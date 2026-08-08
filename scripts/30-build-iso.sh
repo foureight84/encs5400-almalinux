@@ -92,6 +92,9 @@ menuentry 'Rescue an existing system' {
     initrdefi /images/pxeboot/initrd.img
 }
 EOF
+# BIOS boot is optional: an EFI-only source ISO has no isolinux/ at all, and
+# writing into a missing directory would abort the build.
+if [ -d "$WORK/iso/isolinux" ]; then
 cat > "$WORK/iso/isolinux/isolinux.cfg" <<EOF
 default vesamenu.c32
 timeout 150
@@ -113,13 +116,20 @@ label rescue
   kernel vmlinuz
   append initrd=initrd.img inst.stage2=hd:LABEL=$LABEL rd.live.ram rescue quiet
 EOF
+else
+    warn "no isolinux/ on the source ISO - building UEFI-only (no BIOS boot)"
+fi
 
 say "Building $OUT"
 rm -f "$OUT"
+BIOSARGS=()
+if [ -f "$WORK/iso/isolinux/isolinux.bin" ]; then
+    BIOSARGS=(-b isolinux/isolinux.bin -c isolinux/boot.cat
+              -no-emul-boot -boot-load-size 4 -boot-info-table -eltorito-alt-boot)
+fi
 xorriso -as mkisofs -o "$OUT" -V "$LABEL" -J -R -joliet-long \
-    -b isolinux/isolinux.bin -c isolinux/boot.cat \
-    -no-emul-boot -boot-load-size 4 -boot-info-table \
-    -eltorito-alt-boot -e images/efiboot.img -no-emul-boot \
+    "${BIOSARGS[@]}" \
+    -e images/efiboot.img -no-emul-boot \
     "$WORK/iso" 2>&1 | grep -vE '^xorriso : UPDATE' || true
 
 [ -f "$OUT" ] || die "ISO was not produced"

@@ -72,8 +72,10 @@ def main():
         shutil.copy2(ovmf("OVMF_VARS"), varsf)
 
         accel = "kvm" if os.access("/dev/kvm", os.R_OK | os.W_OK) else "tcg"
+        # -cpu host is KVM-only; TCG rejects it outright, so fall back to 'max'.
+        cpumodel = "host" if accel == "kvm" else "max"
         cmd = ["qemu-system-x86_64", "-machine", f"q35,accel={accel}",
-               "-cpu", "host", "-smp", "4", "-m", "2048",
+               "-cpu", cpumodel, "-smp", "4", "-m", "2048",
                "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf('OVMF_CODE')}",
                "-drive", f"if=pflash,format=raw,file={varsf}",
                "-drive", f"file={copy},format=qcow2,if=virtio",
@@ -109,7 +111,7 @@ def main():
             p.stdin.write((s + "\n").encode())
             p.stdin.flush()
 
-        print(f"== booting {os.path.basename(img)} (accel={accel}) ==", flush=True)
+        print(f"== booting {os.path.basename(img)} (accel={accel}, cpu={cpumodel}) ==", flush=True)
         if wait_for(r"login:", 300) is None:
             with lock:
                 sys.stdout.write(buf[-3000:].decode("utf8", "replace"))

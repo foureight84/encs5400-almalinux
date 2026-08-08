@@ -41,8 +41,10 @@ while [ $# -gt 0 ]; do
         --qcow2-only) DO_ISO=0 ;;
         --full)       MODE="--full" ;;
         --no-verify)  DO_VERIFY=0 ;;
-        --out)        OUT_DIR="$2"; shift ;;
-        --work)       WORK_DIR="$2"; shift ;;
+        --out)        [ $# -ge 2 ] || die "--out needs a directory"
+                      OUT_DIR="$2"; shift ;;
+        --work)       [ $# -ge 2 ] || die "--work needs a directory"
+                      WORK_DIR="$2"; shift ;;
         -h|--help)    usage ;;
         -*)           die "unknown option: $1" ;;
         *)            ISO="$1" ;;
@@ -52,8 +54,8 @@ done
 [ -n "$ISO" ] || usage
 [ -f "$ISO" ] || die "no such file: $ISO"
 
-BUILT_ISO="$OUT_DIR/AlmaLinux-8.9-ENCS5412-switch.iso"
-BUILT_QCOW="$OUT_DIR/AlmaLinux-8.9-ENCS5412-switch.qcow2"
+BUILT_ISO="$OUT_DIR/AlmaLinux-8.9-ENCS5400-switch.iso"
+BUILT_QCOW="$OUT_DIR/AlmaLinux-8.9-ENCS5400-switch.qcow2"
 
 say "Checking build dependencies"
 check_deps || die "install the missing packages listed above, then re-run"
@@ -73,8 +75,13 @@ if [ "$DO_QCOW" -eq 1 ]; then
 
     if [ "$DO_VERIFY" -eq 1 ]; then
         say "Verifying the built image by booting it"
-        python3 "$HERE/scripts/50-verify-qcow2.py" "$BUILT_QCOW" \
-            || warn "verification reported problems - review the output above"
+        # Fatal on failure: the verifier only exits non-zero when the image
+        # genuinely does not boot or cannot be logged into. The alarming-looking
+        # "Marvell not visible / mv_pciboot not loaded" lines are EXPECTED (no
+        # switch is attached to the test VM) and do not affect its exit code.
+        # Shipping an unbootable image with exit 0 would be worse than noisy.
+        python3 "$HERE/scripts/50-verify-qcow2.py" "$BUILT_QCOW" "${ROOT_PASSWORD:-encs}" \
+            || die "the built image failed boot verification - see output above"
     fi
 fi
 
@@ -85,7 +92,9 @@ cat <<EOF
 
 Next steps
 ----------
-1. Copy the qcow2 to your Proxmox host and import it:
+1. Copy the qcow2 to your Proxmox host, then import it:
+
+     scp $OUT_DIR/$(basename "$BUILT_QCOW") root@<proxmox>:/root/
 
      qm create 900 --name encs-switch --machine q35 --bios ovmf \\
          --memory 2048 --cores 2 --net0 virtio,bridge=vmbr0 \\
@@ -95,7 +104,7 @@ Next steps
      qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
      qm set 900 --boot order=virtio0
      qm set 900 --smbios1 product=\$(echo -n 'ENCS5412/K9' | base64),base64=1
-     qm set 900 --hostpci0 \$(lspci -d 11ab:be00 | cut -d' ' -f1)
+     qm set 900 --hostpci0 0000:\$(lspci -d 11ab:be00 | cut -d' ' -f1)
      qm set 900 --onboot 1 --startup order=1
      qm start 900
 

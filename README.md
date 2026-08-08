@@ -85,8 +85,8 @@ Roughly 15 minutes. You get:
 
 | Artifact | Size | Use |
 |---|---|---|
-| `out/AlmaLinux-8.9-ENCS5412-switch.qcow2` | ~940 MB | **import into Proxmox — recommended**, no install step |
-| `out/AlmaLinux-8.9-ENCS5412-switch.iso` | ~1.6 GB | install into a VM yourself, or bare metal on the ENCS |
+| `out/AlmaLinux-8.9-ENCS5400-switch.qcow2` | ~940 MB | **import into Proxmox — recommended**, no install step |
+| `out/AlmaLinux-8.9-ENCS5400-switch.iso` | ~1.6 GB | install into a VM yourself, or bare metal on the ENCS |
 
 Both are covered below: [importing the qcow2](#deploying-on-proxmox) and
 [installing from the ISO](#alternative-install-from-the-iso-instead).
@@ -137,7 +137,7 @@ On Proxmox 8 (kernel 6.8) it is usually on already.
 qm create 900 --name encs-switch --machine q35 --bios ovmf \
     --memory 2048 --cores 2 --net0 virtio,bridge=vmbr0 \
     --serial0 socket --vga serial0
-qm importdisk 900 AlmaLinux-8.9-ENCS5412-switch.qcow2 local-lvm
+qm importdisk 900 AlmaLinux-8.9-ENCS5400-switch.qcow2 local-lvm
 qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
 qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
 qm set 900 --boot order=virtio0
@@ -194,7 +194,7 @@ bash /root/encs-host/install.sh
 pull the identical bundle straight off the ISO instead — no VM involvement:
 
 ```sh
-mount -o loop,ro AlmaLinux-8.9-ENCS5412-switch.iso /mnt
+mount -o loop,ro AlmaLinux-8.9-ENCS5400-switch.iso /mnt
 cp -r /mnt/encs/opt/encs-host /root/
 umount /mnt
 bash /root/encs-host/install.sh
@@ -224,7 +224,7 @@ Open the Ports view and press `space`, or apply a saved config.
 ### Alternative: install from the ISO instead
 
 If you would rather install into a VM yourself, or you are going bare metal,
-use `AlmaLinux-8.9-ENCS5412-switch.iso`.
+use `AlmaLinux-8.9-ENCS5400-switch.iso`.
 
 **As a Proxmox VM** — upload the ISO to a storage that holds ISO images
 (`local` by default: *Datacenter → local → ISO Images → Upload*, or just
@@ -236,7 +236,7 @@ qm create 900 --name encs-switch --machine q35 --bios ovmf \
     --serial0 socket --vga serial0
 qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:16
 qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
-qm set 900 --ide2 local:iso/AlmaLinux-8.9-ENCS5412-switch.iso,media=cdrom
+qm set 900 --ide2 local:iso/AlmaLinux-8.9-ENCS5400-switch.iso,media=cdrom
 qm set 900 --boot 'order=ide2;virtio0'
 qm set 900 --smbios1 product=RU5DUzU0MTIvSzk=,base64=1
 qm start 900 && qm terminal 900
@@ -260,7 +260,7 @@ use for the switch, and leaving it out keeps the install from touching it.
 ISO to a USB stick and boot it.
 
 ```sh
-sudo dd if=AlmaLinux-8.9-ENCS5412-switch.iso of=/dev/sdX bs=4M status=progress oflag=sync
+sudo dd if=AlmaLinux-8.9-ENCS5400-switch.iso of=/dev/sdX bs=4M status=progress oflag=sync
 ```
 
 No SMBIOS override is needed — a real ENCS already reports

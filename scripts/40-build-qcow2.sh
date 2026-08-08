@@ -22,7 +22,10 @@ mkdir -p "$WORK"
 cp -f "$VARS" "$WORK/OVMF_VARS.fd"
 
 ACCEL=$(check_kvm)
-say "Installing under QEMU (accel=$ACCEL, console -> $LOG)"
+# -cpu host only exists with a hardware accelerator; under TCG qemu rejects it
+# ("The 'host' CPU model is not supported in TCG"). Fall back to 'max'.
+if [ "$ACCEL" = "kvm" ]; then CPUMODEL=host; else CPUMODEL=max; fi
+say "Installing under QEMU (accel=$ACCEL, cpu=$CPUMODEL, console -> $LOG)"
 rm -f "$LOG" "$WORK/raw.qcow2"
 qemu-img create -f qcow2 "$WORK/raw.qcow2" "$SIZE" >/dev/null
 
@@ -32,7 +35,7 @@ qemu-img create -f qcow2 "$WORK/raw.qcow2" "$SIZE" >/dev/null
 # before honouring quotes, so "Cisco Systems, Inc." is rejected outright.
 set +e
 timeout "${QCOW_TIMEOUT:-5400}" qemu-system-x86_64 \
-    -machine "q35,accel=$ACCEL" -cpu host -smp "$CPUS" -m "$MEM" \
+    -machine "q35,accel=$ACCEL" -cpu "$CPUMODEL" -smp "$CPUS" -m "$MEM" \
     -drive "if=pflash,format=raw,readonly=on,file=$CODE" \
     -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd" \
     -drive "file=$WORK/raw.qcow2,format=qcow2,if=virtio,cache=unsafe" \
