@@ -1,0 +1,48 @@
+encs5400-almalinux
+Copyright 2026 foureight84
+
+This product includes software developed for running AlmaLinux on Cisco ENCS
+5400 series appliances with the built-in Marvell switch operational.
+
+------------------------------------------------------------------------------
+PRIOR ART
+------------------------------------------------------------------------------
+
+The core discovery that the Marvell BobCat2 switch in an ENCS 5400 can be
+bootstrapped from a PCI-passthrough VM is the work of yeyus:
+
+    Switch bootstrap VM
+    https://yeyus.notion.site/Switch-bootstrap-VM-04cac1d64bde48b684c51e8dac524245
+    https://forums.servethehome.com/index.php?members/yeyus.35233/
+
+That write-up identified the Marvell PCI device (11ab:be00), the out-of-tree
+mv_pciboot kernel module and remote-bootd loader inside Cisco's switch-confd
+package, the SMBIOS product-name gate a VM must satisfy, and the requirement to
+pin the kernel to the version the module was built against.
+
+This repository automates that process and adds switch management tooling.
+
+Hardware analysis of the ENCS 5412 — NIC layout, internal switch topology, and
+the observation that NFVIS releases after 4.15.x disable the switch — came from
+the ServeTheHome community thread:
+
+    https://forums.servethehome.com/index.php?threads/127-cisco-encs5412-k9-xeon-d-1557-12-core-32g-ram.42638/
+
+------------------------------------------------------------------------------
+THIRD-PARTY SOFTWARE — NOT INCLUDED HERE
+------------------------------------------------------------------------------
+
+This repository contains NO Cisco or Marvell software.
+
+The build scripts extract proprietary components — kernel modules, switch
+firmware, and RPM packages — from a Cisco NFVIS ISO that the USER supplies, on
+the user's own machine. Those components remain the property of their
+respective owners and are governed by their own licenses.
+
+Images produced by these scripts therefore contain Cisco proprietary software
+and are almost certainly NOT REDISTRIBUTABLE. Build them yourself, for hardware
+you own, and do not publish the output.
+
+Of note: the mv_pciboot kernel module declares "license=GPL" (author: Marvell
+Semi.), and the remote_boot.h header shipped in Cisco's own switch-confd
+debugsource package is tri-licensed Commercial / GPLv2 / BSD.

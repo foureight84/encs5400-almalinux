@@ -1,0 +1,77 @@
+ENCS 5412 switch — HYPERVISOR bundle
+====================================
+
+This directory ships inside the bootstrap VM but is NOT meant to run here.
+Copy it to the Proxmox host and install it there.
+
+WHY
+---
+The bootstrap VM's only job is to push firmware into the Marvell ASIC over
+PCIe. It carries no traffic and cannot reach the switch's management IP.
+
+The switch answers on 169.254.1.0 over VLAN 2363 on the X710 backplane NIC —
+and that NIC belongs to the hypervisor. So management lives on the host.
+
+    front gi0-gi7 -> Marvell ASIC -> te1/te2 10G -> host X710 -> you
+                        ^ PCIe
+                        |
+                  bootstrap VM (this machine — boot only)
+
+INSTALL
+-------
+From the Proxmox host, with <vm-ip> being this VM:
+
+    scp -r root@<vm-ip>:/opt/encs-host /root/
+    bash /root/encs-host/install.sh
+
+install.sh will:
+  * find the X710 backplane port (it does NOT hardcode a name — it is
+    enp8s0f1np1 on one box and something else on the next)
+  * create VLAN interface sw2363 with 169.254.1.1/16, MTU 9216
+    (the VLAN iface CANNOT be called enp8s0f1np1.2363 — 16 chars exceeds the
+    15-char IFNAMSIZ limit and ip link rejects it)
+  * persist that to /etc/network/interfaces
+  * install encs-switch-tui and encs-switch-api to /usr/local/sbin
+  * install and enable encs-switch-replay.service
+  * verify the switch answers
+
+Then just run:
+
+    encs-switch-tui          press ? for the built-in manual
+
+CONTENTS
+--------
+  install.sh                   host installer (run on Proxmox)
+  encs-switch-tui              the management UI; also --save/--apply/--status
+  encs-switch-api              low-level XML API client for scripting
+  encs-switch-replay.service   reapplies config after a cold boot
+
+THE TWO THINGS TO REMEMBER
+--------------------------
+1. Config is volatile. The ASIC has no flash. VM restarts are fine — they do
+   not power-cycle it — but any real power loss wipes the config back to
+   VLAN 1 + 2363 with every front port SHUT and PoE off. Save your config
+   (TUI: c then w) and let encs-switch-replay put it back.
+
+2. Never restart the bootstrap service, and avoid stopping the VM. The loader
+   can only bootstrap an ASIC in WFI; re-running it against a live switch
+   wedges it, and the only recovery is PHYSICAL AC REMOVAL — a CIMC power-off
+   is not enough. Note that a wedged loader does not mean a dead switch: check
+   with 'ping 169.254.1.0', not with the log.
+
+CREDENTIALS
+-----------
+  Switch (encs-switch-tui / encs-switch-api):  cisco / cisco
+
+That is the ROS firmware default, not a choice this project made — Cisco's own
+switch_settings.py hardcodes it for the un-provisioned case. NFVIS would
+replace it and keep the new one in ConfD, which we do not run.
+
+Since the ASIC has no flash, a changed switch password is lost on every cold
+boot and reverts to cisco/cisco.
+
+Override per-session:  SW_USER=admin SW_PASS=secret encs-switch-tui
+
+The management VLAN (2363, 169.254.1.0/16) is link-local on the internal
+backplane and not routable from your LAN unless you bridge or NAT it
+deliberately. Given the credentials reset on power loss, keep it that way.

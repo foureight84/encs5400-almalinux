@@ -1,0 +1,29 @@
+[Unit]
+# Re-apply switch configuration after a COLD boot.
+#
+# The Marvell ASIC has no flash. Its running config lives in RAM and is lost
+# whenever it loses power, at which point the bootstrap brings it back with
+# firmware defaults only: VLAN 1 + 2363, and every front port (gi0-gi7)
+# ADMINISTRATIVELY SHUT with PoE off. A switch in that state boots fine and
+# forwards nothing.
+#
+# Config DOES survive VM restarts - those do not power-cycle the ASIC - so this
+# unit is only doing real work after an actual power loss. Running it anyway is
+# harmless: applying the same config twice is a no-op.
+Description=Replay ENCS switch configuration
+After=network-online.target
+Wants=network-online.target
+ConditionPathExistsGlob=/etc/encs-switch/*.xml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Wait for the ASIC to finish bootstrapping. Cold start to "ROS ready!" is
+# about 60s, plus however long the bootstrap VM takes to boot first.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ping -c1 -W1 169.254.1.0 >/dev/null 2>&1 && exit 0; sleep 5; done; echo "switch never came up at 169.254.1.0" >&2; exit 1'
+ExecStart=/usr/local/sbin/encs-switch-tui --apply
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

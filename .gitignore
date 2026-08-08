@@ -1,0 +1,11 @@
+# Build outputs contain Cisco proprietary software - never commit them.
+out/
+work/
+*.iso
+*.qcow2
+*.rpm
+*.ko
+*.ko.xz
+*.bin
+__pycache__/
+*.pyc

@@ -1,0 +1,57 @@
+#!/bin/bash
+# Quick health check for the ENCS Marvell switch bootstrap.
+SW_IP="${SW_IP:-169.254.1.0}"
+ok(){ printf "  \e[32m%-4s\e[0m %s\n" "OK" "$1"; }
+no(){ printf "  \e[31m%-4s\e[0m %s\n" "FAIL" "$1"; }
+wr(){ printf "  \e[33m%-4s\e[0m %s\n" "??" "$1"; }
+
+echo
+echo "ENCS 5412 switch bootstrap status"
+echo "---------------------------------"
+
+# 1. Is the Marvell device visible?
+if lspci -d 11ab:be00 2>/dev/null | grep -q .; then
+    ok "Marvell 11ab:be00 present at $(lspci -d 11ab:be00 | awk '{print $1}')"
+else
+    no "Marvell 11ab:be00 NOT visible on the PCI bus"
+    echo "       In a VM, check that the device is passed through."
+fi
+
+# 2. Kernel module
+if lsmod | grep -q '^mv_pciboot'; then ok "mv_pciboot loaded"; else no "mv_pciboot not loaded"; fi
+
+# 3. Char device
+if [ -e /dev/servicecpu ]; then ok "/dev/servicecpu present"; else no "/dev/servicecpu missing"; fi
+
+# 4. Firmware blob (the file Cisco removed in 4.18+)
+if [ -s /opt/switch-confd/switch_firmware.bin ]; then
+    ok "switch_firmware.bin present ($(stat -c%s /opt/switch-confd/switch_firmware.bin) bytes)"
+else
+    no "switch_firmware.bin MISSING - the switch cannot boot without it"
+fi
+
+# 5. Daemon
+if systemctl is-active --quiet marvell-switch-boot; then
+    ok "marvell-switch-boot running"
+else
+    no "marvell-switch-boot not running  (journalctl -u marvell-switch-boot)"
+fi
+
+# 6. Kernel pin - the silent killer
+RUNNING=$(uname -r); EXPECT="4.18.0-513.18.2.el8_9.x86_64"
+if [ "$RUNNING" = "$EXPECT" ]; then ok "kernel $RUNNING (matches module vermagic)"
+else no "kernel is $RUNNING but module needs $EXPECT"; fi
+
+# 7. Management reachability (bare metal only)
+if ip -o addr show 2>/dev/null | grep -q '169\.254\.1\.1'; then
+    if ping -c1 -W2 "$SW_IP" >/dev/null 2>&1; then ok "switch reachable at $SW_IP"
+    else wr "169.254.1.1 configured but $SW_IP not answering (still booting?)"; fi
+else
+    wr "no 169.254.1.1 on this host - normal for a passthrough VM"
+    echo "       (the hypervisor owns int-LAN and the mgmt VLAN)"
+fi
+
+echo
+echo "Recent bootstrap log:"
+journalctl -u marvell-switch-boot -n 12 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+echo

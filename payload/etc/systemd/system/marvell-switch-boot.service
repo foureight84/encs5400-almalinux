@@ -1,0 +1,42 @@
+[Unit]
+Description=Cisco ENCS Marvell BobCat2 switch bootstrap
+Documentation=file:///opt/switch-confd
+# The ASIC has no flash: firmware must be pushed over PCIe on every boot.
+After=systemd-modules-load.service
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=simple
+# Load the out-of-tree Marvell PCIe boot shim if it is not already up.
+ExecStartPre=/bin/bash -c 'lsmod | grep -q "^mv_pciboot" || /sbin/insmod /opt/switch-confd/mv_pciboot.ko.xz'
+# Wait for the misc char device the module registers.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 50); do [ -e /dev/servicecpu ] && exit 0; sleep 0.1; done; echo "/dev/servicecpu never appeared" >&2; exit 1'
+# remote_boot_app is a permanent daemon: it pushes booton.bin -> SRAM and
+# switch_firmware.bin -> DDR, then polls the scratchpad register once a
+# second, watching the keep-alive counter for FW hang / PEX link loss.
+#
+# stdbuf is REQUIRED. remote_boot_app uses printf; with stdout on a journal
+# socket glibc switches to full buffering and the progress log lags by
+# MINUTES - "Loading firmware to service CPU DDR..." once appeared only when
+# the process was killed, 4 minutes after the fact. That made a working
+# bootstrap look like a hang. Line-buffer it.
+ExecStart=/usr/bin/stdbuf -oL -eL /opt/switch-confd/remote_boot_app
+#
+# Restart=no is DELIBERATE. Do not change it.
+# The loader can only bootstrap an ASIC that is in WFI (i.e. freshly reset).
+# Cisco's state machine has no reset path of its own - REQUEST_RESET just
+# waits for "an external task" (the BMC on real NFVIS, which we do not run).
+# So re-running the loader against an already-booted switch wedges it in
+# "Service CPU not ready (requires reset?)" forever, and the ONLY recovery is
+# physical AC removal - CIMC power-off is not enough, the ASIC is on standby.
+# An automatic restart would therefore turn a transient blip into a site visit.
+#
+# NOTE: a wedged loader does NOT mean a dead switch. The ASIC keeps running
+# and forwarding. Check with: ping 169.254.1.0 (from the hypervisor).
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

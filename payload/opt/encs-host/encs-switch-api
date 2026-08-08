@@ -1,0 +1,68 @@
+#!/bin/bash
+# Thin client for the Marvell ROS "wcd" XML API on the ENCS L2 switch.
+#
+# Protocol (as used by Cisco's switch-confd):
+#   login   GET  https://IP/System.xml?action=login&user=U&password=P  -> session id
+#   query   GET  https://IP/wcd?{TableName}          header: sessionid: <id>
+#   set     POST https://IP/wcd?                     header: sessionid: <id>, XML body
+#   logout  GET  https://IP/System.xml?action=logout
+#
+# Firmware default credentials are cisco/cisco.
+#
+# Usage:
+#   encs-switch-api get '{VLANList}'
+#   encs-switch-api get '{ForwardingTable}'
+#   encs-switch-api set config.xml
+#   encs-switch-api raw '/System.xml?action=logout'
+set -euo pipefail
+
+SW_IP="${SW_IP:-169.254.1.0}"
+SW_USER="${SW_USER:-cisco}"
+SW_PASS="${SW_PASS:-cisco}"
+CURL=(curl -sk --max-time 20)
+
+usage(){ sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 1; }
+[ $# -ge 1 ] || usage
+
+login() {
+    local hdr body sid
+    hdr=$(mktemp)
+    body=$("${CURL[@]}" -D "$hdr" \
+        "https://${SW_IP}/System.xml?action=login&user=${SW_USER}&password=${SW_PASS}") || {
+        rm -f "$hdr"
+        echo "ERROR: cannot reach switch at ${SW_IP}" >&2
+        echo "  - is the ASIC booted?  (on the VM: encs-switch-status)" >&2
+        echo "  - is 169.254.1.1 configured on the VLAN 2363 backplane interface?" >&2
+        exit 1
+    }
+    # The session id comes back in the "sessionid" RESPONSE HEADER, not in the
+    # XML body -- the body is only an ActionStatus block. Per switch_settings.py:
+    #     sessionId = f.headers.get("sessionid")
+    sid=$(grep -i '^sessionid:' "$hdr" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r\n')
+    rm -f "$hdr"
+    if [ -z "$sid" ]; then
+        echo "ERROR: login returned no sessionid header." >&2
+        if printf '%s' "$body" | grep -q '<statusString>OK</statusString>'; then
+            echo "  (switch reported statusString OK, so the credentials are fine)" >&2
+        else
+            echo "  body was:" >&2; printf '%s\n' "$body" >&2
+        fi
+        exit 1
+    fi
+    printf '%s' "$sid"
+}
+
+SID=$(login)
+trap '"${CURL[@]}" -H "sessionid: ${SID}" "https://${SW_IP}/System.xml?action=logout" >/dev/null 2>&1 || true' EXIT
+
+case "$1" in
+    get)  [ $# -eq 2 ] || usage
+          "${CURL[@]}" -H "sessionid: ${SID}" "https://${SW_IP}/wcd?$2" ;;
+    set)  [ $# -eq 2 ] && [ -f "$2" ] || usage
+          "${CURL[@]}" -H "sessionid: ${SID}" -H 'Content-Type: text/xml' \
+                       --data-binary "@$2" "https://${SW_IP}/wcd?" ;;
+    raw)  [ $# -eq 2 ] || usage
+          "${CURL[@]}" -H "sessionid: ${SID}" "https://${SW_IP}$2" ;;
+    *)    usage ;;
+esac
+echo

@@ -1,0 +1,838 @@
+#!/usr/bin/python3
+"""
+encs-switch-tui - terminal UI for the Marvell BobCat2 L2 switch in a Cisco ENCS 5412.
+
+Speaks the same "wcd" XML API that Cisco's switch-confd used, so it needs
+neither ConfD nor the (non-functional) embedded web UI.
+
+RUN THIS ON THE HYPERVISOR. The switch answers on 169.254.1.0 over VLAN 2363
+on the X710 backplane, and that NIC belongs to the host. The bootstrap VM only
+boots the ASIC over PCIe and cannot reach the switch at all.
+
+Environment:
+    SW_IP      default 169.254.1.0
+    SW_USER    default cisco
+    SW_PASS    default cisco
+    SW_CFG_DIR default /etc/encs-switch
+
+Non-interactive:
+    encs-switch-tui --save     capture running config to SW_CFG_DIR
+    encs-switch-tui --apply    replay SW_CFG_DIR (used by encs-switch-replay)
+    encs-switch-tui --status   one-line health check, exit 0/1
+
+Stdlib only: urllib + curses.
+"""
+import curses
+import os
+import ssl
+import sys
+import textwrap
+import time
+import urllib.request
+import xml.etree.ElementTree as ET
+
+SW_IP = os.environ.get("SW_IP", "169.254.1.0")
+SW_USER = os.environ.get("SW_USER", "cisco")
+SW_PASS = os.environ.get("SW_PASS", "cisco")
+CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
+
+VERSION = "1.0"
+
+# ------------------------------------------------------------------ enums
+# switch_interfaces.py: SWITCH_ADMIN_STATE_UP="1", SWITCH_ADMIN_STATE_DOWN="2"
+ADMIN = {"1": "up", "2": "SHUT"}
+LINK = {"1": "UP", "2": "down", "6": "n/p"}
+MEDIA = {"1": "copper", "2": "fiber"}
+
+
+def media_label(ifname, mediatype):
+    """Human-meaningful media string.
+
+    mediaType is a coarse 1=copper / 2=fiber enum, and the firmware calls
+    anything that is not a copper PHY "fiber". The te ports are internal
+    10GBASE-KR backplane serdes - traces on the board, no optics and no cable -
+    so reporting them as fiber is actively misleading. LAGs have no media at
+    all. (The same coarseness is why lspci calls the RJ45 I350 ports "Fiber".)
+    """
+    if ifname.startswith("te"):
+        return "backplane"
+    if ifname.startswith("LAG"):
+        return "-"
+    return MEDIA.get(mediatype, "-")
+DUPLEX = {"2": "full", "3": "half", "4": "-"}
+POE_ADMIN = {"1": "on", "2": "off"}
+POE_DETECT = {"1": "disabled", "2": "searching", "3": "DELIVERING",
+              "4": "fault", "5": "test", "6": "other"}
+ADDR_TYPE = {"1": "static", "2": "dynamic", "3": "dynamic", "4": "self"}
+
+PORT_ROLE = {
+    "gi": "front-panel RJ45 (PoE capable)",
+    "te": "internal 10G backplane serdes (10GBASE-KR) to the host X710 / NIM slot",
+    "LA": "link aggregation group",
+}
+
+
+class SwitchError(Exception):
+    pass
+
+
+# ================================================================== client
+class Switch:
+    def __init__(self, ip=SW_IP, user=SW_USER, password=SW_PASS):
+        self.ip, self.user, self.password = ip, user, password
+        self.sid = None
+        self.ctx = ssl.create_default_context()
+        self.ctx.check_hostname = False
+        self.ctx.verify_mode = ssl.CERT_NONE
+
+    def login(self):
+        url = (f"https://{self.ip}/System.xml?action=login"
+               f"&user={self.user}&password={self.password}")
+        try:
+            f = urllib.request.urlopen(url, context=self.ctx, timeout=10)
+        except Exception as e:
+            raise SwitchError(f"cannot reach {self.ip}: {e}")
+        body = f.read().decode("utf8", "replace")
+        # The token arrives in the sessionID RESPONSE HEADER, not the body.
+        self.sid = f.headers.get("sessionid") or f.headers.get("sessionID")
+        if not self.sid:
+            raise SwitchError(f"login returned no sessionid header:\n{body[:300]}")
+        # switch-confd disables the web idle timeout right after login;
+        # without this, long-lived sessions get dropped mid-use.
+        try:
+            self.post("<?xml version='1.0' encoding='utf-8'?>"
+                      "<DeviceConfiguration><version>1.0</version>"
+                      "<EWSServiceTable action=\"set\"><Entry>"
+                      "<maxIdleTimeOut>0</maxIdleTimeOut>"
+                      "</Entry></EWSServiceTable></DeviceConfiguration>")
+        except SwitchError:
+            pass
+        return self.sid
+
+    def logout(self):
+        if not self.sid:
+            return
+        try:
+            req = urllib.request.Request(
+                f"https://{self.ip}/System.xml?action=logout",
+                headers={"sessionid": self.sid})
+            urllib.request.urlopen(req, context=self.ctx, timeout=5).read()
+        except Exception:
+            pass
+        self.sid = None
+
+    def _request(self, url, data=None, retry=True):
+        if not self.sid:
+            self.login()
+        req = urllib.request.Request(url, headers={"sessionid": self.sid},
+                                     data=data)
+        try:
+            body = urllib.request.urlopen(
+                req, context=self.ctx, timeout=15).read().decode("utf8", "replace")
+        except Exception as e:
+            raise SwitchError(str(e))
+        if "not authenticated" in body.lower() and retry:
+            self.sid = None
+            return self._request(url, data, retry=False)
+        return body
+
+    def get(self, table):
+        # urllib sends {} literally. curl would eat them without -g (globbing).
+        return self._request(f"https://{self.ip}/wcd?{{{table}}}")
+
+    def post(self, xml):
+        return self._request(f"https://{self.ip}/wcd?", data=xml.encode("utf8"))
+
+    @staticmethod
+    def _rows(body, tag, fields):
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as e:
+            raise SwitchError(f"bad XML: {e}")
+        return [{f: (el.findtext(f) or "").strip() for f in fields}
+                for el in root.iter(tag)]
+
+    def ports(self):
+        return self._rows(self.get("Standard802_3List"), "Entry",
+                          ["interfaceName", "linkState", "adminState", "mediaType",
+                           "speedOper", "duplexOperMode", "MACAddress"])
+
+    def poe(self):
+        return self._rows(self.get("PoEPSEInterfaceList"), "Interface",
+                          ["interfaceName", "adminEnable", "detectionStatus",
+                           "powerClassification", "outputPower", "powerLimit"])
+
+    def vlans(self):
+        return self._rows(self.get("VLANInterfaceMembershipTable"), "Entry",
+                          ["VLANID", "VLANName", "taggedPorts", "untaggedPorts"])
+
+    def macs(self):
+        return self._rows(self.get("ForwardingTable"), "Entry",
+                          ["VLANID", "MACAddress", "interfaceName", "addressType"])
+
+    def stats(self):
+        return self._rows(self.get("StatisticsList"), "InterfaceStatisticsEntry",
+                          ["interfaceName", "receivePacketByteCount",
+                           "receiveUnicastPacketCount", "transmitPacketByteCount",
+                           "transmitUnicastPacketCount", "packetErrorCount"])
+
+    # ---- writes -------------------------------------------------------
+    def set_port_admin(self, ifname, up):
+        return self.post(
+            "<?xml version='1.0' encoding='utf-8'?>\n"
+            "<DeviceConfiguration>\n    <version>1.0</version>\n"
+            '    <Standard802_3List action="set">\n'
+            f"        <Entry><interfaceName>{ifname}</interfaceName>"
+            f"<adminState>{'1' if up else '2'}</adminState></Entry>\n"
+            "    </Standard802_3List>\n</DeviceConfiguration>")
+
+    def set_poe(self, ifname, on):
+        return self.post(
+            "<?xml version='1.0' encoding='utf-8'?>\n"
+            "<DeviceConfiguration>\n    <version>1.0</version>\n"
+            '    <PoEPSEInterfaceList action="set">\n'
+            f"        <Interface><interfaceName>{ifname}</interfaceName>"
+            f"<adminEnable>{'1' if on else '2'}</adminEnable></Interface>\n"
+            "    </PoEPSEInterfaceList>\n</DeviceConfiguration>")
+
+    def vlan(self, vid, create=True):
+        return self.post(
+            "<?xml version='1.0' encoding='utf-8'?>\n"
+            "<DeviceConfiguration>\n    <version>1.0</version>\n"
+            f'    <VLANList action="{"set" if create else "delete"}">\n'
+            f"        <VLAN><VLANID>{vid}</VLANID></VLAN>\n"
+            "    </VLANList>\n</DeviceConfiguration>")
+
+
+def ok(body):
+    return "<statusString>OK</statusString>" in body
+
+
+# ============================================================ config files
+def save_config(sw, path=CFG_DIR):
+    os.makedirs(path, exist_ok=True)
+    written = []
+
+    ports = [p for p in sw.ports() if p["interfaceName"].startswith("gi")]
+    ent = "".join(f"        <Entry><interfaceName>{p['interfaceName']}</interfaceName>"
+                  f"<adminState>{p['adminState']}</adminState></Entry>\n"
+                  for p in ports)
+    f = os.path.join(path, "10-ports.xml")
+    open(f, "w").write("<?xml version='1.0' encoding='utf-8'?>\n"
+                       "<DeviceConfiguration>\n    <version>1.0</version>\n"
+                       '    <Standard802_3List action="set">\n' + ent +
+                       "    </Standard802_3List>\n</DeviceConfiguration>\n")
+    written.append(f)
+
+    # Skip system VLANs: 1 is default, 2363 is the management VLAN the
+    # firmware recreates on every bootstrap.
+    vl = [v for v in sw.vlans() if v["VLANID"] not in ("1", "2363")]
+    if vl:
+        ent = "".join(f"        <VLAN><VLANID>{v['VLANID']}</VLANID></VLAN>\n"
+                      for v in vl)
+        f = os.path.join(path, "20-vlans.xml")
+        open(f, "w").write("<?xml version='1.0' encoding='utf-8'?>\n"
+                           "<DeviceConfiguration>\n    <version>1.0</version>\n"
+                           '    <VLANList action="set">\n' + ent +
+                           "    </VLANList>\n</DeviceConfiguration>\n")
+        written.append(f)
+
+    pe = sw.poe()
+    if pe:
+        ent = "".join(f"        <Interface><interfaceName>{p['interfaceName']}</interfaceName>"
+                      f"<adminEnable>{p['adminEnable']}</adminEnable></Interface>\n"
+                      for p in pe)
+        f = os.path.join(path, "30-poe.xml")
+        open(f, "w").write("<?xml version='1.0' encoding='utf-8'?>\n"
+                           "<DeviceConfiguration>\n    <version>1.0</version>\n"
+                           '    <PoEPSEInterfaceList action="set">\n' + ent +
+                           "    </PoEPSEInterfaceList>\n</DeviceConfiguration>\n")
+        written.append(f)
+    return written
+
+
+def apply_config(sw, path=CFG_DIR):
+    if not os.path.isdir(path):
+        return []
+    out = []
+    for fn in sorted(f for f in os.listdir(path) if f.endswith(".xml")):
+        out.append((fn, ok(sw.post(open(os.path.join(path, fn)).read()))))
+    return out
+
+
+# =================================================================== manual
+MANUAL = [
+    ("WHAT THIS IS", """\
+A management UI for the Marvell BobCat2 L2 switch inside a Cisco ENCS 5412,
+running without any Cisco NFVIS software.
+
+It talks the "wcd" XML API on https://{ip} - the same interface Cisco's own
+switch-confd daemon used. The switch's embedded web UI does not work on this
+firmware (its login form handler is missing), so this is the way in."""),
+
+    ("HOW THE PIECES FIT", """\
+  front panel gi0-gi7  ->  Marvell ASIC  ->  te1/te2 10G backplane  ->  host X710
+                              ^ PCIe
+                              |
+                       bootstrap VM (boots the ASIC only)
+
+The ASIC has NO FLASH and no firmware of its own. On every power-on a small VM
+pushes booton.bin into its SRAM and a 26MB firmware image into its DDR over
+PCIe. That VM does nothing else - it carries no traffic and cannot even reach
+the switch's management IP.
+
+THIS tool runs on the HYPERVISOR, which owns the X710 backplane NIC and
+therefore the management VLAN (2363, 169.254.1.1 -> 169.254.1.0)."""),
+
+    ("VIEWS", """\
+  p  Ports    link/admin state per interface. SPACE toggles admin up/shut.
+  v  VLANs    VLAN list with tagged/untagged membership. n=new  d=delete.
+  e  PoE      per-port power state and draw. SPACE toggles PoE.
+  m  MAC      the forwarding table - which MAC was learned on which port.
+  s  Stats    rx/tx byte and packet counters, error counts.
+  c  Config   save the running config to disk, or replay it.
+  ?  Help     this manual."""),
+
+    ("READING THE PORTS VIEW", """\
+  gi0-gi7   the 8 front-panel RJ45 ports (PoE capable), media "copper"
+  te1-te4   INTERNAL 10G backplane, media shown as "backplane". These are
+            10GBASE-KR serdes links - board traces, no optics, no cable.
+            te1/te2 reach the host X710 (te2 normally carries your traffic);
+            te3/te4 head to the NIM slot.
+            The raw mediaType enum only has copper/fiber, so the firmware
+            calls these "fiber". They are not. (Same coarseness makes lspci
+            report the RJ45 I350 ports as "Fiber".)
+  LAG1-4    link aggregation groups - no media, unused unless configured
+
+  link      UP / down / n-p (not present)
+  admin     up   = enabled
+            SHUT = administratively disabled, shown in red
+
+IMPORTANT: after a cold bootstrap every gi port comes up SHUT and PoE off.
+The switch boots but forwards nothing until you enable them. That is what
+Cisco's switch_init.xml did, and we do not run it."""),
+
+    ("CONFIG IS VOLATILE", """\
+The ASIC has no flash, so its configuration lives in RAM.
+
+  VM restart / bootstrap service restart -> config SURVIVES
+        (those do not remove power from the ASIC)
+  cold power cycle / AC loss             -> config is LOST
+        (comes back as VLAN 1 + 2363, all gi ports SHUT, PoE off)
+
+So the files under {cfg} are the switch's real source of truth. Use the
+Config view to write them, keep them in version control, and let
+encs-switch-replay.service reapply them after a power loss."""),
+
+    ("THINGS THAT WILL RUIN YOUR DAY", """\
+DO NOT restart the bootstrap service, and avoid stopping the bootstrap VM.
+
+The loader can only bootstrap an ASIC that is in WFI (freshly reset). Cisco's
+state machine has no reset path of its own - it waits for "an external task"
+that only exists on real NFVIS (the BMC). Re-running the loader against an
+already-running switch wedges it in:
+
+    Service CPU not ready (requires reset?)
+
+and the ONLY recovery is PHYSICAL AC REMOVAL for ~30 seconds. A CIMC power-off
+is NOT enough - the ASIC sits on standby power and never cold-starts.
+
+But note: a wedged loader does NOT mean a dead switch. The ASIC keeps running
+and forwarding. Judge switch health from this tool or from
+'ping 169.254.1.0', never from that log line."""),
+
+    ("CREDENTIALS", """\
+Switch login is cisco / cisco - that is the ROS FIRMWARE DEFAULT, not a choice
+this tool made. Cisco's switch_settings.py hardcodes it for the un-provisioned
+case; NFVIS would normally replace it and store the new one in ConfD, which we
+do not run.
+
+Because the ASIC has no flash, a changed switch password is lost on every cold
+boot and reverts to cisco/cisco. Override per-session with:
+
+    SW_USER=admin SW_PASS=secret encs-switch-tui
+
+The management VLAN is link-local on the internal backplane and is not
+routable from your LAN unless you deliberately bridge or NAT it. Given the
+credentials reset on power loss, keep it that way."""),
+
+    ("KEYS", """\
+  up/down, j/k    move selection
+  space           toggle (Ports: admin state, PoE: power)
+  n / d           VLANs: new / delete
+  w / a           Config: write / apply
+  r               refresh now (Ports, PoE and Stats also auto-refresh)
+  i               toggle the detail panel
+  ? or F1         this manual (arrows scroll, any other key exits)
+  q               quit"""),
+
+    ("TROUBLESHOOTING", """\
+"cannot reach 169.254.1.0"
+  - is the bootstrap VM running?     (on the hypervisor: qm list)
+  - in the VM: encs-switch-status
+  - in the VM: journalctl -u marvell-switch-boot | tail
+    a cold bootstrap takes ~60s to reach "ROS ready!"
+  - is the VLAN interface up on the host?
+        ip -br addr show sw2363     -> should show 169.254.1.1/16
+    if missing:  bash /root/encs-host/install.sh
+
+Front ports show link down with a cable plugged in
+  - check the Ports view: admin is probably SHUT. Press SPACE to enable.
+
+A write says FAILED
+  - the session may have expired; press r to refresh (this re-logs in)."""),
+]
+
+
+# ==================================================================== UI
+VIEWS = [("ports", "p"), ("vlans", "v"), ("poe", "e"),
+         ("mac", "m"), ("stats", "s"), ("config", "c"), ("help", "?")]
+
+C_OK, C_BAD, C_HDR, C_WARN, C_DIM = 1, 2, 3, 4, 5
+
+
+class UI:
+    def __init__(self, stdscr, sw):
+        self.s, self.sw = stdscr, sw
+        self.view = "ports"
+        self.sel = 0
+        self.top = 0
+        self.msg = ""
+        self.msg_bad = False
+        self.detail = True
+        self.help_scroll = 0
+        self.data = {}
+        self.last_refresh = 0
+        self.connected = True
+        curses.curs_set(0)
+        self.s.timeout(1000)
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(C_OK, curses.COLOR_GREEN, -1)
+            curses.init_pair(C_BAD, curses.COLOR_RED, -1)
+            curses.init_pair(C_HDR, curses.COLOR_CYAN, -1)
+            curses.init_pair(C_WARN, curses.COLOR_YELLOW, -1)
+            curses.init_pair(C_DIM, curses.COLOR_BLUE, -1)
+
+    # ---------------------------------------------------------- data
+    def refresh_data(self, force=False):
+        try:
+            if self.view == "ports":
+                self.data["ports"] = self.sw.ports()
+            elif self.view == "poe":
+                self.data["poe"] = self.sw.poe()
+            elif self.view == "vlans":
+                self.data["vlans"] = self.sw.vlans()
+            elif self.view == "mac":
+                self.data["mac"] = self.sw.macs()
+            elif self.view == "stats":
+                self.data["stats"] = self.sw.stats()
+            self.connected = True
+            self.last_refresh = time.time()
+        except SwitchError as e:
+            self.connected = False
+            self.set_msg(f"{e}", bad=True)
+
+    def rows(self):
+        return self.data.get(self.view, [])
+
+    def set_msg(self, m, bad=False):
+        self.msg, self.msg_bad = m, bad
+
+    # ---------------------------------------------------------- chrome
+    def draw(self):
+        self.s.erase()
+        h, w = self.s.getmaxyx()
+
+        state = "connected" if self.connected else "UNREACHABLE"
+        age = ("" if not self.last_refresh
+               else f"  updated {int(time.time()-self.last_refresh)}s ago")
+        title = f" ENCS 5412 switch  {self.sw.ip}  [{state}]{age} "
+        self.s.addnstr(0, 0, title.ljust(w - 1), w - 1,
+                       curses.A_REVERSE | (0 if self.connected
+                                           else curses.color_pair(C_BAD)))
+
+        tabs = "  ".join(
+            (f"[{k}] {n.upper()}" if n == self.view else f"[{k}] {n}")
+            for n, k in VIEWS)
+        self.s.addnstr(1, 1, tabs, w - 2, curses.color_pair(C_HDR))
+        self.s.hline(2, 0, curses.ACS_HLINE, w)
+
+        if self.view == "help":
+            self.draw_help(3, h, w)
+        else:
+            dh = 6 if (self.detail and self.view in ("ports", "poe", "vlans")) else 0
+            {"ports": self.d_ports, "poe": self.d_poe, "vlans": self.d_vlans,
+             "mac": self.d_mac, "stats": self.d_stats,
+             "config": self.d_config}[self.view](3, h - dh - 3, w)
+            if dh:
+                self.draw_detail(h - dh - 3, h, w)
+
+        keys = {
+            "ports": "SPACE toggle admin   r refresh   i detail   ? help   q quit",
+            "poe": "SPACE toggle PoE   r refresh   i detail   ? help   q quit",
+            "vlans": "n new   d delete   r refresh   i detail   ? help   q quit",
+            "config": "w write config   a apply config   ? help   q quit",
+            "help": "arrows scroll   any other key returns",
+        }.get(self.view, "r refresh   ? help   q quit")
+        self.s.hline(h - 3, 0, curses.ACS_HLINE, w)
+        self.s.addnstr(h - 2, 1, keys, w - 2, curses.A_DIM)
+        if self.msg:
+            self.s.addnstr(h - 1, 1, self.msg[:w - 2], w - 2,
+                           curses.color_pair(C_BAD if self.msg_bad else C_WARN))
+        self.s.refresh()
+
+    def draw_help(self, y, h, w):
+        lines = []
+        for title, body in MANUAL:
+            lines.append(("H", title))
+            for para in body.format(ip=self.sw.ip, cfg=CFG_DIR).split("\n"):
+                for wrapped in (textwrap.wrap(para, w - 6) or [""]):
+                    lines.append(("T", wrapped))
+            lines.append(("T", ""))
+        maxs = max(0, len(lines) - (h - y - 4))
+        self.help_scroll = max(0, min(self.help_scroll, maxs))
+        for i, (kind, text) in enumerate(lines[self.help_scroll:]):
+            if y + i >= h - 4:
+                break
+            if kind == "H":
+                self.s.addnstr(y + i, 2, text, w - 3,
+                               curses.A_BOLD | curses.color_pair(C_HDR))
+            else:
+                self.s.addnstr(y + i, 4, text, w - 5)
+        if maxs:
+            pct = int(100 * self.help_scroll / maxs)
+            self.s.addnstr(h - 4, w - 12, f"-- {pct:3d}% --", 11, curses.A_DIM)
+
+    def draw_detail(self, y, h, w):
+        self.s.hline(y, 0, curses.ACS_HLINE, w)
+        rows = self.rows()
+        if not rows or self.sel >= len(rows):
+            return
+        r = rows[self.sel]
+        out = []
+        if self.view == "ports":
+            n = r["interfaceName"]
+            role = PORT_ROLE.get(n[:2], "")
+            out = [f"{n}  -  {role}",
+                   f"  link {LINK.get(r['linkState'],'?')}   "
+                   f"admin {ADMIN.get(r['adminState'],'?')}   "
+                   f"{r['speedOper']} Mb/s {DUPLEX.get(r['duplexOperMode'],'-')}   "
+                   f"media {media_label(n, r['mediaType'])}",
+                   f"  mac  {r['MACAddress']}"]
+            if r["adminState"] == "2":
+                out.append("  ADMIN SHUT - this port will not pass traffic. "
+                           "SPACE enables it.")
+            elif r["linkState"] != "1":
+                out.append("  enabled but no link - nothing plugged in, "
+                           "or the far end is down.")
+        elif self.view == "poe":
+            try:
+                ow, lim = int(r["outputPower"]) / 1000, int(r["powerLimit"]) / 1000
+            except ValueError:
+                ow, lim = 0, 0
+            out = [f"{r['interfaceName']}  PoE {POE_ADMIN.get(r['adminEnable'],'?')}",
+                   f"  status {POE_DETECT.get(r['detectionStatus'],'?')}   "
+                   f"class {r['powerClassification']}   "
+                   f"drawing {ow:.1f} W of {lim:.1f} W limit"]
+            if r["adminEnable"] == "2":
+                out.append("  PoE disabled on this port. SPACE enables it.")
+        elif self.view == "vlans":
+            out = [f"VLAN {r['VLANID']}  {r['VLANName'] or '(no name)'}",
+                   f"  untagged: {r['untaggedPorts'] or '(none)'}",
+                   f"  tagged  : {r['taggedPorts'] or '(none)'}"]
+            if r["VLANID"] == "2363":
+                out.append("  management VLAN - carries this session. Do not remove.")
+            elif r["VLANID"] == "1":
+                out.append("  default VLAN - all ports are untagged members.")
+        for i, t in enumerate(out):
+            if y + 1 + i >= h - 3:
+                break
+            self.s.addnstr(y + 1 + i, 2, t, w - 3,
+                           curses.A_BOLD if i == 0 else curses.A_DIM)
+
+    # ---------------------------------------------------------- views
+    def _list(self, y, h, w, header, fmt, rows, colour=None):
+        self.s.addnstr(y, 2, header, w - 3, curses.A_BOLD | curses.A_UNDERLINE)
+        avail = h - y - 1
+        if self.sel < self.top:
+            self.top = self.sel
+        elif self.sel >= self.top + avail:
+            self.top = self.sel - avail + 1
+        for i, r in enumerate(rows[self.top:self.top + avail]):
+            idx = self.top + i
+            attr = curses.A_REVERSE if idx == self.sel else 0
+            if colour:
+                attr |= colour(r)
+            self.s.addnstr(y + 1 + i, 2, fmt(r), w - 3, attr)
+        if len(rows) > avail:
+            self.s.addnstr(y, w - 14, f"{self.sel+1}/{len(rows)}", 12, curses.A_DIM)
+
+    def d_ports(self, y, h, w):
+        self._list(
+            y, h, w,
+            f"{'port':8}{'link':7}{'admin':8}{'speed':9}{'duplex':8}{'media':9}mac",
+            lambda r: (f"{r['interfaceName']:8}{LINK.get(r['linkState'],'?'):7}"
+                       f"{ADMIN.get(r['adminState'],'?'):8}{r['speedOper']:9}"
+                       f"{DUPLEX.get(r['duplexOperMode'],'-'):8}"
+                       f"{media_label(r['interfaceName'], r['mediaType']):9}"
+                       f"{r['MACAddress']}"),
+            self.rows(),
+            lambda r: (curses.color_pair(C_OK) if r["linkState"] == "1"
+                       else curses.color_pair(C_BAD) if r["adminState"] == "2"
+                       else 0))
+
+    def d_poe(self, y, h, w):
+        def f(r):
+            try:
+                ow, lim = int(r["outputPower"]) / 1000, int(r["powerLimit"]) / 1000
+            except ValueError:
+                ow = lim = 0.0
+            return (f"{r['interfaceName']:8}{POE_ADMIN.get(r['adminEnable'],'?'):7}"
+                    f"{POE_DETECT.get(r['detectionStatus'],'?'):13}"
+                    f"{r['powerClassification']:7}{ow:>7.1f} W {lim:>7.1f} W")
+        self._list(y, h, w,
+                   f"{'port':8}{'poe':7}{'status':13}{'class':7}{'draw':>9}{'limit':>10}",
+                   f, self.rows(),
+                   lambda r: curses.color_pair(C_OK) if r["adminEnable"] == "1" else 0)
+
+    def d_vlans(self, y, h, w):
+        self._list(y, h, w,
+                   f"{'vlan':8}{'name':14}{'untagged':30}tagged",
+                   lambda r: (f"{r['VLANID']:8}{(r['VLANName'] or '-'):14}"
+                              f"{(r['untaggedPorts'] or '-'):30}"
+                              f"{r['taggedPorts'] or '-'}"),
+                   self.rows())
+
+    def d_mac(self, y, h, w):
+        self._list(y, h, w, f"{'vlan':8}{'mac':20}{'port':9}type",
+                   lambda r: (f"{r['VLANID']:8}{r['MACAddress']:20}"
+                              f"{r['interfaceName']:9}"
+                              f"{ADDR_TYPE.get(r['addressType'], r['addressType'])}"),
+                   self.rows())
+
+    def d_stats(self, y, h, w):
+        self._list(y, h, w,
+                   f"{'port':8}{'rx bytes':>15}{'rx pkts':>12}"
+                   f"{'tx bytes':>15}{'tx pkts':>12}{'errs':>8}",
+                   lambda r: (f"{r['interfaceName']:8}"
+                              f"{r['receivePacketByteCount']:>15}"
+                              f"{r['receiveUnicastPacketCount']:>12}"
+                              f"{r['transmitPacketByteCount']:>15}"
+                              f"{r['transmitUnicastPacketCount']:>12}"
+                              f"{r['packetErrorCount']:>8}"),
+                   self.rows(),
+                   lambda r: curses.color_pair(C_BAD)
+                   if r["packetErrorCount"] not in ("0", "") else 0)
+
+    def d_config(self, y, h, w):
+        files = sorted(f for f in os.listdir(CFG_DIR)) \
+            if os.path.isdir(CFG_DIR) else []
+        body = [
+            ("H", "WHY THIS MATTERS"),
+            ("T", "The ASIC has no flash. Its config lives in RAM and is LOST on a"),
+            ("T", "cold power cycle - it comes back as VLAN 1 + 2363 with every"),
+            ("T", "front port SHUT and PoE off. Config DOES survive VM restarts."),
+            ("T", ""),
+            ("T", f"These files are the switch's real source of truth: {CFG_DIR}"),
+            ("T", ""),
+            ("H", "ACTIONS"),
+            ("T", "  w   write the running ports / VLANs / PoE state to disk"),
+            ("T", "  a   apply every *.xml there, in filename order"),
+            ("T", ""),
+            ("H", "CURRENT FILES"),
+        ]
+        body += [("T", "  " + f) for f in files] or [("T", "  (none yet - press w)")]
+        body += [("T", ""),
+                 ("H", "AUTOMATIC REPLAY"),
+                 ("T", "encs-switch-replay.service reapplies these after a cold"),
+                 ("T", "boot, once the switch answers. Check it with:"),
+                 ("T", "  systemctl status encs-switch-replay")]
+        for i, (kind, t) in enumerate(body):
+            if y + i >= h - 1:
+                break
+            self.s.addnstr(y + i, 2, t, w - 3,
+                           curses.A_BOLD | curses.color_pair(C_HDR)
+                           if kind == "H" else 0)
+
+    # ---------------------------------------------------------- input
+    def prompt(self, question):
+        h, w = self.s.getmaxyx()
+        curses.echo()
+        curses.curs_set(1)
+        self.s.addnstr(h - 1, 0, " " * (w - 1), w - 1)
+        self.s.addnstr(h - 1, 1, question, w - 2, curses.color_pair(C_WARN))
+        self.s.refresh()
+        try:
+            v = self.s.getstr(h - 1, len(question) + 2, 12).decode().strip()
+        except Exception:
+            v = ""
+        curses.noecho()
+        curses.curs_set(0)
+        return v
+
+    def write(self, label, fn):
+        try:
+            r = fn()
+            good = ok(r)
+            self.set_msg(f"{label}: {'OK' if good else 'FAILED'}", bad=not good)
+            self.refresh_data()
+        except SwitchError as e:
+            self.set_msg(f"{label}: {e}", bad=True)
+
+    def run(self):
+        self.refresh_data()
+        while True:
+            self.draw()
+            try:
+                c = self.s.getch()
+            except KeyboardInterrupt:
+                break
+            rows = self.rows()
+
+            if self.view == "help":
+                if c in (curses.KEY_DOWN, ord("j")):
+                    self.help_scroll += 1
+                elif c in (curses.KEY_UP, ord("k")):
+                    self.help_scroll = max(0, self.help_scroll - 1)
+                elif c == curses.KEY_NPAGE:
+                    self.help_scroll += 15
+                elif c == curses.KEY_PPAGE:
+                    self.help_scroll = max(0, self.help_scroll - 15)
+                elif c in (ord("q"), 27):
+                    break
+                elif c != -1:
+                    self.view, self.help_scroll = "ports", 0
+                    self.refresh_data()
+                continue
+
+            if c in (ord("q"), 27):
+                break
+            elif c in (curses.KEY_DOWN, ord("j")):
+                self.sel = min(self.sel + 1, max(0, len(rows) - 1))
+            elif c in (curses.KEY_UP, ord("k")):
+                self.sel = max(self.sel - 1, 0)
+            elif c in (ord("?"), curses.KEY_F1):
+                self.view = "help"
+            elif c == ord("i"):
+                self.detail = not self.detail
+            elif c == ord("r"):
+                self.set_msg("")
+                self.refresh_data(force=True)
+            elif c in [ord(k) for _, k in VIEWS if k != "?"]:
+                self.view = [n for n, k in VIEWS if k == chr(c)][0]
+                self.sel = self.top = 0
+                self.set_msg("")
+                self.refresh_data()
+            elif c == ord(" ") and self.view == "ports" and rows:
+                p = rows[self.sel]
+                up = p["adminState"] != "1"
+                self.write(f"{p['interfaceName']} admin {'up' if up else 'shut'}",
+                           lambda: self.sw.set_port_admin(p["interfaceName"], up))
+            elif c == ord(" ") and self.view == "poe" and rows:
+                p = rows[self.sel]
+                on = p["adminEnable"] != "1"
+                self.write(f"PoE {p['interfaceName']} {'on' if on else 'off'}",
+                           lambda: self.sw.set_poe(p["interfaceName"], on))
+            elif c == ord("n") and self.view == "vlans":
+                vid = self.prompt("new VLAN id (1-4094):")
+                if vid.isdigit() and 1 <= int(vid) <= 4094:
+                    self.write(f"create VLAN {vid}",
+                               lambda: self.sw.vlan(vid, True))
+                elif vid:
+                    self.set_msg(f"'{vid}' is not a valid VLAN id", bad=True)
+            elif c == ord("d") and self.view == "vlans" and rows:
+                vid = rows[self.sel]["VLANID"]
+                if vid in ("1", "2363"):
+                    self.set_msg(f"refusing to delete VLAN {vid} - system VLAN "
+                                 f"(2363 carries this session)", bad=True)
+                elif self.prompt(f"delete VLAN {vid}? type yes:") == "yes":
+                    self.write(f"delete VLAN {vid}",
+                               lambda: self.sw.vlan(vid, False))
+            elif c == ord("w") and self.view == "config":
+                try:
+                    fs = save_config(self.sw)
+                    self.set_msg("wrote " + ", ".join(os.path.basename(f) for f in fs))
+                except Exception as e:
+                    self.set_msg(str(e), bad=True)
+            elif c == ord("a") and self.view == "config":
+                if self.prompt("apply saved config to the switch? type yes:") == "yes":
+                    try:
+                        res = apply_config(self.sw)
+                        self.set_msg("  ".join(f"{f}:{'OK' if g else 'FAIL'}"
+                                               for f, g in res) or "nothing to apply",
+                                     bad=any(not g for _, g in res))
+                    except Exception as e:
+                        self.set_msg(str(e), bad=True)
+
+            if (time.time() - self.last_refresh > 10
+                    and self.view in ("ports", "poe", "stats")):
+                self.refresh_data()
+
+
+# =================================================================== main
+def cli_status(sw):
+    try:
+        sw.login()
+        ports = sw.ports()
+    except SwitchError as e:
+        print(f"UNREACHABLE: {e}")
+        return 1
+    gi = [p for p in ports if p["interfaceName"].startswith("gi")]
+    up = sum(1 for p in gi if p["linkState"] == "1")
+    shut = sum(1 for p in gi if p["adminState"] == "2")
+    print(f"switch {sw.ip}: OK - {len(gi)} front ports, {up} link up, {shut} admin shut")
+    if shut:
+        print("  WARNING: shut ports will not pass traffic (run the TUI, press SPACE)")
+    sw.logout()
+    return 0
+
+
+def main():
+    sw = Switch()
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+
+    if arg in ("-h", "--help"):
+        print(__doc__)
+        return
+    if arg == "--status":
+        sys.exit(cli_status(sw))
+    if arg in ("--save", "--apply"):
+        try:
+            sw.login()
+        except SwitchError as e:
+            sys.exit(f"ERROR: {e}")
+        if arg == "--save":
+            for f in save_config(sw):
+                print("wrote", f)
+            sw.logout()
+            return
+        bad = False
+        for f, good in apply_config(sw):
+            print(f"{f}: {'OK' if good else 'FAILED'}")
+            bad |= not good
+        sw.logout()
+        sys.exit(1 if bad else 0)
+
+    try:
+        sw.login()
+    except SwitchError as e:
+        sys.exit(
+            f"ERROR: {e}\n\n"
+            f"  This tool must run on the HYPERVISOR - the switch is reachable\n"
+            f"  over VLAN 2363 on the X710 backplane, which the host owns.\n"
+            f"  The bootstrap VM cannot reach it.\n\n"
+            f"  Checks:\n"
+            f"    ip -br addr show sw2363     -> expect 169.254.1.1/16\n"
+            f"    ping -c2 {SW_IP}\n"
+            f"    qm list                     -> is the bootstrap VM running?\n"
+            f"  In the VM:  encs-switch-status\n")
+    try:
+        curses.wrapper(lambda scr: UI(scr, sw).run())
+    finally:
+        sw.logout()
+
+
+if __name__ == "__main__":
+    main()
