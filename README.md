@@ -109,8 +109,23 @@ Install Proxmox on the ENCS as normal, then:
 ```sh
 dmesg | grep -i "Directed I/O"          # expect: DMAR: Intel(R) Virtualization Technology
 ls /sys/kernel/iommu_groups | wc -l     # expect: > 0
-lspci -nn | grep 11ab                   # the Marvell switch, e.g. 0d:00.0
+lspci -nn | grep 11ab                   # the Marvell switch
+
+# it must be ALONE in its IOMMU group - expect exactly one line:
+for d in /sys/kernel/iommu_groups/*/devices/*; do
+  g=$(basename $(dirname $(dirname $d))); b=$(basename $d)
+  echo "group $g  $b  $(lspci -nns $b | cut -d' ' -f2-)"
+done | grep -i 11ab
 ```
+
+**Do not hardcode the BDF.** It moves between firmware and OS installs — it has
+been observed at both `0d:00.0` and `0e:00.0` on the same machine, and on one
+install `0e:00.0` was the I210 management NIC instead. Always derive it:
+`lspci -d 11ab:be00 | cut -d' ' -f1`. The IOMMU group number renumbers with it.
+
+If more than one device shares the group, they must all be passed through
+together — on a 5412 the Marvell is normally isolated, so a single line is the
+expected result.
 
 If IOMMU is off: enable VT-d in the ENCS BIOS (F2), then add
 `intel_iommu=on iommu=pt` to `GRUB_CMDLINE_LINUX_DEFAULT`, `update-grub`, reboot.
@@ -127,7 +142,7 @@ qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
 qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
 qm set 900 --boot order=virtio0
 qm set 900 --smbios1 product=RU5DUzU0MTIvSzk=,base64=1   # 'ENCS5412/K9'
-qm set 900 --hostpci0 0000:0d:00.0                        # your Marvell BDF
+qm set 900 --hostpci0 0000:$(lspci -d 11ab:be00 | cut -d' ' -f1)
 qm set 900 --onboot 1 --startup order=1
 qm start 900
 ```
@@ -233,7 +248,7 @@ fix the boot order:
 
 ```sh
 qm set 900 --ide2 none --boot order=virtio0
-qm set 900 --hostpci0 0000:0d:00.0        # add the Marvell switch
+qm set 900 --hostpci0 0000:$(lspci -d 11ab:be00 | cut -d' ' -f1)   # the Marvell switch
 qm set 900 --onboot 1 --startup order=1
 qm start 900
 ```

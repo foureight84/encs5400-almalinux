@@ -196,7 +196,7 @@ Chassis `FGLxxxxxxxx`, board `FOCxxxxxxxx`. All checks read-only via `support sh
 |---|---|
 | **IOMMU group of the Marvell device** | **Group 50, sole occupant** — passthrough is clean |
 | **SMBIOS product name** | **`ENCS5412/K9`** — platform gate passes natively |
-| Marvell switch BDF | `0d:00.0`, `11ab:be00` rev 01, 1 MB + 64 MB + 4 MB BARs |
+| Marvell switch BDF | `11ab:be00` rev 01, 1 MB + 64 MB + 4 MB BARs. **The BDF is not stable** — observed at `0d:00.0` under NFVIS and Proxmox, then `0e:00.0` after a Proxmox reinstall (where `0e:00.0` had previously been the I210 MGMT NIC). yeyus recorded `0e:00`. Always derive it: `lspci -d 11ab:be00`. |
 | Backplane NIC | **X710** (not XL710) at `08:00.0/.1`, netdev `int-LAN`, MTU 9216 |
 | Management path | `int-LAN.2363` @ `169.254.1.1` → switch `169.254.1.0`, **ARP REACHABLE** (`c4:f7:d5:xx:xx:9c`) |
 | Front ports | 8 × `gigabitEthernet 1/0`–`1/7`, all `1G-Copper` / `MediaType RJ45` |
