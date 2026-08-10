@@ -52,7 +52,7 @@ CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
 
 # Single source of truth for the version. scripts/release.sh reads this line
 # to name the tag and the tarball, so keep the literal on one line.
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 
 # Where --update looks. Override for a fork or a test repo.
 GITHUB_REPO = os.environ.get("ENCS_REPO", "foureight84/encs5400-almalinux")
@@ -101,9 +101,11 @@ PORT_ROLE = {
     "LA": "link aggregation group",
 }
 
-# LACPEnabled is what the channel-group POST writes; whether the firmware
-# reports it back on a read is unverified, so everything downstream treats an
-# empty value as "unknown" rather than assuming a mode.
+# LACPEnabled and LAGID are both reported on read (confirmed on hardware:
+# every Entry carries LAGID, and the 12 physical ports also carry
+# LACPEnabled; an unbound port reads 0/0). Downstream still treats an empty
+# value as "unknown" rather than assuming a mode, in case a different
+# firmware build is less forthcoming.
 PORT_FIELDS = ["interfaceName", "linkState", "adminState", "mediaType",
                "speedOper", "duplexOperMode", "MACAddress", "LACPEnabled"]
 
@@ -200,11 +202,14 @@ class Switch:
     def _lags(body):
         """LAG1-4 with their member ports.
 
-        LAGList is the only table confirmed to report membership on a READ -
-        switch_port_info.py:563 walks LAGEntry/PortList/PortEntry exactly like
-        this. (LAGID appears on Standard802_3List entries, but only as a WRITE
-        field in the channel-group POST, and on the STP table's InterfaceEntry.
-        Neither is a documented read path here.)
+        Confirmed against hardware: all four groups always exist, each with a
+        PortList that is empty until ports are bound. switch_port_info.py:563
+        walks LAGEntry/PortList/PortEntry exactly like this.
+
+        Standard802_3List does also report a LAGID per port, so membership
+        could be derived from the ports table alone - but only PortEntry
+        carries membershipType, which is what distinguishes a member that is
+        forwarding from one that is merely bound. Hence this table.
         """
         try:
             root = ET.fromstring(body)
@@ -322,10 +327,11 @@ def save_config(sw, path=CFG_DIR):
 
     # LAG membership, before VLANs so the groups exist when VLAN membership
     # is replayed. Written per member port, because that is what the API
-    # takes. LAGList does not report the on/auto mode back, so we reuse
-    # LACPEnabled from the port entry when the firmware supplies it and
-    # otherwise record auto/LACP - a static bundle facing a far end that
-    # speaks LACP silently black-holes traffic, so auto is the safer default.
+    # takes. LAGList reports who is in a group but not in which mode, so the
+    # mode comes from the port entry's own LACPEnabled. If a firmware ever
+    # withholds it, fall back to auto/LACP: a static bundle facing a far end
+    # that speaks LACP silently black-holes traffic, so auto is the safer
+    # thing to guess.
     mode_of = {p["interfaceName"]: p["LACPEnabled"] for p in allports}
     bound = [(m["portName"], lag["interfaceName"])
              for lag in lags for m in lag["members"]

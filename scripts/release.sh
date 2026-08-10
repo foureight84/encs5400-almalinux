@@ -68,9 +68,13 @@ EOF
 # --- package --------------------------------------------------------------
 TARBALL="$OUT/$NAME.tar.gz"
 rm -f "$TARBALL"
-# Deterministic-ish: sorted, no owner metadata, so rebuilding the same commit
-# gives the same bytes.
-tar -C "$OUT" --numeric-owner --owner=0 --group=0 -czf "$TARBALL" "$NAME"
+# No owner metadata, so rebuilding the same commit gives the same bytes.
+# COPYFILE_DISABLE and --no-xattrs keep macOS from stapling
+# LIBARCHIVE.xattr.com.apple.provenance headers onto every member, which GNU
+# tar on the target then warns about on every single file.
+COPYFILE_DISABLE=1 tar -C "$OUT" --numeric-owner --owner=0 --group=0 \
+    $(tar --no-xattrs --version >/dev/null 2>&1 && echo --no-xattrs) \
+    -czf "$TARBALL" "$NAME"
 rm -rf "$STAGE"
 
 SUMS="$OUT/SHA256SUMS"

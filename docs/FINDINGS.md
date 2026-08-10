@@ -937,8 +937,29 @@ Membership is not a property of the group. It is set on the **member port's own*
 `PortList` → `PortEntry` with `portName` and `membershipType` (1 = active, 2 = inactive,
 3 = not candidate — `switch_port_info.py:573-579`). Cisco fetches it in the *same* GET as the port
 list, `wcd?{Standard802_3List}{LAGList}` (`switch_port_info.py:550`), and `encs-switch-tui` does the
-same. Note `LAGID` is **not** a confirmed read field on `Standard802_3List`; the places confd reads
-it (`switch_port_info.py:3035`, `:4563`) are parsing the `{STP}` table's `InterfaceEntry`.
+same.
+
+Confirmed on hardware 2026-08-10 (switch idle, nothing bundled):
+
+```xml
+<LAGEntry>
+  <interfaceName>LAG1</interfaceName>
+  <interfaceType>2</interfaceType>   <!-- 2 = port-channel -->
+  <interfaceID>1</interfaceID>
+  <LACPType>3</LACPType>
+  <PortList></PortList>              <!-- empty until ports are bound -->
+</LAGEntry>
+```
+
+All four groups always exist with an empty `PortList`; `LAGEntry` also carries an undocumented
+group-level `LACPType` (3 on an unconfigured group) that we do not currently use.
+
+`Standard802_3List` **does** report `LAGID` on every entry, and `LACPEnabled` on the 12 physical
+ports — both read `0` on an unbound port, which is the same pair that means "no channel-group" on
+write. So membership *could* be derived from the ports table alone. `{LAGList}` is still the right
+source because only `PortEntry` carries `membershipType`, i.e. whether a bound port is actually
+forwarding. (Note the two places confd reads `LAGID` — `switch_port_info.py:3035`, `:4563` — are
+parsing the `{STP}` table's `InterfaceEntry`, not this one.)
 
 Two operational traps:
 
@@ -968,6 +989,12 @@ The tell was visible in the very first response and read past repeatedly:
 ```
 
 **Fix: `curl -g` (`--globoff`).** POSTs were unaffected because their URL is plain `wcd?`.
+
+**And it came back.** `encs-switch-api` shipped without `-g` and every `get` returned that same
+empty `ActionStatus` — found on hardware 2026-08-10, fixed in v0.0.2. The TUI was never affected
+because it speaks urllib, not curl, which is exactly why the regression went unnoticed: the tool
+everyone uses kept working. If you are diagnosing this class of bug, check `<requestURL>` in the
+response first — braces missing there means the shell or curl ate them, not the switch.
 
 ### Session mechanics (confirmed)
 

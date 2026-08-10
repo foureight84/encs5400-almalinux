@@ -19,7 +19,12 @@ set -euo pipefail
 SW_IP="${SW_IP:-169.254.1.0}"
 SW_USER="${SW_USER:-cisco}"
 SW_PASS="${SW_PASS:-cisco}"
-CURL=(curl -sk --max-time 20)
+# -g is NOT optional. { and } are curl's URL-globbing syntax: without it curl
+# expands "{VLANList}" as a single-item set and sends "wcd?VLANList" with the
+# braces stripped, which the switch answers with an empty ActionStatus. That
+# looks exactly like a broken session or a bad table name and costs hours.
+# See docs/FINDINGS.md, "Root cause of the empty ActionStatus dead end".
+CURL=(curl -skg --max-time 20)
 
 usage(){ sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 1; }
 [ $# -ge 1 ] || usage
