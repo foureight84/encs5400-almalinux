@@ -219,9 +219,67 @@ Ports, VLANs, PoE, link aggregation, MAC table, statistics, and config
 save/replay. The active view is highlighted in the tab bar; the running
 version sits at the right-hand end of the title bar.
 
+**Reading the front panel.** The API calls the switch ports `gi0`–`gi7`; the
+chassis silkscreen calls them `GE1/0`–`GE1/7`, and the TUI shows both. They are
+four vertically stacked pairs, **numbered downwards, not across**:
+
+```
+   GE1/0   GE1/2   GE1/4   GE1/6      <- gi0  gi2  gi4  gi6
+   GE1/1   GE1/3   GE1/5   GE1/7      <- gi1  gi3  gi5  gi7
+```
+
+`GE1/1` is directly below `GE1/0`. Count along the top row and you will
+unplug the wrong thing. Verified on a 5412 by cabling `GE1/0`, `GE1/4` and
+`GE1/7` individually; 5406/5408 are unconfirmed.
+
+**Everything else on the panel bypasses the switch** — those jacks go to the
+host CPU or the BMC, and none of their MACs ever appear in the switch's MAC
+table:
+
+| Panel label | What it really is |
+|---|---|
+| `CONSOLE` (top) | serial console to the host CPU — `ttyS0` at **115200 8N1** |
+| `CIMC` (bottom, serial) | out-of-band serial CLI to the BMC |
+| `MGMT CPU` (top) | I210 → the host. This is the NFVIS management port; under Proxmox it is your normal management NIC. |
+| `MGMT CIMC` (bottom) | a **separate** physical jack straight to the BMC. Invisible to the host — the host reaches the CIMC out `MGMT CPU` and back in via your LAN. |
+| `GE0/0` (top row) | I350 `02:00.0` = `enp2s0f0`, fronted by **both** an RJ45 and an SFP jack |
+| `GE0/1` (bottom row) | I350 `02:00.1` = `enp2s0f1`, likewise RJ45 + SFP |
+
+`GE0/0` and `GE0/1` are dual-media: two jacks, one logical port. Under a stock
+in-tree `igb` both report `Port: FIBRE` and **the RJ45 side will not link at
+all** — and pulling the SFP does not wake it up. The NVM presents these as
+fiber-variant devices (`8086:1522`, `Supported link modes: 1000baseKX/Full`)
+and in-tree `igb` has no media-select parameter, so the copper connector is
+never exposed. Cisco's `igb` fork and its `def_media` knob are what select it.
+
+**So on stock Proxmox your only working uplinks are `MGMT CPU`, or a `GE0/x`
+SFP.** Both cage-to-function mappings above were confirmed by moving one
+transceiver between them and watching which port could read its EEPROM.
+
+**Keep a serial cable for this box.** The `CONSOLE` RJ45 at **115200 8N1**
+gives you the GRUB menu *and* a Proxmox login, courtesy of the settings the
+Proxmox installer drops in `/etc/default/grub.d/installer.cfg`. It depends on
+no network, no VLAN and no switch state — which matters here, because the
+switch management VLAN is link-local, its config is volatile, and shutting
+`te2` or mis-detecting the backplane NIC will cut you off from the ASIC
+entirely. That port is the way back in.
+
+```sh
+screen /dev/ttyUSB0 115200        # Linux
+screen /dev/cu.usbserial-XXXX 115200   # macOS
+```
+
 **Front ports come up administratively SHUT with PoE off** after a bootstrap —
 that is the firmware default, and NFVIS's own init is what used to enable them.
 Open the Ports view and press `space`, or apply a saved config.
+
+**The TUI refuses to shut `te1`–`te4`.** Those are internal backplane ports
+with no front-panel jack, and the switch owns its end of each link — it will
+accept the shut. `te2` carries the management VLAN, so shutting it ends your
+session, and with no flash on the ASIC only a cold power cycle undoes it.
+Worse, the serdes stays trained regardless, so a shut backplane port still
+reports `link UP` and nothing on screen looks wrong. Enabling is always
+allowed; only shutting is blocked. Override with `ENCS_ALLOW_TE_SHUT=1`.
 
 ### Link aggregation (LAG / port-channel)
 

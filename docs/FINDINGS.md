@@ -254,28 +254,279 @@ to fall back to.
 
 | Linux name | PCI | MAC | Connects to |
 |---|---|---|---|
-| `int-LAN` | `08:00.1` | `c4:f7:d5:xx:xx:2b` | **Marvell switch backplane, 10G** — verified |
-| `int-ngio` | `08:00.0` | `c4:f7:d5:xx:xx:2a` | NIM expansion slot (per "NGIO" naming) — *inferred* |
+| `int-LAN` | `08:00.1` | `c4:f7:d5:xx:xx:2b` | **Marvell switch backplane, 10G** — verified, = `te2` |
+| `int-ngio` | `08:00.0` | `c4:f7:d5:xx:xx:2a` | NIM slot — **not wired to the switch**, see below |
 
 `int-LAN` is confirmed by the live ARP entry for `169.254.1.0` on `int-LAN.2363` and by Cisco's
 kickstart (`change_intf_name "enp8s0f1" "int-LAN"`). An X552 at `05:00.0` appears unconnected.
 
+### Mapping te1-te4, and why link state lies (tested 2026-08-10)
+
+**Both X710 ports go to the switch. `int-ngio` does not go to the NIM slot** — the name misleads.
+
+Method that works — stamp a unique MAC on the NIC, generate a frame, read `{ForwardingTable}`:
+
+```sh
+ip link set enp8s0f0np0 down
+ip link set enp8s0f0np0 address 02:00:00:de:ad:01
+ip link set enp8s0f0np0 up
+ping -c2 -I enp8s0f0np0 224.0.0.1;  arping -c3 -I enp8s0f0np0 169.254.99.99
+encs-switch-api get '{ForwardingTable}'     # -> 02:00:00:de:ad:01 on te1
+```
+
+| Port | Far end | Evidence |
+|---|---|---|
+| `te1` | `int-ngio`, X710 `08:00.0` | synthetic MAC `02:00:00:de:ad:01` learned on `te1` |
+| `te2` | `int-LAN`, X710 `08:00.1` | `c4:f7:d5:xx:xx:2b` learned on `te2`; VLAN 2363 tagged on `te2` only |
+| `te3`, `te4` | **unproven** | down, autoneg admin = 2 and *cannot be enabled* — see below |
+
+The firmware will not let you turn autonegotiation on for `te3`/`te4`, and says why:
+
+```
+POST autoNegotiationAdminEnabled=1 for te3
+  -> statusCode 3
+     "Fiber Ethernet port te3 doesn't support Auto Negotiation enabled mode"
+   (the identical write against gi0 returns statusCode 0 / OK)
+```
+
+So **te3/te4 are fiber ports**, which by itself excludes them being any RJ45 jack on the panel.
+Combined with the SFP test above — which proved both `GE0/x` cages belong to the I350 — and with
+`int-ngio` proven to be `te1`, every front-panel connector is accounted for and **none of them is
+te3 or te4**.
+
+#### te3/te4 are the expansion-module (NIM) ports — per Cisco's own code
+
+Elimination only gets you so far. `switch-confd` states the mapping outright.
+
+`switch_main.py:1201` — `lan1_bsm_l2_op_cfg(slot, bay, vid, port, opcode, mac_sz, mac)`, addressed
+by **slot/bay/port** as a modular chassis would be:
+
+```python
+if (port == 0):
+    switch_te_mac_setup("te3", mac, 2350)      # module port 0 -> te3
+    switch_te_mac_setup("te3", mac, 2351)
+    switch_cp_dp_mac_settings('aa:bb:cc:dd:ee:f0', 2351)   # CP
+    switch_cp_dp_mac_settings('aa:bb:cc:dd:ee:f1', 2350)   # DP
+    switch_te_mac_setup("te1", 'aa:bb:cc:dd:ee:f0', 2351)  # host end of the fabric
+    switch_te_mac_setup("te1", 'aa:bb:cc:dd:ee:f1', 2350)
+elif (port == 1):
+    switch_te_mac_setup("te4", mac, 2350)      # module port 1 -> te4
+```
+
+`switch_te_mac_setup()` installs a **permanent** (static) forwarding entry. `switch_lan1_settings()`
+comments the scheme: *"First pair is for CP, the rest is DP for module 1,2,3"* — so **VLAN 2351 is
+the control plane and 2350 the data plane** of an internal module fabric.
+
+`set_module_default_setting()` (`switch_interfaces.py:2411`) configures all four accordingly:
+
+| Port | Config | Reading |
+|---|---|---|
+| `te1` | PVID 2351, **tagged** 2350+2351, LLDP/CDP off | the **host's** trunk into the module fabric |
+| `te2` | trunk `2-2349,2363,2450-4093` | ordinary data + the 2363 management VLAN |
+| `te3` | PVID 2351, **untagged** 2350+2351, LLDP/CDP off | module port 0 |
+| `te4` | PVID 4095, untagged 2350, LLDP/CDP off | module port 1 |
+
+`switch_main.py:1742` reserves the whole band by creating VLANs 2350–2353 plus 2363 at startup, and
+`switch_util.py:290` refuses user VLANs inside 2350–2449.
+
+**This also resolves the "NGIO" naming.** `int-ngio` is physically `te1` (proven by MAC learning),
+but its *purpose* is to reach the expansion module — via the ASIC on VLANs 2350/2351, not
+point-to-point. The old "int-ngio goes to the NIM slot" inference was functionally right and
+physically wrong; both halves now have evidence.
+
+Caveats, because this is code-reading rather than measurement: the sibling `lan1_bsm_port_cfg()`
+and `lan1_bsm_port_enable_cfg()` are stubbed out (`return`), the RPM scriptlet disables
+`switch-service.service` on ENCS, and **no NIM is fitted on the test chassis** (filler panel in
+place), so te3/te4 have never been seen up. The mapping is Cisco's stated intent, not an observed
+link.
+
+This confirms the §4 topology diagram ("2× 10G backplane") and **retires the earlier `int-ngio` =
+NIM-slot inference.** With no NIM fitted here, te3/te4 remain the only candidates for a NIM path,
+and that is still a guess. Anyone with a populated NIM slot can settle it in one read.
+
+#### Do not map these ports by link state
+
+An earlier pass concluded the opposite — that `int-ngio` was not wired to the switch — because
+toggling it changed no switch port. **That method is invalid on this hardware.** On a 10GBASE-KR
+backplane link the serdes stays trained regardless of the netdev's admin state, so:
+
+- `te1` reports `linkState` UP permanently, even with `enp8s0f0np0` administratively down
+- bringing that NIC up or down produces **no** change in the switch's link state
+- the switch happily floods broadcast out `te1` into a dead end
+
+Counters make it obvious, and are the honest signal:
+
+```
+port      rx bytes    rx pkts     tx bytes    tx pkts
+te1           1694          0      4157513      39361   <- rx frozen, tx climbing
+te2        3287576      41141      2248727       1608   <- both moving
+te3/te4          0          0            0          0
+```
+
+**MAC learning is the only reliable way to map a backplane port.** `encs-switch-tui` now derives
+the mapping this way at runtime (cross-referencing `{ForwardingTable}` against the host's own NIC
+MACs from sysfs) and flags a trained-but-silent link as `UP idle` in yellow, precisely because
+`UP` next to `UP` gave no way to tell a working link from a dead one.
+
+### Front-panel labels — verified by cabling (2026-08-10)
+
+The API says `gi0`..`gi7`; the chassis silkscreen says **`GE1/0`..`GE1/7`** (slash, matching
+Cisco's CLI form — `switch_port_info.py` `port_xlate` maps `gi` → `gi1/`). The TUI shows the panel
+label alongside the API name.
+
+Method — shut every port, enable exactly one, see what links:
+
+| Cable in | Port enabled | Result |
+|---|---|---|
+| `GE1/0`, top-left jack | `gi0` only | link UP 1000 |
+| `GE1/7`, bottom-right jack | `gi7` only | link UP 1000, learned `3c:ec:ef:xx:xx:xx` |
+| `GE1/4`, top row 3rd column | `gi4` only | link UP 1000 |
+
+All three land where the naming predicts, so **`gi<n>` = `GE1/<n>`**. Each test enabled exactly one
+port with the other seven left shut, so a link could only come from the jack under test.
+
+The physical arrangement is **column-major** — four vertically stacked RJ45 pairs, numbered top
+then bottom within each pair, not left to right across the row. The silkscreen heads the block
+`GE LAN` and numbers the jacks `1/0`..`1/7` (commonly written `GE1/0`, and `gi1/0` in Cisco's CLI):
+
+```
+   GE LAN
+   1/0   1/2   1/4   1/6
+   1/1   1/3   1/5   1/7
+```
+
+Cross-checked against Cisco's own published ENCS **5406** front-panel diagram, which shows the same
+`1/0`/`1/6` top and `1/1`/`1/7` bottom numbering — so the layout is not 5412-specific.
+
+`GE1/1` is directly *below* `GE1/0`. This is worth knowing before someone counts along the top row
+and unplugs the wrong customer. It also explains why the two endpoint tests could not settle the
+layout on their own: top-left and bottom-right are index 0 and 7 under both row-major and
+column-major, so they were consistent with either. The layout above came from reading the
+silkscreen; the cabling only anchored the two ends.
+
+None of that changes the API mapping, which is index → **printed label** — the label being what the
+operator actually reads. With both ends and an interior point confirmed, `gi1`/`gi2`/`gi3`/`gi5`/
+`gi6` are interpolated across a regular four-pair structure; a permutation that fixes 0, 4 and 7
+while scrambling the rest is not a credible failure mode. Only the 5412 has been checked — 5406 and
+5408 are unconfirmed.
+
+#### The rest of the front panel is not on the switch
+
+Everything except the eight `GE1/x` jacks bypasses the Marvell ASIC entirely. None of these MACs
+ever appear in the switch's forwarding table.
+
+| Panel label | Hardware | State on this box |
+|---|---|---|
+| **CONSOLE** (top) | `ttyS0` — real 16550A, `0x3F8` IRQ 4 | serial console to the host CPU, 115200 8N1. See below. |
+| **CIMC** (bottom) | the BMC's serial port | out-of-band CLI to the CIMC |
+| **MGMT CPU** (top) | I210, `0f:00.0`, `enp15s0` | `Port: Twisted Pair`, link up 1000. Proxmox at `<host-ip>`. This is the jack NFVIS used for its own management. |
+| **MGMT CIMC** (bottom) | the BMC's own NIC — invisible to the host, absent from `lspci` | CIMC at `<cimc-ip>` |
+| **GE0/0** (top row) | I350 `02:00.0`, `enp2s0f0` | RJ45 **and** SFP jack, one logical port |
+| **GE0/1** (bottom row) | I350 `02:00.1`, `enp2s0f1` | RJ45 **and** SFP jack, one logical port |
+
+#### The CONSOLE port is a full out-of-band recovery path
+
+Verified 2026-08-10: an RJ45→USB serial adapter on **CONSOLE** at **115200 8N1** lands straight on
+Proxmox. Confirmed from both ends — a login prompt on the client, and on the host
+`serial-getty@ttyS0` respawning at the moment of connection plus a `root ttyS0` entry in `last`.
+`/proc/tty/driver/serial` shows `ttyS0` as a real `16550A` at `0x3F8` with live tx/rx counters;
+`ttyS1` has no hardware behind it.
+
+This survives a Proxmox reinstall because the installer writes
+`/etc/default/grub.d/installer.cfg`:
+
+```
+GRUB_TERMINAL_INPUT="console serial"
+GRUB_TERMINAL_OUTPUT="gfxterm serial"
+GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"
+GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX console=ttyS0,115200"
+```
+
+Note the setting is **not** in `/etc/default/grub` itself, which looks alarming — but a
+`grub-mkconfig` dry run confirms the snippet is picked up and `console=ttyS0,115200` is preserved,
+so a kernel update will not silently cost you the console. GRUB's own menu is on the serial line
+too, so the boot menu and the `single` recovery entry are both reachable.
+
+That matters on this platform more than most: the switch management VLAN is link-local, the switch
+config is volatile, and a mis-set `BACKPLANE` or a shut `te2` can cut you off from the ASIC. The
+CONSOLE port depends on none of that.
+
+**MGMT CPU and MGMT CIMC are two physically separate jacks**, not one port shared over a BMC
+sideband. The host reaches `<cimc-ip>` out `vmbr0`/`enp15s0` — i.e. out of the MGMT CPU jack,
+across the external LAN, and back in through the MGMT CIMC jack. They share a subnet only because
+both are patched into the same LAN. (An earlier revision of this document claimed the CIMC shared
+the I210 PHY via NC-SI. It does not.)
+
+**`GE0/0` and `GE0/1` are dual-media**: each is one I350 function fronted by both an RJ45 and an
+SFP cage — top row is `GE0/0`, bottom row is `GE0/1`. Under a stock in-tree `igb` both report
+`Supported ports: [ FIBRE ]` and `Port: FIBRE`, and **the RJ45 side will not link at all**.
+Selecting copper needs Cisco's `igb` fork and its `def_media` knob — see §5 Q3.
+
+Confirmed positively by walking one 1000BASE-T copper SFP between the two cages and watching which
+function could read its EEPROM (`ethtool -m`) — the module identifies as
+`Identifier 0x03 (SFP) / Transceiver type: Ethernet: 1000BASE-T`:
+
+| SFP in | `enp2s0f0` (`02:00.0`) | `enp2s0f1` (`02:00.1`) |
+|---|---|---|
+| `GE0/0` cage | **reads EEPROM** | `Input/output error` |
+| `GE0/1` cage | `Input/output error` | **reads EEPROM** |
+
+The readout follows the module, so `GE0/0` = `02:00.0` and `GE0/1` = `02:00.1`. **No switch port
+changed state in either position.** Together with the firmware's own refusal message for `te3`
+(below), that rules out any `GE0/x` jack — copper or optical — being a switch port.
+
+This is positive evidence rather than absence: an empty cage returns an I/O error, so a successful
+EEPROM read proves that cage is wired to that specific I350 function.
+
+Note the SFP cage is the *only* way to get a `GE0/x` port up on stock Proxmox, since the RJ45 side
+is unreachable without Cisco's `igb`. Otherwise MGMT CPU is the only usable uplink.
+
+#### Why the RJ45 side is dead, precisely
+
+Cisco documents these as dual-media with **fiber taking priority over copper when both are live at
+boot**. That is not the mechanism at work under Proxmox, and the distinction matters — do not
+expect "pull the SFP and the RJ45 wakes up". Measured with an *empty* cage, the copper side still
+never linked. The reason is further down the stack:
+
+| Evidence | Meaning |
+|---|---|
+| PCI ID `8086:1522` = *I350 Gigabit **Fiber** Network Connection* | the NVM presents a fiber-variant device, not a dual-media one |
+| `Supported ports: [ FIBRE ]`, `Supported link modes: 1000baseKX/Full` | only a SerDes/backplane mode is exposed — no copper mode exists to select |
+| in-tree `igb` params are `max_vfs` and `debug` only | **no `def_media` knob**; nothing to override with |
+| driver `igb` 6.8.12-41-pve, NVM `1.63, 0x80000e2f` | stock Proxmox 8.4 kernel driver |
+
+So on stock Proxmox the copper connector is not deprioritised — it is simply not exposed. Media
+priority is a Cisco-`igb`/NFVIS behaviour and is **not verified here**.
+
+For context on the NFVIS side (reported, not verified by this project): NFVIS 3.10+ binds `GE0-0`
+to `wan-br` with DHCP enabled out of the box, which is why `GE0/0` is "the WAN port" in Cisco's
+documentation and why its panel annotation reads *"NFVIS and VNF Management via WAN"*.
+
 ```
 FRONT PANEL
-  MGMT      GE0-0  GE0-1          GE1-0 ... GE1-7  (8x RJ45, PoE)
-    |         |      |                |  |  |  |
-  I210      I350   I350         +-----+--+--+--+-----+
- 0e:00.0   02:00.0 02:00.1      |  Marvell BobCat2   |
-    |         |      |          |     0d:00.0        |
-    |         |      |          +---------+----------+
-    |         |      |            10G bkpl|   ^ PCIe (boot only)
-  +-+---------+------+--------------------+---+------------------+
-  |                        HOST CPU                              |
-  |   MGMT    GE0-0  GE0-1          int-LAN (08:00.1)   0d:00.0  |
-  |                                  = X710, internal   passthru |
-  +--------------------------------------------------------------+
-        ^ Proxmox owns these          ^ Proxmox            ^ VM
+  MGMT CPU    GE0/0: RJ45 SFP     GE1/0 GE1/2 GE1/4 GE1/6   <- stacked pairs,
+  MGMT CIMC   GE0/1: RJ45 SFP     GE1/1 GE1/3 GE1/5 GE1/7      numbered DOWN
+     |  |       |       |           |  |  |  |                 then across
+     |  |    (one I350 function per row,  |  |
+     |  |     two jacks, pick one media)  |  |
+     |  |       |                 +----+--+--+--+------+
+   I210 BMC   I350 02:00.0/.1     |  Marvell BobCat2   |
+  0f:00.0                         |  gi0..gi7 = GE1/n  |
+     |  |       |                 +---------+----------+
+     |  |       |               te1 |  te2  |   ^ PCIe (boot only)
+  +--+--+-------+-------------------+-------+---+------------------+
+  |  |  ^ BMC, not visible to the host      |   |                  |
+  |  |                    HOST CPU          |   |                  |
+  |  enp15s0   enp2s0f0/f1     int-ngio  int-LAN        Marvell    |
+  |  = Proxmox  = fibre-only    08:00.0   08:00.1       passthru   |
+  |              on stock igb   = X710, BOTH to the switch         |
+  +----------------------------------------------------------------+
+        ^ Proxmox owns these                            ^ bootstrap VM
 ```
+
+Both X710 functions land on the ASIC (`08:00.0` = `te1`, `08:00.1` = `te2`); only `te2` carries the
+management VLAN. `te3`/`te4` exist on the ASIC but are down and unattributed. See §"Mapping
+te1-te4" for how that was established and why link state is the wrong tool for it.
 
 Design consequences:
 

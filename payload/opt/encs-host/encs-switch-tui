@@ -16,6 +16,8 @@ Environment:
     SW_CFG_DIR default /etc/encs-switch
     ENCS_REPO  GitHub repo --update pulls from
     ENCS_NO_UPDATE_CHECK=1   skip the startup release check entirely
+    ENCS_ALLOW_TE_SHUT=1     permit shutting the internal backplane ports
+                             (te1-te4). Refused by default - see the manual.
 
 Non-interactive:
     encs-switch-tui --save     capture running config to SW_CFG_DIR
@@ -52,7 +54,7 @@ CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
 
 # Single source of truth for the version. scripts/release.sh reads this line
 # to name the tag and the tarball, so keep the literal on one line.
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 
 # Where --update looks. Override for a fork or a test repo.
 GITHUB_REPO = os.environ.get("ENCS_REPO", "foureight84/encs5400-almalinux")
@@ -90,6 +92,26 @@ LAG_MEMBER = {"1": "active", "2": "inactive", "3": "not candidate"}
 # switchports_cdb_util.py:51 - "Max 4 Port Channels"
 MAX_LAG = 4
 
+# switch_main.py:1742 creates 2350-2353 + 2363 at startup; switch_util.py:290
+# refuses user VLANs inside 2350-2449. 2363 is the management VLAN this tool
+# talks over; 2351/2350 are the module fabric's control and data planes.
+MGMT_VLAN = "2363"
+CP_VLAN, DP_VLAN = "2351", "2350"
+
+# What each internal backplane port is for, so a refusal can say WHY.
+TE_ROLE = {
+    "te1": "the host's trunk into the expansion-module fabric "
+           f"(VLANs {CP_VLAN} control / {DP_VLAN} data)",
+    "te2": "the host data path and the management VLAN",
+    "te3": "expansion-module (NIM) port 0",
+    "te4": "expansion-module (NIM) port 1",
+}
+
+# Shutting a backplane port is a foot-cannon: te2 carries this very session,
+# and the ASIC has no flash, so there is no way to undo it except a cold power
+# cycle that wipes the whole config. Off by default, escape hatch documented.
+ALLOW_TE_SHUT = bool(os.environ.get("ENCS_ALLOW_TE_SHUT"))
+
 POE_ADMIN = {"1": "on", "2": "off"}
 POE_DETECT = {"1": "disabled", "2": "searching", "3": "DELIVERING",
               "4": "fault", "5": "test", "6": "other"}
@@ -97,7 +119,7 @@ ADDR_TYPE = {"1": "static", "2": "dynamic", "3": "dynamic", "4": "self"}
 
 PORT_ROLE = {
     "gi": "front-panel RJ45 (PoE capable)",
-    "te": "internal 10G backplane serdes (10GBASE-KR) to the host X710 / NIM slot",
+    "te": "internal 10G backplane serdes (10GBASE-KR) - board traces, no connector",
     "LA": "link aggregation group",
 }
 
@@ -108,6 +130,56 @@ PORT_ROLE = {
 # firmware build is less forthcoming.
 PORT_FIELDS = ["interfaceName", "linkState", "adminState", "mediaType",
                "speedOper", "duplexOperMode", "MACAddress", "LACPEnabled"]
+STAT_FIELDS = ["interfaceName", "receivePacketByteCount",
+               "receiveUnicastPacketCount", "transmitPacketByteCount",
+               "transmitUnicastPacketCount", "packetErrorCount"]
+MAC_FIELDS = ["VLANID", "MACAddress", "interfaceName", "addressType"]
+
+
+def panel_label(ifname):
+    """What is silkscreened on the chassis, for the ports that have a jack.
+
+    The API says gi0..gi7; the ENCS 5412 front panel reads GE1/0..GE1/7, which
+    is also Cisco's CLI form (switch_port_info.py port_xlate maps "gi" ->
+    "gi1/"). When you are standing in front of the box about to pull a cable,
+    the silkscreen is the name that matters.
+
+    Verified on a 5412 by cabling GE1/0, GE1/4 and GE1/7 with every other port
+    shut - each lit gi0, gi4 and gi7. The jacks are four vertically stacked
+    pairs numbered downwards (GE1/1 is below GE1/0, not beside it).
+
+    Only the 8 LAN jacks get one. te1-4 are internal backplane serdes with no
+    connector, and GE0/0, GE0/1 and MGMT on the panel are I350/I210 ports
+    wired to the host CPU - they are not on this switch at all.
+    """
+    m = re.fullmatch(r"gi(\d+)", ifname or "")
+    return f"GE1/{m.group(1)}" if m else "-"
+
+
+def local_nics():
+    """MAC -> host interface name, read from sysfs.
+
+    Used to say which host NIC is on the other end of a backplane port. Read
+    by MAC, never by name: interface names are not stable across Debian
+    releases (bookworm -> trixie renamed plenty of them), and this must keep
+    working when they change. Empty dict off-host, which is fine - the peer
+    column just stays blank.
+    """
+    out = {}
+    base = "/sys/class/net"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return out
+    for n in sorted(names):
+        try:
+            with open(os.path.join(base, n, "address")) as f:
+                mac = f.read().strip().lower()
+        except OSError:
+            continue
+        if mac and mac != "00:00:00:00:00:00":
+            out.setdefault(mac, n)
+    return out
 
 
 class SwitchError(Exception):
@@ -224,21 +296,31 @@ class Switch:
                         "members": [m for m in members if m["portName"]]})
         return out
 
-    def ports_and_lags(self):
-        """Both tables in one GET, the way switch_port_info.py:550 does it.
+    def port_snapshot(self):
+        """Everything the Ports view needs, in ONE GET.
 
-        Membership is only meaningful against the port list it was read with,
-        so fetching them together also keeps the two consistent.
+        switch_port_info.py:550 already combines {Standard802_3List}{LAGList};
+        the wcd API takes any number of tables, so counters and the MAC table
+        ride along at no extra round trip. They have to be read together
+        anyway - LAG membership, "is this link actually carrying anything",
+        and "what is on the other end" are only meaningful against the port
+        list they were sampled with.
+
+        Returns {"ports", "lags", "stats", "macs"}.
         """
-        body = self._request(f"https://{self.ip}/wcd?{{Standard802_3List}}{{LAGList}}")
+        body = self._request(f"https://{self.ip}/wcd?"
+                             f"{{Standard802_3List}}{{LAGList}}"
+                             f"{{StatisticsList}}{{ForwardingTable}}")
         ports = self._rows(body, "Entry", PORT_FIELDS, within="Standard802_3List")
         if not ports:
             # Should not happen, but never lose the Ports view over a wrapper
-            # element that is not shaped the way we expect. LAGList nests its
-            # rows under LAGEntry/PortEntry, so a document-wide sweep for
-            # "Entry" cannot pick up anything but ports.
-            ports = self._rows(body, "Entry", PORT_FIELDS)
-        return ports, self._lags(body)
+            # element that is not shaped the way we expect.
+            ports = self._rows(body, "Entry", PORT_FIELDS, within="DeviceConfiguration")
+        stats = {r["interfaceName"]: r
+                 for r in self._rows(body, "InterfaceStatisticsEntry", STAT_FIELDS)}
+        macs = self._rows(body, "Entry", MAC_FIELDS, within="ForwardingTable")
+        return {"ports": ports, "lags": self._lags(body),
+                "stats": stats, "macs": macs}
 
     def poe(self):
         return self._rows(self.get("PoEPSEInterfaceList"), "Interface",
@@ -313,7 +395,8 @@ def save_config(sw, path=CFG_DIR):
     os.makedirs(path, exist_ok=True)
     written = []
 
-    allports, lags = sw.ports_and_lags()
+    snap = sw.port_snapshot()
+    allports, lags = snap["ports"], snap["lags"]
     ports = [p for p in allports if p["interfaceName"].startswith("gi")]
     ent = "".join(f"        <Entry><interfaceName>{p['interfaceName']}</interfaceName>"
                   f"<adminState>{p['adminState']}</adminState></Entry>\n"
@@ -622,22 +705,73 @@ therefore the management VLAN (2363, 169.254.1.1 -> 169.254.1.0)."""),
   ?  Help     this manual."""),
 
     ("READING THE PORTS VIEW", """\
-  gi0-gi7   the 8 front-panel RJ45 ports (PoE capable), media "copper"
-  te1-te4   INTERNAL 10G backplane, media shown as "backplane". These are
-            10GBASE-KR serdes links - board traces, no optics, no cable.
-            te1/te2 reach the host X710 (te2 normally carries your traffic);
-            te3/te4 head to the NIM slot.
+  gi0-gi7   the 8 front-panel RJ45 ports (PoE capable), media "copper".
+            The panel column gives the label silkscreened on the chassis:
+            gi0 = GE1/0 ... gi7 = GE1/7, which is also Cisco's CLI form.
+
+            The 8 jacks are four vertically stacked pairs, numbered top then
+            bottom within each pair - NOT left to right:
+
+                 GE1/0   GE1/2   GE1/4   GE1/6
+                 GE1/1   GE1/3   GE1/5   GE1/7
+
+            So GE1/1 sits directly BELOW GE1/0, not beside it. Verified on a
+            5412 by cabling GE1/0, GE1/4 and GE1/7 one at a time with every
+            other port shut: each brought up gi0, gi4 and gi7 respectively.
+
+            GE0/0, GE0/1 and MGMT on the panel are I350/I210 ports wired
+            straight to the host CPU. They are NOT on this switch, will never
+            appear here, and under a stock in-tree igb the two GE0 ports sit
+            in fibre mode and will not link on RJ45 at all.
+
+            To re-check on another chassis: shut every port, enable one, plug
+            a cable into a jack you can read, see which gi<n> lights up.
+
+  te1-te4   INTERNAL 10G backplane. Board traces between the ASIC and other
+            chips - NO connector, nothing on the front panel corresponds to
+            them. You cannot plug anything into a te port.
+
+            te1 and te2 are BOTH host X710 ports. te2 carries the management
+            VLAN and normally your traffic. The "attached to" column names
+            the actual host NIC, worked out live from the MAC table, so it is
+            right on any chassis rather than baked in.
+
+            te3/te4 are the expansion-module (NIM) ports: switch-confd maps
+            module port 0 to te3 and port 1 to te4, on internal VLANs 2351
+            (control plane) and 2350 (data plane). They stay down with
+            autonegotiation off when no module is fitted. That mapping comes
+            from reading Cisco's code, not from a link ever being observed.
+
+SHUTTING A te PORT IS REFUSED. The switch owns its end of each backplane
+link and will happily accept the shut - te2 carries the management VLAN, so
+shutting it ends your session, and with no flash on the ASIC only a cold
+power cycle undoes it. Worse, the serdes stays trained either way, so a shut
+backplane port still reports link UP and nothing on screen looks wrong.
+Enabling a te port is always allowed; only shutting is blocked. Override
+with ENCS_ALLOW_TE_SHUT=1 if you genuinely mean it.
             The raw mediaType enum only has copper/fiber, so the firmware
             calls these "fiber". They are not. (Same coarseness makes lspci
             report the RJ45 I350 ports as "Fiber".)
   LAG1-4    link aggregation groups - no media. Empty until you put ports
             in them with g; the lag column then shows the member count.
 
-  link      UP / down / n-p (not present)
+  link      UP        trained AND receiving - green
+            UP idle   trained but NOTHING has arrived - yellow
+            down      no link
+            n/p       not present
   admin     up   = enabled
             SHUT = administratively disabled, shown in red
   lag       which LAG this port is bundled into, "(i)" if it is a member
             but inactive (in the group, not forwarding)
+  attached  the host NIC found on the other end, from the MAC table
+    to      (blank until that end sends a frame - a down NIC never does)
+
+"UP" IS NOT "IN USE". It describes the serdes, nothing more. A 10GBASE-KR
+backplane link stays trained even when the host NIC at the far end is
+administratively down, so a completely idle port reports UP forever while
+the switch floods broadcast at it and gets nothing back. That is why "UP
+idle" and the yellow are called out separately, and why the detail panel
+shows rx/tx packet counts: counters moving is the only real proof of use.
 
 IMPORTANT: after a cold bootstrap every gi port comes up SHUT and PoE off.
 The switch boots but forwards nothing until you enable them. That is what
@@ -827,7 +961,11 @@ class UI:
     def refresh_data(self, force=False):
         try:
             if self.view == "ports":
-                self.data["ports"], self.data["lags"] = self.sw.ports_and_lags()
+                snap = self.sw.port_snapshot()
+                self.data["ports"] = snap["ports"]
+                self.data["lags"] = snap["lags"]
+                self.data["portstats"] = snap["stats"]
+                self.data["portmacs"] = snap["macs"]
             elif self.view == "poe":
                 self.data["poe"] = self.sw.poe()
             elif self.view == "vlans":
@@ -854,6 +992,53 @@ class UI:
         return {m["portName"]: (lag["interfaceName"], m["membershipType"])
                 for lag in self.data.get("lags", [])
                 for m in lag["members"] if m["membershipType"] in ("1", "2")}
+
+    def peer_map(self):
+        """switch port -> name of the host NIC on the other end of it.
+
+        Derived, never hardcoded: cross-references the switch's own MAC table
+        against this machine's NICs. That is what makes it correct on any
+        chassis - MACs differ per unit, so a baked-in table would be wrong
+        everywhere but here.
+
+        A port only appears once the far end has actually sent a frame. An
+        admin-down NIC never does, so a silent backplane link stays blank -
+        which is itself the useful signal.
+        """
+        nics = local_nics()
+        out = {}
+        for m in self.data.get("portmacs", []):
+            nic = nics.get(m["MACAddress"].strip().lower())
+            if nic and m["interfaceName"]:
+                out.setdefault(m["interfaceName"], nic)
+        return out
+
+    def mgmt_port(self):
+        """The switch port this session's traffic actually arrives on.
+
+        Derived, not assumed: a local NIC's MAC learned in the management
+        VLAN. Shutting this port ends the session, and with no flash on the
+        ASIC the only way back is a cold power cycle that wipes everything.
+        """
+        nics = local_nics()
+        for m in self.data.get("portmacs", []):
+            if (m["VLANID"] == MGMT_VLAN
+                    and m["MACAddress"].strip().lower() in nics):
+                return m["interfaceName"]
+        return None
+
+    def rx_idle(self, ifname):
+        """True if the link is up but has never received a unicast frame.
+
+        The trap this exists for: a 10GBASE-KR backplane link stays trained
+        even when the host NIC at the far end is administratively down, so the
+        switch reports it UP while nothing whatsoever is arriving. "up" is a
+        statement about the serdes, not about traffic.
+        """
+        s = self.data.get("portstats", {}).get(ifname)
+        if not s:
+            return False
+        return (s.get("receiveUnicastPacketCount") or "0").strip() in ("0", "")
 
     def set_msg(self, m, bad=False):
         self.msg, self.msg_bad = m, bad
@@ -895,8 +1080,9 @@ class UI:
         if self.view == "help":
             self.draw_help(3, h, w)
         else:
-            # Ports gets an extra line: LAG state can add two of its own.
-            dh = ((7 if self.view == "ports" else 6)
+            # Ports needs the most room: LAG state and the idle-link warning
+            # can each add two lines of their own.
+            dh = ((9 if self.view == "ports" else 6)
                   if (self.detail and self.view in ("ports", "poe", "vlans")) else 0)
             {"ports": self.d_ports, "poe": self.d_poe, "vlans": self.d_vlans,
              "mac": self.d_mac, "stats": self.d_stats,
@@ -953,12 +1139,28 @@ class UI:
         if self.view == "ports":
             n = r["interfaceName"]
             role = PORT_ROLE.get(n[:2], "")
-            out = [f"{n}  -  {role}",
+            pl = panel_label(n)
+            head = f"{n}  -  {role}"
+            if pl != "-":
+                head = f"{n}  =  front panel {pl}  -  {role}"
+            peer = self.peer_map().get(n)
+            if peer:
+                head += f"  ->  this host's {peer}"
+            st = self.data.get("portstats", {}).get(n, {})
+            out = [head,
                    f"  link {LINK.get(r['linkState'],'?')}   "
                    f"admin {ADMIN.get(r['adminState'],'?')}   "
                    f"{r['speedOper']} Mb/s {DUPLEX.get(r['duplexOperMode'],'-')}   "
                    f"media {media_label(n, r['mediaType'])}",
-                   f"  mac  {r['MACAddress']}"]
+                   f"  mac  {r['MACAddress']}"
+                   + (f"   rx {st.get('receiveUnicastPacketCount','?')} pkts"
+                      f"   tx {st.get('transmitUnicastPacketCount','?')} pkts"
+                      if st else "")]
+            if r["linkState"] == "1" and self.rx_idle(n):
+                out.append("  UP BUT IDLE - nothing has arrived on this port. A "
+                           "backplane link stays trained even")
+                out.append("  when the NIC at the far end is down, so UP here "
+                           "means the serdes, not traffic.")
             lm = self.lag_map()
             if n.startswith("LAG"):
                 mem = [(p, s) for p, (g, s) in sorted(lm.items()) if g == n]
@@ -1025,6 +1227,7 @@ class UI:
 
     def d_ports(self, y, h, w):
         lm = self.lag_map()
+        pm = self.peer_map()
 
         def lag_col(r):
             n = r["interfaceName"]
@@ -1038,18 +1241,32 @@ class UI:
             # (i) = bound but inactive: in the group, not currently forwarding.
             return g[0] + ("" if g[1] == "1" else "(i)")
 
+        def link_col(r):
+            s = LINK.get(r["linkState"], "?")
+            # "idle" reads as what it is: trained, but nothing coming in.
+            if r["linkState"] == "1" and self.rx_idle(r["interfaceName"]):
+                return "UP idle"
+            return s
+
         self._list(
             y, h, w,
-            f"{'port':8}{'link':7}{'admin':8}{'speed':9}{'duplex':8}{'media':9}"
-            f"{'lag':9}mac",
-            lambda r: (f"{r['interfaceName']:8}{LINK.get(r['linkState'],'?'):7}"
-                       f"{ADMIN.get(r['adminState'],'?'):8}{r['speedOper']:9}"
-                       f"{DUPLEX.get(r['duplexOperMode'],'-'):8}"
-                       f"{media_label(r['interfaceName'], r['mediaType']):9}"
+            f"{'port':7}{'panel':7}{'link':9}{'admin':7}{'speed':8}{'media':10}"
+            f"{'lag':9}{'attached to':16}mac",
+            lambda r: (f"{r['interfaceName']:7}"
+                       f"{panel_label(r['interfaceName']):7}"
+                       f"{link_col(r):9}{ADMIN.get(r['adminState'],'?'):7}"
+                       f"{r['speedOper']:8}"
+                       f"{media_label(r['interfaceName'], r['mediaType']):10}"
                        f"{lag_col(r):9}"
+                       f"{pm.get(r['interfaceName'], '-'):16}"
                        f"{r['MACAddress']}"),
             self.rows(),
-            lambda r: (curses.color_pair(C_OK) if r["linkState"] == "1"
+            # Green only when the link is up AND something is arriving on it.
+            # Yellow for trained-but-silent, which used to look identical to a
+            # working port and is exactly how te1 gets mistaken for in-use.
+            lambda r: (curses.color_pair(C_WARN)
+                       if r["linkState"] == "1" and self.rx_idle(r["interfaceName"])
+                       else curses.color_pair(C_OK) if r["linkState"] == "1"
                        else curses.color_pair(C_BAD) if r["adminState"] == "2"
                        else 0))
 
@@ -1147,6 +1364,25 @@ class UI:
         curses.curs_set(0)
         return v
 
+    def may_shut(self, ifname):
+        """Guard the internal backplane ports against being shut.
+
+        These are real, settable ports - the switch owns its end of each
+        backplane link, so shutting te2 drops the management VLAN and this
+        session with it, and the ASIC has no flash to recover from. Enabling
+        is always allowed; only shutting is refused.
+        """
+        if not ifname.startswith("te") or ALLOW_TE_SHUT:
+            return True
+        why = TE_ROLE.get(ifname, "an internal backplane link")
+        if ifname == self.mgmt_port():
+            self.set_msg(f"REFUSED: {ifname} carries THIS session - {why}. "
+                         f"Only a cold power cycle would undo it.", bad=True)
+        else:
+            self.set_msg(f"REFUSED: {ifname} is {why} - no front-panel jack. "
+                         f"Override with ENCS_ALLOW_TE_SHUT=1.", bad=True)
+        return False
+
     def bind_lag(self, p):
         """Add the selected port to a LAG, or take it out of one."""
         name = p["interfaceName"]
@@ -1236,8 +1472,11 @@ class UI:
             elif c == ord(" ") and self.view == "ports" and rows:
                 p = rows[self.sel]
                 up = p["adminState"] != "1"
-                self.write(f"{p['interfaceName']} admin {'up' if up else 'shut'}",
-                           lambda: self.sw.set_port_admin(p["interfaceName"], up))
+                if up or self.may_shut(p["interfaceName"]):
+                    self.write(f"{p['interfaceName']} admin "
+                               f"{'up' if up else 'shut'}",
+                               lambda: self.sw.set_port_admin(
+                                   p["interfaceName"], up))
             elif c == ord("g") and self.view == "ports" and rows:
                 self.bind_lag(rows[self.sel])
             elif c == ord(" ") and self.view == "poe" and rows:
