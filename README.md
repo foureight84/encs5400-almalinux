@@ -215,11 +215,136 @@ It is idempotent — safe to re-run, and it skips anything already in place.
 encs-switch-tui        # press ? for the built-in manual
 ```
 
-Ports, VLANs, PoE, MAC table, statistics, and config save/replay.
+Ports, VLANs, PoE, link aggregation, MAC table, statistics, and config
+save/replay. The active view is highlighted in the tab bar; the running
+version sits at the right-hand end of the title bar.
 
 **Front ports come up administratively SHUT with PoE off** after a bootstrap —
 that is the firmware default, and NFVIS's own init is what used to enable them.
 Open the Ports view and press `space`, or apply a saved config.
+
+### Link aggregation (LAG / port-channel)
+
+The ASIC supports **four groups, `LAG1`–`LAG4`**. They show up in the Ports
+view from the start but stay empty — `link n/p`, no media — until you put
+ports in them.
+
+Select a `gi` port in the Ports view and press **`g`**:
+
+```
+add gi3 to which LAG? 1-4 (0 = none):  1
+mode: (a)uto = LACP, (o)n = static:    a
+```
+
+Press `g` on a member and answer `0` to take it back out. The `lag` column
+shows each port's group, and the group rows show a member count; select a
+`LAG` row to see its members and their state in the detail panel.
+
+| Mode | Behaviour |
+|---|---|
+| `auto` | LACP — negotiates with the far end. **Use this unless you know otherwise.** |
+| `on` | Static bundle. Forwards immediately, negotiates nothing. Only correct if the far end is also static. |
+
+> **A static `on` bundle facing an LACP peer silently black-holes traffic.**
+> Neither side logs an error; frames just disappear. When in doubt, `auto`.
+
+Member state, shown as `LAG1` or `LAG1(i)` in the `lag` column:
+
+| State | Meaning |
+|---|---|
+| active | in the group and forwarding |
+| inactive `(i)` | in the group, not forwarding — usually the far end is not bundling this port |
+| not candidate | listed against the group but not a member; not shown as membership |
+
+Two things the TUI enforces for you:
+
+- **Only the eight `gi` front ports can be bundled.** `te1`/`te2` are the
+  internal 10G backplane links that carry both your data path and the
+  management session on VLAN 2363 — bundling one cuts the wire you are
+  managing over. The TUI refuses them outright.
+- **Membership is volatile like everything else.** Save it (`c`, then `w`)
+  or a cold power cycle takes it with the rest of the config. It lands in
+  `/etc/encs-switch/15-lag.xml` and is replayed before VLAN membership.
+
+The write goes to the *member port*, not to the group — it sets `LACPEnabled`
+and `LAGID` on the port's own `Standard802_3List` entry, which is exactly what
+Cisco's `switch-confd` sent for `channel-group`. See
+[docs/CONFIG.md](docs/CONFIG.md) for the file format and
+[docs/FINDINGS.md](docs/FINDINGS.md) for how it was derived.
+
+### Updating the host tools
+
+The switch tools on the hypervisor are **completely independent of the disk
+image**. The ISO and qcow2 only carry the bootstrap VM — kernel, Marvell
+module, firmware loader. `encs-switch-tui` and `encs-switch-api` run on
+Proxmox. **Updating them never requires rebuilding anything.**
+
+On startup the TUI asks GitHub once, in the background, whether a newer
+release exists; if so the title bar says
+`v0.0.1 -> v0.1.0 available`. A host with no route to github.com simply sees
+nothing — no error, no delay. Set `ENCS_NO_UPDATE_CHECK=1` to skip the request
+entirely.
+
+```sh
+encs-switch-tui --version         # what is installed
+encs-switch-tui --check-update    # is there anything newer?
+sudo encs-switch-tui --update     # fetch and install it
+```
+
+`--update` fetches the release tarball over verified HTTPS, checks it against
+the published `SHA256SUMS`, refuses to install anything that does not compile,
+backs up what it replaces into `/var/backups/encs-switch/<timestamp>/`, and
+swaps each file in atomically. It only writes to `/usr/local/sbin`,
+`/etc/systemd/system` and `/opt/encs-host` — it never touches your switch
+config, the VLAN interface, or `/etc/encs-switch`. Roll back by copying the
+files back out of the backup directory.
+
+#### Updating by hand
+
+If the host has no internet access, or you would rather see exactly what lands
+where, do it manually. **You do not need to rebuild the ISO or the qcow2 for
+any of this.**
+
+*From a release tarball:*
+
+```sh
+V=0.1.0
+curl -fsSLO https://github.com/foureight84/encs5400-almalinux/releases/download/v$V/encs-host-$V.tar.gz
+curl -fsSLO https://github.com/foureight84/encs5400-almalinux/releases/download/v$V/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing     # must print OK
+tar xzf encs-host-$V.tar.gz && cd encs-host-$V
+
+install -m 0755 encs-switch-tui encs-switch-api /usr/local/sbin/
+install -m 0644 encs-switch-replay.service /etc/systemd/system/
+systemctl daemon-reload
+encs-switch-tui --version
+```
+
+The tarball's `MANIFEST` lists every file and its destination, so that install
+loop is just those five lines spelled out.
+
+*From a git checkout* — no release needed, and this is the right path if you
+are running your own modifications:
+
+```sh
+git clone https://github.com/foureight84/encs5400-almalinux
+scp -r encs5400-almalinux/payload/opt/encs-host root@<proxmox>:/root/
+ssh root@<proxmox> 'bash /root/encs-host/install.sh'
+```
+
+`install.sh` is idempotent — it reinstalls the tools and skips the VLAN and
+network config that is already in place.
+
+*Copying just the one file* is also perfectly fine — the TUI is a single
+self-contained Python script with no dependencies beyond the standard library:
+
+```sh
+scp payload/opt/encs-host/encs-switch-tui root@<proxmox>:/usr/local/sbin/
+```
+
+Nothing here restarts the bootstrap VM or touches the ASIC, so updating the
+tools is safe on a live switch. A running TUI keeps its old code until you
+quit and relaunch it.
 
 ### Alternative: install from the ISO instead
 
@@ -367,11 +492,13 @@ never from that log line.
 | Event | Config |
 |---|---|
 | VM restart / service restart | survives (no power cycle of the ASIC) |
-| cold power cycle / AC loss | **lost** — back to VLAN 1 + 2363, all ports shut, PoE off |
+| cold power cycle / AC loss | **lost** — back to VLAN 1 + 2363, all ports shut, PoE off, LAGs empty |
 
 Save it (`encs-switch-tui`, `c`, `w`) into `/etc/encs-switch/*.xml` — those
 files are the switch's real source of truth, and `encs-switch-replay.service`
-reapplies them after a power loss.
+reapplies them after a power loss. **[docs/CONFIG.md](docs/CONFIG.md)** covers
+the file format, the apply ordering, and every enum value, for when you want to
+hand-write one or keep them in version control.
 
 **Never update the kernel.** The Marvell module is built for exactly
 `4.18.0-513.18.2.el8_9` with `modversions` CRCs. The image pins `releasever`
@@ -394,6 +521,7 @@ scripts/
   30-build-iso.sh             trim, regenerate repodata, remaster
   40-build-qcow2.sh           run the install under QEMU/KVM
   50-verify-qcow2.py          boot the result and assert its state
+  release.sh                  package + publish the host tools to GitHub
 kickstart/ks-encs.cfg         the kickstart, heavily commented
 payload/                      our code, installed into the image
   usr/local/sbin/encs-switch-status        (VM) bootstrap health check
@@ -403,12 +531,32 @@ payload/                      our code, installed into the image
     encs-switch-tui                        curses UI, built-in manual
     encs-switch-api                        low-level XML API client
     encs-switch-replay.service             cold-boot config replay
-docs/FINDINGS.md              the full reverse-engineering writeup
+docs/
+  FINDINGS.md                 the full reverse-engineering writeup
+  CONFIG.md                   the /etc/encs-switch/*.xml files, field by field
 ```
 
 `docs/FINDINGS.md` is worth reading if you want the why: how the bootstrap was
 found, why `@core` is a trap on this media, the `curl` globbing bug that made
 the API look broken, and every dead end (with evidence) so nobody retreads them.
+
+`docs/CONFIG.md` is the practical companion: what each config file holds, the
+enum values, and how to hand-write one the replay service will accept.
+
+### Cutting a release
+
+The host tools version independently of the image. Bump `VERSION` in
+`payload/opt/encs-host/encs-switch-tui`, then:
+
+```sh
+./scripts/release.sh              # build + self-verify into out/, publish nothing
+./scripts/release.sh --publish    # tag and create the GitHub release
+```
+
+The build step compiles every script, packages the bundle with a `MANIFEST`,
+generates `SHA256SUMS`, then unpacks its own tarball and checks that the
+manifest paths and the reported version are right — all before anything is
+published. Existing hosts then pick it up with `encs-switch-tui --update`.
 
 ---
 

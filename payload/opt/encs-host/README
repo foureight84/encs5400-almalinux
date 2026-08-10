@@ -39,6 +39,31 @@ Then just run:
 
     encs-switch-tui          press ? for the built-in manual
 
+Ports, VLANs, PoE, link aggregation (Ports view, 'g'), MAC table, statistics
+and config save/replay.
+
+UPDATING
+--------
+These host tools are independent of the disk image — the ISO and qcow2 only
+carry the bootstrap VM. Updating them NEVER requires rebuilding anything.
+
+    encs-switch-tui --version         what is installed
+    encs-switch-tui --check-update    is there anything newer?
+    encs-switch-tui --update          fetch and install it (needs root)
+
+The TUI also checks once at startup and says so in the title bar. Hosts with
+no route to github.com see nothing and are not slowed down;
+ENCS_NO_UPDATE_CHECK=1 skips the check entirely.
+
+--update verifies SHA256SUMS, refuses anything that will not compile, and
+backs up what it replaces into /var/backups/encs-switch/<timestamp>/. It
+writes only to /usr/local/sbin, /etc/systemd/system and /opt/encs-host —
+never to /etc/encs-switch or your network config.
+
+To update by hand instead, re-copy this directory from a newer checkout and
+re-run install.sh; it is idempotent. Or just scp encs-switch-tui over the
+installed one — it is a single stdlib-only Python script.
+
 CONTENTS
 --------
   install.sh                   host installer (run on Proxmox)

@@ -904,6 +904,55 @@ an `xml_*_str` variable in `payload/extract/opt/switch-confd/switch_*.py`, paire
 `url_*_str` naming its `wcd?{Table}` endpoint — VLANs, ports, PoE, STP, LACP, QoS, ACLs, 802.1X,
 RADIUS. Nothing needs to be guessed.
 
+### Link aggregation: the write targets the member port, not the LAG
+
+`LAG1`–`LAG4` show up in `{Standard802_3List}` as ordinary interfaces (`interfaceType` 2) and are
+what the Ports view lists. They are **empty until ports are bound to them**, which is why a fresh
+switch shows them as `n/p` with no media.
+
+Membership is not a property of the group. It is set on the **member port's own**
+`Standard802_3List` entry (`xml_post_channel_group_str`, `switch_interfaces.py:1035`, reached via
+`SET_IFACE_CHANNEL_GROUP` = 925):
+
+```xml
+<DeviceConfiguration>
+    <version>1.0</version>
+    <Standard802_3List action="set">
+        <Entry>
+            <interfaceName>gi3</interfaceName>
+            <LACPEnabled>2</LACPEnabled>   <!-- 1 = on/static, 2 = auto/LACP -->
+            <LAGID>1</LAGID>
+        </Entry>
+    </Standard802_3List>
+</DeviceConfiguration>
+```
+
+| Field | Meaning |
+|---|---|
+| `LAGID` | 1–4. Max 4 groups (`switchports_cdb_util.py:51`, "Max 4 Port Channels"). |
+| `LACPEnabled` | `s_cg_mode_on=1` / `s_cg_mode_auto=2` (`switch_ns.py:298,338`). |
+| unbind | `LAGID` 0 **and** `LACPEnabled` 0 — what confd sends for `no channel-group` (`switch_interfaces.py:7061`). |
+
+**Reading membership back is a different table.** `{LAGList}` returns `LAGEntry` →
+`PortList` → `PortEntry` with `portName` and `membershipType` (1 = active, 2 = inactive,
+3 = not candidate — `switch_port_info.py:573-579`). Cisco fetches it in the *same* GET as the port
+list, `wcd?{Standard802_3List}{LAGList}` (`switch_port_info.py:550`), and `encs-switch-tui` does the
+same. Note `LAGID` is **not** a confirmed read field on `Standard802_3List`; the places confd reads
+it (`switch_port_info.py:3035`, `:4563`) are parsing the `{STP}` table's `InterfaceEntry`.
+
+Two operational traps:
+
+- **Never bundle `te1`/`te2`.** They are the internal backplane links carrying both the data path
+  and the management session on VLAN 2363 — bundling one cuts the wire you are managing over.
+  Cisco's own display code skips `te` ports when listing LAG members (`is_te_channel`), and
+  `encs-switch-tui` refuses them outright.
+- **`on` against an LACP far end black-holes traffic.** Neither side errors; frames just vanish.
+  `auto` is the right default.
+
+`{LACPPortList}`/`{LACPLAGList}` expose actor/partner LACP detail (system priority, MAC, admin and
+oper keys) for a `show lacp` equivalent, but **not** the on/auto mode — so a saved config records
+`LACPEnabled` from the port entry when the firmware reports it and falls back to `auto` otherwise.
+
 ### Root cause of the "empty ActionStatus" dead end: curl globbing
 
 Every `wcd?{Table}` query returned an empty `ActionStatus` for hours. The cause was **not** the

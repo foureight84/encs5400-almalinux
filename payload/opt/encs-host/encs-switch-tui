@@ -14,20 +14,34 @@ Environment:
     SW_USER    default cisco
     SW_PASS    default cisco
     SW_CFG_DIR default /etc/encs-switch
+    ENCS_REPO  GitHub repo --update pulls from
+    ENCS_NO_UPDATE_CHECK=1   skip the startup release check entirely
 
 Non-interactive:
     encs-switch-tui --save     capture running config to SW_CFG_DIR
     encs-switch-tui --apply    replay SW_CFG_DIR (used by encs-switch-replay)
     encs-switch-tui --status   one-line health check, exit 0/1
+    encs-switch-tui --version  print the version and exit
+    encs-switch-tui --check-update   ask GitHub whether a newer release exists
+    encs-switch-tui --update   install the latest release (needs root)
 
-Stdlib only: urllib + curses.
+Stdlib only.
 """
 import curses
+import hashlib
+import json
 import os
+import re
+import shutil
 import ssl
+import subprocess
 import sys
+import tarfile
+import tempfile
 import textwrap
+import threading
 import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -36,7 +50,12 @@ SW_USER = os.environ.get("SW_USER", "cisco")
 SW_PASS = os.environ.get("SW_PASS", "cisco")
 CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
 
-VERSION = "1.0"
+# Single source of truth for the version. scripts/release.sh reads this line
+# to name the tag and the tarball, so keep the literal on one line.
+VERSION = "0.0.1"
+
+# Where --update looks. Override for a fork or a test repo.
+GITHUB_REPO = os.environ.get("ENCS_REPO", "foureight84/encs5400-almalinux")
 
 # ------------------------------------------------------------------ enums
 # switch_interfaces.py: SWITCH_ADMIN_STATE_UP="1", SWITCH_ADMIN_STATE_DOWN="2"
@@ -60,6 +79,17 @@ def media_label(ifname, mediatype):
         return "-"
     return MEDIA.get(mediatype, "-")
 DUPLEX = {"2": "full", "3": "half", "4": "-"}
+
+# switch_ns.py: s_cg_mode_on=1, s_cg_mode_auto=2. "on" is a static bundle,
+# "auto" negotiates with LACP. 0 is not a mode - it is what confd sends
+# alongside LAGID 0 to mean "no channel-group".
+CG_ON, CG_AUTO = "1", "2"
+CG_MODE = {CG_ON: "on/static", CG_AUTO: "auto/LACP"}
+# switch_port_info.py:573-579
+LAG_MEMBER = {"1": "active", "2": "inactive", "3": "not candidate"}
+# switchports_cdb_util.py:51 - "Max 4 Port Channels"
+MAX_LAG = 4
+
 POE_ADMIN = {"1": "on", "2": "off"}
 POE_DETECT = {"1": "disabled", "2": "searching", "3": "DELIVERING",
               "4": "fault", "5": "test", "6": "other"}
@@ -70,6 +100,12 @@ PORT_ROLE = {
     "te": "internal 10G backplane serdes (10GBASE-KR) to the host X710 / NIM slot",
     "LA": "link aggregation group",
 }
+
+# LACPEnabled is what the channel-group POST writes; whether the firmware
+# reports it back on a read is unverified, so everything downstream treats an
+# empty value as "unknown" rather than assuming a mode.
+PORT_FIELDS = ["interfaceName", "linkState", "adminState", "mediaType",
+               "speedOper", "duplexOperMode", "MACAddress", "LACPEnabled"]
 
 
 class SwitchError(Exception):
@@ -144,18 +180,60 @@ class Switch:
         return self._request(f"https://{self.ip}/wcd?", data=xml.encode("utf8"))
 
     @staticmethod
-    def _rows(body, tag, fields):
+    def _rows(body, tag, fields, within=None):
         try:
             root = ET.fromstring(body)
         except ET.ParseError as e:
             raise SwitchError(f"bad XML: {e}")
+        # A multi-table GET returns both tables in one document, so scope the
+        # search to the right one instead of iterating the whole tree.
+        scope = root if within is None else root.find(f".//{within}")
+        if scope is None:
+            return []
         return [{f: (el.findtext(f) or "").strip() for f in fields}
-                for el in root.iter(tag)]
+                for el in scope.iter(tag)]
 
     def ports(self):
-        return self._rows(self.get("Standard802_3List"), "Entry",
-                          ["interfaceName", "linkState", "adminState", "mediaType",
-                           "speedOper", "duplexOperMode", "MACAddress"])
+        return self._rows(self.get("Standard802_3List"), "Entry", PORT_FIELDS)
+
+    @staticmethod
+    def _lags(body):
+        """LAG1-4 with their member ports.
+
+        LAGList is the only table confirmed to report membership on a READ -
+        switch_port_info.py:563 walks LAGEntry/PortList/PortEntry exactly like
+        this. (LAGID appears on Standard802_3List entries, but only as a WRITE
+        field in the channel-group POST, and on the STP table's InterfaceEntry.
+        Neither is a documented read path here.)
+        """
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as e:
+            raise SwitchError(f"bad XML: {e}")
+        out = []
+        for e in root.iter("LAGEntry"):
+            members = [{"portName": (p.findtext("portName") or "").strip(),
+                        "membershipType": (p.findtext("membershipType") or "").strip()}
+                       for p in e.iter("PortEntry")]
+            out.append({"interfaceName": (e.findtext("interfaceName") or "").strip(),
+                        "members": [m for m in members if m["portName"]]})
+        return out
+
+    def ports_and_lags(self):
+        """Both tables in one GET, the way switch_port_info.py:550 does it.
+
+        Membership is only meaningful against the port list it was read with,
+        so fetching them together also keeps the two consistent.
+        """
+        body = self._request(f"https://{self.ip}/wcd?{{Standard802_3List}}{{LAGList}}")
+        ports = self._rows(body, "Entry", PORT_FIELDS, within="Standard802_3List")
+        if not ports:
+            # Should not happen, but never lose the Ports view over a wrapper
+            # element that is not shaped the way we expect. LAGList nests its
+            # rows under LAGEntry/PortEntry, so a document-wide sweep for
+            # "Entry" cannot pick up anything but ports.
+            ports = self._rows(body, "Entry", PORT_FIELDS)
+        return ports, self._lags(body)
 
     def poe(self):
         return self._rows(self.get("PoEPSEInterfaceList"), "Interface",
@@ -195,6 +273,23 @@ class Switch:
             f"<adminEnable>{'1' if on else '2'}</adminEnable></Interface>\n"
             "    </PoEPSEInterfaceList>\n</DeviceConfiguration>")
 
+    # LAG membership is a property of the MEMBER PORT, not of the LAG: the
+    # write targets the port's own Standard802_3List entry and names the group
+    # in LAGID. Verbatim from switch-confd's xml_post_channel_group_str
+    # (switch_interfaces.py:1035, driven by SET_IFACE_CHANNEL_GROUP).
+    #
+    # Unbinding is LAGID 0 with mode 0, which is what confd sends for
+    # "no channel-group" (switch_interfaces.py:7061).
+    def set_channel_group(self, ifname, lag_id, mode):
+        return self.post(
+            "<?xml version='1.0' encoding='utf-8'?>\n"
+            "<DeviceConfiguration>\n    <version>1.0</version>\n"
+            '    <Standard802_3List action="set">\n'
+            f"        <Entry><interfaceName>{ifname}</interfaceName>"
+            f"<LACPEnabled>{mode}</LACPEnabled>"
+            f"<LAGID>{lag_id}</LAGID></Entry>\n"
+            "    </Standard802_3List>\n</DeviceConfiguration>")
+
     def vlan(self, vid, create=True):
         return self.post(
             "<?xml version='1.0' encoding='utf-8'?>\n"
@@ -213,7 +308,8 @@ def save_config(sw, path=CFG_DIR):
     os.makedirs(path, exist_ok=True)
     written = []
 
-    ports = [p for p in sw.ports() if p["interfaceName"].startswith("gi")]
+    allports, lags = sw.ports_and_lags()
+    ports = [p for p in allports if p["interfaceName"].startswith("gi")]
     ent = "".join(f"        <Entry><interfaceName>{p['interfaceName']}</interfaceName>"
                   f"<adminState>{p['adminState']}</adminState></Entry>\n"
                   for p in ports)
@@ -223,6 +319,36 @@ def save_config(sw, path=CFG_DIR):
                        '    <Standard802_3List action="set">\n' + ent +
                        "    </Standard802_3List>\n</DeviceConfiguration>\n")
     written.append(f)
+
+    # LAG membership, before VLANs so the groups exist when VLAN membership
+    # is replayed. Written per member port, because that is what the API
+    # takes. LAGList does not report the on/auto mode back, so we reuse
+    # LACPEnabled from the port entry when the firmware supplies it and
+    # otherwise record auto/LACP - a static bundle facing a far end that
+    # speaks LACP silently black-holes traffic, so auto is the safer default.
+    mode_of = {p["interfaceName"]: p["LACPEnabled"] for p in allports}
+    bound = [(m["portName"], lag["interfaceName"])
+             for lag in lags for m in lag["members"]
+             if m["membershipType"] in ("1", "2")
+             and m["portName"].startswith("gi")]
+    lag_ent = ""
+    for pname, lagname in sorted(bound):
+        lag_id = lagname.replace("LAG", "")
+        if not lag_id.isdigit():
+            continue
+        mode = mode_of.get(pname) or CG_AUTO
+        if mode not in CG_MODE:
+            mode = CG_AUTO
+        lag_ent += (f"        <Entry><interfaceName>{pname}</interfaceName>"
+                    f"<LACPEnabled>{mode}</LACPEnabled>"
+                    f"<LAGID>{lag_id}</LAGID></Entry>\n")
+    if lag_ent:
+        f = os.path.join(path, "15-lag.xml")
+        open(f, "w").write("<?xml version='1.0' encoding='utf-8'?>\n"
+                           "<DeviceConfiguration>\n    <version>1.0</version>\n"
+                           '    <Standard802_3List action="set">\n' + lag_ent +
+                           "    </Standard802_3List>\n</DeviceConfiguration>\n")
+        written.append(f)
 
     # Skip system VLANs: 1 is default, 2363 is the management VLAN the
     # firmware recreates on every bootstrap.
@@ -260,6 +386,201 @@ def apply_config(sw, path=CFG_DIR):
     return out
 
 
+# =============================================================== self-update
+API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+
+# A release may only write inside these prefixes. The manifest ships in the
+# same tarball as the code, so this is not a trust boundary - it is a guard
+# against a malformed manifest quietly scattering files across the host.
+ALLOWED_DESTS = ("/usr/local/sbin/", "/etc/systemd/system/", "/opt/encs-host/")
+BACKUP_ROOT = "/var/backups/encs-switch"
+
+
+class UpdateError(Exception):
+    pass
+
+
+def _fetch(url, accept="application/vnd.github+json"):
+    """HTTPS GET with certificate verification ON.
+
+    Deliberately NOT the Switch context: that one turns verification off for
+    the switch's self-signed cert on a link-local address, which is fine
+    there and indefensible against github.com.
+    """
+    req = urllib.request.Request(url, headers={
+        "Accept": accept, "User-Agent": f"encs-switch-tui/{VERSION}"})
+    try:
+        with urllib.request.urlopen(
+                req, context=ssl.create_default_context(), timeout=20) as f:
+            return f.read()
+    except urllib.error.HTTPError as e:
+        # GitHub answers 404 both for "no releases yet" - a normal state, not
+        # a broken URL - and for a repo that does not exist. Same status, so
+        # the message has to cover both.
+        if e.code == 404 and url == API_LATEST:
+            raise UpdateError(f"no published release for {GITHUB_REPO} "
+                              f"(none yet, or the repo name is wrong)")
+        raise UpdateError(f"{url}: HTTP {e.code} {e.reason}")
+    except Exception as e:
+        raise UpdateError(f"{url}: {e}")
+
+
+def _vtuple(s):
+    """'v0.1.10' -> (0, 1, 10), so 0.1.10 sorts above 0.1.9."""
+    return tuple(int(x) for x in re.findall(r"\d+", s)) or (0,)
+
+
+def check_update():
+    """-> (tag, is_newer, {asset name: url}). Raises UpdateError on failure."""
+    try:
+        data = json.loads(_fetch(API_LATEST))
+    except ValueError as e:
+        raise UpdateError(f"release feed was not JSON: {e}")
+    tag = (data.get("tag_name") or "").strip()
+    if not tag:
+        raise UpdateError("release feed carried no tag_name "
+                          "(has a release been published yet?)")
+    assets = {a.get("name"): a.get("browser_download_url")
+              for a in data.get("assets", []) if a.get("name")}
+    return tag, _vtuple(tag) > _vtuple(VERSION), assets
+
+
+def _safe_extract(tf, dest):
+    """Reject anything that would land outside dest, and any link member."""
+    root = os.path.realpath(dest)
+    for m in tf.getmembers():
+        if m.issym() or m.islnk():
+            raise UpdateError(f"refusing link member in archive: {m.name}")
+        if not m.isfile() and not m.isdir():
+            raise UpdateError(f"refusing special member in archive: {m.name}")
+        target = os.path.realpath(os.path.join(root, m.name))
+        if target != root and not target.startswith(root + os.sep):
+            raise UpdateError(f"refusing path traversal in archive: {m.name}")
+    tf.extractall(dest)
+
+
+def _read_manifest(src):
+    """mode<space>relpath<space>destpath per line; # comments; blanks skipped."""
+    path = os.path.join(src, "MANIFEST")
+    if not os.path.isfile(path):
+        raise UpdateError("release tarball has no MANIFEST")
+    out = []
+    for lineno, raw in enumerate(open(path), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 3:
+            raise UpdateError(f"MANIFEST line {lineno}: expected 3 fields")
+        mode, rel, dest = parts
+        srcfile = os.path.realpath(os.path.join(src, rel))
+        if not srcfile.startswith(os.path.realpath(src) + os.sep):
+            raise UpdateError(f"MANIFEST line {lineno}: source escapes archive")
+        if not os.path.isfile(srcfile):
+            raise UpdateError(f"MANIFEST line {lineno}: {rel} not in archive")
+        if not dest.startswith(ALLOWED_DESTS):
+            raise UpdateError(
+                f"MANIFEST line {lineno}: {dest} is outside "
+                f"{', '.join(ALLOWED_DESTS)}")
+        try:
+            imode = int(mode, 8)
+        except ValueError:
+            raise UpdateError(f"MANIFEST line {lineno}: bad mode {mode!r}")
+        out.append((imode, srcfile, dest))
+    if not out:
+        raise UpdateError("MANIFEST is empty")
+    return out
+
+
+def do_update(force=False, say_=print):
+    """Download the latest release and install it. Returns the tag installed."""
+    if os.geteuid() != 0:
+        raise UpdateError("--update needs root: it writes to "
+                          + ", ".join(ALLOWED_DESTS))
+
+    tag, newer, assets = check_update()
+    if not newer and not force:
+        say_(f"already up to date: {VERSION} (latest release is {tag})")
+        return None
+    say_(f"updating {VERSION} -> {tag}")
+
+    tarname = next((n for n in assets if n.endswith(".tar.gz")), None)
+    if not tarname:
+        raise UpdateError(f"release {tag} has no .tar.gz asset")
+    if "SHA256SUMS" not in assets:
+        raise UpdateError(f"release {tag} has no SHA256SUMS asset")
+
+    blob = _fetch(assets[tarname], accept="application/octet-stream")
+    sums = _fetch(assets["SHA256SUMS"], accept="text/plain").decode()
+    want = next((l.split()[0] for l in sums.splitlines()
+                 if l.strip().endswith(tarname)), None)
+    if not want:
+        raise UpdateError(f"SHA256SUMS does not mention {tarname}")
+    got = hashlib.sha256(blob).hexdigest()
+    if got != want:
+        raise UpdateError(f"checksum mismatch for {tarname}\n"
+                          f"  expected {want}\n  got      {got}")
+    say_(f"sha256 verified: {got[:16]}...")
+
+    tmp = tempfile.mkdtemp(prefix="encs-update-")
+    try:
+        arc = os.path.join(tmp, tarname)
+        open(arc, "wb").write(blob)
+        src = os.path.join(tmp, "x")
+        os.makedirs(src)
+        with tarfile.open(arc, "r:gz") as tf:
+            _safe_extract(tf, src)
+        # Tarballs carry a single top-level directory; descend into it.
+        kids = [d for d in os.listdir(src) if os.path.isdir(os.path.join(src, d))]
+        if len(kids) == 1 and not os.path.exists(os.path.join(src, "MANIFEST")):
+            src = os.path.join(src, kids[0])
+
+        items = _read_manifest(src)
+
+        # Refuse to install code that will not even parse - a truncated or
+        # botched release should not take the tool out with it.
+        for _, srcfile, dest in items:
+            if not _is_python(srcfile):
+                continue
+            r = subprocess.run([sys.executable, "-m", "py_compile", srcfile],
+                               capture_output=True)
+            if r.returncode != 0:
+                raise UpdateError(
+                    f"{os.path.basename(dest)} in {tag} does not compile - "
+                    f"refusing to install:\n{r.stderr.decode()[:400]}")
+
+        backup = os.path.join(BACKUP_ROOT, time.strftime("%Y%m%d-%H%M%S"))
+        os.makedirs(backup, exist_ok=True)
+        units = False
+        for imode, srcfile, dest in items:
+            if os.path.exists(dest):
+                shutil.copy2(dest, os.path.join(backup, os.path.basename(dest)))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            # Write beside the target and rename: an atomic swap, so a running
+            # copy of this very script is never half-replaced underneath us.
+            staged = dest + ".new"
+            shutil.copyfile(srcfile, staged)
+            os.chmod(staged, imode)
+            os.replace(staged, dest)
+            units |= dest.startswith("/etc/systemd/system/")
+            say_(f"  {dest}")
+        say_(f"previous files saved in {backup}")
+        if units:
+            subprocess.run(["systemctl", "daemon-reload"], check=False)
+            say_("  systemctl daemon-reload")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return tag
+
+
+def _is_python(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"#!" and b"python" in f.readline().lower()
+    except OSError:
+        return False
+
+
 # =================================================================== manual
 MANUAL = [
     ("WHAT THIS IS", """\
@@ -285,7 +606,8 @@ THIS tool runs on the HYPERVISOR, which owns the X710 backplane NIC and
 therefore the management VLAN (2363, 169.254.1.1 -> 169.254.1.0)."""),
 
     ("VIEWS", """\
-  p  Ports    link/admin state per interface. SPACE toggles admin up/shut.
+  p  Ports    link/admin state per interface. SPACE toggles admin up/shut,
+              g binds the port into a LAG or takes it out.
   v  VLANs    VLAN list with tagged/untagged membership. n=new  d=delete.
   e  PoE      per-port power state and draw. SPACE toggles PoE.
   m  MAC      the forwarding table - which MAC was learned on which port.
@@ -302,15 +624,70 @@ therefore the management VLAN (2363, 169.254.1.1 -> 169.254.1.0)."""),
             The raw mediaType enum only has copper/fiber, so the firmware
             calls these "fiber". They are not. (Same coarseness makes lspci
             report the RJ45 I350 ports as "Fiber".)
-  LAG1-4    link aggregation groups - no media, unused unless configured
+  LAG1-4    link aggregation groups - no media. Empty until you put ports
+            in them with g; the lag column then shows the member count.
 
   link      UP / down / n-p (not present)
   admin     up   = enabled
             SHUT = administratively disabled, shown in red
+  lag       which LAG this port is bundled into, "(i)" if it is a member
+            but inactive (in the group, not forwarding)
 
 IMPORTANT: after a cold bootstrap every gi port comes up SHUT and PoE off.
 The switch boots but forwards nothing until you enable them. That is what
 Cisco's switch_init.xml did, and we do not run it."""),
+
+    ("LINK AGGREGATION", """\
+Select a gi port in the Ports view and press g. You are asked for a group
+(1-4) and then a mode:
+
+  auto  LACP - negotiates with the far end. Use this against any switch
+        that runs LACP, and prefer it when unsure.
+  on    static bundle - forwards immediately, negotiates nothing. Only
+        correct when the far end is also static.
+
+Pairing a static "on" bundle with a far end running LACP silently
+black-holes traffic: neither side reports an error, frames just go missing.
+
+Press g again on a member and answer 0 to take it out of the group.
+
+  - only the 8 gi front ports can be bundled. te1/te2 are the internal
+    backplane links that carry your traffic and this management session,
+    so the TUI refuses to touch them.
+  - the ASIC supports 4 groups (LAG1-4).
+  - membership is as volatile as the rest of the config. Write it with
+    the Config view or it is gone after a cold power cycle.
+
+The write goes to the MEMBER PORT, not to the LAG: it sets LACPEnabled and
+LAGID on the port's Standard802_3List entry, which is exactly what Cisco's
+switch-confd sent for "channel-group"."""),
+
+    ("UPDATING THIS TOOL", """\
+Version {ver}. On startup this tool asks GitHub once, in the background,
+whether a newer release exists. If there is one the title bar says so; if
+the host has no route to github.com nothing is reported and nothing breaks.
+Set ENCS_NO_UPDATE_CHECK=1 to skip that request entirely.
+
+The Config view's u key repeats the check on demand. Installing needs root
+and happens from a shell:
+
+  encs-switch-tui --check-update     does a newer release exist?
+  encs-switch-tui --update           download and install it
+  encs-switch-tui --version          what is installed right now
+
+--update fetches the release tarball over verified HTTPS, checks it against
+the published SHA256SUMS, refuses to install anything that does not compile,
+saves what it replaces under /var/backups/encs-switch/<timestamp>/, and swaps
+each file in atomically. It only ever writes to /usr/local/sbin,
+/etc/systemd/system and /opt/encs-host.
+
+It does NOT touch your switch config, the VLAN interface, or /etc/encs-switch.
+Roll back by copying the files out of the backup directory.
+
+This updates the HOST tools only. The bootstrap VM's kernel, the Marvell
+module and the firmware loader are baked into the image and are not
+updatable this way - and must not be, since the module is pinned to one
+exact kernel build."""),
 
     ("CONFIG IS VOLATILE", """\
 The ASIC has no flash, so its configuration lives in RAM.
@@ -359,8 +736,10 @@ credentials reset on power loss, keep it that way."""),
     ("KEYS", """\
   up/down, j/k    move selection
   space           toggle (Ports: admin state, PoE: power)
+  g               Ports: add the port to a LAG, or remove it from one
   n / d           VLANs: new / delete
   w / a           Config: write / apply
+  u               Config: check GitHub for a newer release
   r               refresh now (Ports, PoE and Stats also auto-refresh)
   i               toggle the detail panel
   ? or F1         this manual (arrows scroll, any other key exits)
@@ -404,6 +783,8 @@ class UI:
         self.data = {}
         self.last_refresh = 0
         self.connected = True
+        self.update_tag = None
+        self._check_update_bg()
         curses.curs_set(0)
         self.s.timeout(1000)
         if curses.has_colors():
@@ -415,11 +796,32 @@ class UI:
             curses.init_pair(C_WARN, curses.COLOR_YELLOW, -1)
             curses.init_pair(C_DIM, curses.COLOR_BLUE, -1)
 
+    def _check_update_bg(self):
+        """One-shot release check at startup, off the UI thread.
+
+        Failures are swallowed on purpose. A host with no route to github.com
+        is an entirely normal deployment - this VLAN is link-local and plenty
+        of these boxes are isolated - and it must not produce an error banner.
+        Set ENCS_NO_UPDATE_CHECK=1 to skip the request altogether.
+        """
+        if os.environ.get("ENCS_NO_UPDATE_CHECK"):
+            return
+
+        def run():
+            try:
+                tag, newer, _ = check_update()
+                if newer:
+                    self.update_tag = tag
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
     # ---------------------------------------------------------- data
     def refresh_data(self, force=False):
         try:
             if self.view == "ports":
-                self.data["ports"] = self.sw.ports()
+                self.data["ports"], self.data["lags"] = self.sw.ports_and_lags()
             elif self.view == "poe":
                 self.data["poe"] = self.sw.poe()
             elif self.view == "vlans":
@@ -437,6 +839,16 @@ class UI:
     def rows(self):
         return self.data.get(self.view, [])
 
+    def lag_map(self):
+        """member port name -> (LAG name, membershipType).
+
+        "Not candidate" (3) means the port is listed against the group but is
+        not part of it, so it is not membership and is left out.
+        """
+        return {m["portName"]: (lag["interfaceName"], m["membershipType"])
+                for lag in self.data.get("lags", [])
+                for m in lag["members"] if m["membershipType"] in ("1", "2")}
+
     def set_msg(self, m, bad=False):
         self.msg, self.msg_bad = m, bad
 
@@ -449,20 +861,37 @@ class UI:
         age = ("" if not self.last_refresh
                else f"  updated {int(time.time()-self.last_refresh)}s ago")
         title = f" ENCS 5412 switch  {self.sw.ip}  [{state}]{age} "
-        self.s.addnstr(0, 0, title.ljust(w - 1), w - 1,
-                       curses.A_REVERSE | (0 if self.connected
-                                           else curses.color_pair(C_BAD)))
+        attr = curses.A_REVERSE | (0 if self.connected
+                                   else curses.color_pair(C_BAD))
+        self.s.addnstr(0, 0, title.ljust(w - 1), w - 1, attr)
+        # Right-hand end of the title bar: the running version, or a nudge
+        # once the background check has found a newer release.
+        ver = (f" v{VERSION} -> {self.update_tag} available (c) "
+               if self.update_tag else f" v{VERSION} ")
+        if len(title) + len(ver) < w:
+            self.s.addnstr(0, w - 1 - len(ver), ver, len(ver),
+                           attr | (curses.A_BOLD if self.update_tag else 0))
 
-        tabs = "  ".join(
-            (f"[{k}] {n.upper()}" if n == self.view else f"[{k}] {n}")
-            for n, k in VIEWS)
-        self.s.addnstr(1, 1, tabs, w - 2, curses.color_pair(C_HDR))
+        # Draw the tabs one at a time so the active one can carry its own
+        # attribute - a single addnstr can only paint the whole strip.
+        x = 1
+        for n, k in VIEWS:
+            active = n == self.view
+            label = f" [{k}] {n.upper()} " if active else f" [{k}] {n} "
+            if x >= w - 1:
+                break
+            self.s.addnstr(1, x, label, w - 1 - x,
+                           curses.A_REVERSE | curses.A_BOLD if active
+                           else curses.color_pair(C_HDR))
+            x += len(label)
         self.s.hline(2, 0, curses.ACS_HLINE, w)
 
         if self.view == "help":
             self.draw_help(3, h, w)
         else:
-            dh = 6 if (self.detail and self.view in ("ports", "poe", "vlans")) else 0
+            # Ports gets an extra line: LAG state can add two of its own.
+            dh = ((7 if self.view == "ports" else 6)
+                  if (self.detail and self.view in ("ports", "poe", "vlans")) else 0)
             {"ports": self.d_ports, "poe": self.d_poe, "vlans": self.d_vlans,
              "mac": self.d_mac, "stats": self.d_stats,
              "config": self.d_config}[self.view](3, h - dh - 3, w)
@@ -470,10 +899,12 @@ class UI:
                 self.draw_detail(h - dh - 3, h, w)
 
         keys = {
-            "ports": "SPACE toggle admin   r refresh   i detail   ? help   q quit",
+            "ports": ("SPACE toggle admin   g LAG   r refresh   i detail   "
+                      "? help   q quit"),
             "poe": "SPACE toggle PoE   r refresh   i detail   ? help   q quit",
             "vlans": "n new   d delete   r refresh   i detail   ? help   q quit",
-            "config": "w write config   a apply config   ? help   q quit",
+            "config": ("w write config   a apply config   u check update   "
+                       "? help   q quit"),
             "help": "arrows scroll   any other key returns",
         }.get(self.view, "r refresh   ? help   q quit")
         self.s.hline(h - 3, 0, curses.ACS_HLINE, w)
@@ -487,7 +918,8 @@ class UI:
         lines = []
         for title, body in MANUAL:
             lines.append(("H", title))
-            for para in body.format(ip=self.sw.ip, cfg=CFG_DIR).split("\n"):
+            for para in body.format(ip=self.sw.ip, cfg=CFG_DIR,
+                                    ver=VERSION).split("\n"):
                 for wrapped in (textwrap.wrap(para, w - 6) or [""]):
                     lines.append(("T", wrapped))
             lines.append(("T", ""))
@@ -521,10 +953,26 @@ class UI:
                    f"{r['speedOper']} Mb/s {DUPLEX.get(r['duplexOperMode'],'-')}   "
                    f"media {media_label(n, r['mediaType'])}",
                    f"  mac  {r['MACAddress']}"]
+            lm = self.lag_map()
+            if n.startswith("LAG"):
+                mem = [(p, s) for p, (g, s) in sorted(lm.items()) if g == n]
+                if mem:
+                    out.append("  members: " + ", ".join(
+                        f"{p} ({LAG_MEMBER.get(s, s)})" for p, s in mem))
+                else:
+                    out.append("  no members - select a gi port and press g "
+                               "to add one.")
+            elif n in lm:
+                g, st = lm[n]
+                out.append(f"  bundled into {g} - {LAG_MEMBER.get(st, st)}. "
+                           f"g rebinds or removes it.")
+                if st == "2":
+                    out.append("  inactive: in the group but not forwarding. "
+                               "Usually the far end is not bundling this port.")
             if r["adminState"] == "2":
                 out.append("  ADMIN SHUT - this port will not pass traffic. "
                            "SPACE enables it.")
-            elif r["linkState"] != "1":
+            elif r["linkState"] != "1" and not n.startswith("LAG"):
                 out.append("  enabled but no link - nothing plugged in, "
                            "or the far end is down.")
         elif self.view == "poe":
@@ -570,13 +1018,29 @@ class UI:
             self.s.addnstr(y, w - 14, f"{self.sel+1}/{len(rows)}", 12, curses.A_DIM)
 
     def d_ports(self, y, h, w):
+        lm = self.lag_map()
+
+        def lag_col(r):
+            n = r["interfaceName"]
+            if n.startswith("LAG"):
+                # For the group itself, show how many ports it has.
+                c = sum(1 for v in lm.values() if v[0] == n)
+                return f"{c} ports" if c else "-"
+            g = lm.get(n)
+            if not g:
+                return "-"
+            # (i) = bound but inactive: in the group, not currently forwarding.
+            return g[0] + ("" if g[1] == "1" else "(i)")
+
         self._list(
             y, h, w,
-            f"{'port':8}{'link':7}{'admin':8}{'speed':9}{'duplex':8}{'media':9}mac",
+            f"{'port':8}{'link':7}{'admin':8}{'speed':9}{'duplex':8}{'media':9}"
+            f"{'lag':9}mac",
             lambda r: (f"{r['interfaceName']:8}{LINK.get(r['linkState'],'?'):7}"
                        f"{ADMIN.get(r['adminState'],'?'):8}{r['speedOper']:9}"
                        f"{DUPLEX.get(r['duplexOperMode'],'-'):8}"
                        f"{media_label(r['interfaceName'], r['mediaType']):9}"
+                       f"{lag_col(r):9}"
                        f"{r['MACAddress']}"),
             self.rows(),
             lambda r: (curses.color_pair(C_OK) if r["linkState"] == "1"
@@ -638,7 +1102,7 @@ class UI:
             ("T", f"These files are the switch's real source of truth: {CFG_DIR}"),
             ("T", ""),
             ("H", "ACTIONS"),
-            ("T", "  w   write the running ports / VLANs / PoE state to disk"),
+            ("T", "  w   write the running ports / LAGs / VLANs / PoE to disk"),
             ("T", "  a   apply every *.xml there, in filename order"),
             ("T", ""),
             ("H", "CURRENT FILES"),
@@ -648,7 +1112,12 @@ class UI:
                  ("H", "AUTOMATIC REPLAY"),
                  ("T", "encs-switch-replay.service reapplies these after a cold"),
                  ("T", "boot, once the switch answers. Check it with:"),
-                 ("T", "  systemctl status encs-switch-replay")]
+                 ("T", "  systemctl status encs-switch-replay"),
+                 ("T", ""),
+                 ("H", f"VERSION {VERSION}"),
+                 ("T", "  u   ask GitHub whether a newer release exists"),
+                 ("T", "  install it from a root shell, not from here:"),
+                 ("T", "        encs-switch-tui --update")]
         for i, (kind, t) in enumerate(body):
             if y + i >= h - 1:
                 break
@@ -671,6 +1140,39 @@ class UI:
         curses.noecho()
         curses.curs_set(0)
         return v
+
+    def bind_lag(self, p):
+        """Add the selected port to a LAG, or take it out of one."""
+        name = p["interfaceName"]
+        if not name.startswith("gi"):
+            self.set_msg(
+                "only the gi front ports can join a LAG - te1/te2 are the "
+                "backplane links carrying this session", bad=True)
+            return
+        cur = self.lag_map().get(name)
+        v = self.prompt(
+            f"{name} is in {cur[0]}. LAG 1-{MAX_LAG}, or 0 to remove:" if cur
+            else f"add {name} to which LAG? 1-{MAX_LAG} (0 = none):")
+        if not v:
+            return
+        if not v.isdigit() or not 0 <= int(v) <= MAX_LAG:
+            self.set_msg(f"'{v}' is not a LAG number (0-{MAX_LAG})", bad=True)
+            return
+        lag_id = int(v)
+        if lag_id == 0:
+            if not cur:
+                self.set_msg(f"{name} is not in a LAG", bad=True)
+                return
+            self.write(f"{name} leaves {cur[0]}",
+                       lambda: self.sw.set_channel_group(name, 0, 0))
+            return
+        m = self.prompt("mode: (a)uto = LACP, (o)n = static:")
+        mode = {"a": CG_AUTO, "o": CG_ON}.get(m[:1].lower()) if m else None
+        if mode is None:
+            self.set_msg("cancelled - answer a or o", bad=True)
+            return
+        self.write(f"{name} -> LAG{lag_id} ({CG_MODE[mode]})",
+                   lambda: self.sw.set_channel_group(name, lag_id, mode))
 
     def write(self, label, fn):
         try:
@@ -730,6 +1232,8 @@ class UI:
                 up = p["adminState"] != "1"
                 self.write(f"{p['interfaceName']} admin {'up' if up else 'shut'}",
                            lambda: self.sw.set_port_admin(p["interfaceName"], up))
+            elif c == ord("g") and self.view == "ports" and rows:
+                self.bind_lag(rows[self.sel])
             elif c == ord(" ") and self.view == "poe" and rows:
                 p = rows[self.sel]
                 on = p["adminEnable"] != "1"
@@ -755,6 +1259,18 @@ class UI:
                     fs = save_config(self.sw)
                     self.set_msg("wrote " + ", ".join(os.path.basename(f) for f in fs))
                 except Exception as e:
+                    self.set_msg(str(e), bad=True)
+            elif c == ord("u") and self.view == "config":
+                self.set_msg("checking github ...")
+                self.draw()
+                try:
+                    tag, newer, _ = check_update()
+                    self.update_tag = tag if newer else None
+                    self.set_msg(
+                        f"{tag} is available - run 'encs-switch-tui --update' "
+                        f"as root" if newer
+                        else f"up to date: {VERSION} is the latest release")
+                except UpdateError as e:
                     self.set_msg(str(e), bad=True)
             elif c == ord("a") and self.view == "config":
                 if self.prompt("apply saved config to the switch? type yes:") == "yes":
@@ -795,6 +1311,22 @@ def main():
 
     if arg in ("-h", "--help"):
         print(__doc__)
+        return
+    if arg in ("--version", "-V"):
+        print(f"encs-switch-tui {VERSION}")
+        return
+    if arg in ("--check-update", "--update"):
+        try:
+            if arg == "--check-update":
+                tag, newer, _ = check_update()
+                print(f"installed {VERSION}, latest release {tag}"
+                      + ("  -- run 'encs-switch-tui --update'" if newer
+                         else "  -- up to date"))
+                return
+            if do_update(force="--force" in sys.argv):
+                print("done. Restart any running encs-switch-tui.")
+        except UpdateError as e:
+            sys.exit(f"ERROR: {e}")
         return
     if arg == "--status":
         sys.exit(cli_status(sw))
