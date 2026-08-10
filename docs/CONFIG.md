@@ -36,9 +36,10 @@ ordering is the whole reason for the numeric prefixes.
 
 | File | Holds | Why it sorts there |
 |---|---|---|
-| `10-ports.xml` | admin up/shut per `gi` port | ports must exist and be enabled first |
-| `15-lag.xml` | LAG membership | groups must be formed before VLANs reference them |
-| `20-vlans.xml` | VLAN creation | |
+| `10-ports.xml` | admin UP/DOWN per `gi` port | ports must exist and be enabled first |
+| `15-lag.xml` | LAG membership and mode | groups must be formed before VLANs reference them |
+| `20-vlans.xml` | which VLANs exist | |
+| `25-vlan-ports.xml` | which ports are in them, and how they tag | needs the VLANs to already exist |
 | `30-poe.xml` | PoE on/off per port | last; depends on nothing |
 
 Only files that have something to say are written — no LAGs configured means
@@ -157,10 +158,49 @@ encs-switch-api get '{LAGList}'
 management session — or VLAN 1, the default. The TUI refuses both; a
 hand-written file will not.
 
-Port membership lives in `VLANInterfaceMembershipTable`
-(`taggedPorts` / `untaggedPorts`), which the TUI displays but does not yet
-write. Set it by hand if you need it, and add it as, say, `25-vlan-ports.xml`
-so it lands after the VLANs exist.
+This file only says which VLANs *exist*. Which ports are in them is the next
+file.
+
+## 25-vlan-ports.xml — port membership
+
+Membership is a property of the **port**, written to `VLANInterfaceISList`:
+
+```xml
+<VLANInterfaceISList action="set">
+    <Entry>
+        <interfaceName>gi3</interfaceName>
+        <switchportModeAdmin>10</switchportModeAdmin>
+        <generalPVID>1</generalPVID>
+        <generalTaggedVLANs>100,200</generalTaggedVLANs>
+        <generalUntaggedVLANs>300</generalUntaggedVLANs>
+    </Entry>
+</VLANInterfaceISList>
+```
+
+| `switchportModeAdmin` | |
+|---|---|
+| `10` | general — mix of tagged and untagged, PVID for ingress |
+| `11` | access — single untagged VLAN, from `generalPVID` |
+| `12` | trunk — tagged members plus a native VLAN |
+| `13` / `15` | private-vlan / customer |
+
+`generalTaggedVLANs` and `generalUntaggedVLANs` take a comma/range list
+(`100,200-204`). The read-back view is `VLANInterfaceMembershipTable`, which
+presents the same information per *VLAN* rather than per port — useful for
+checking your work:
+
+```sh
+encs-switch-api get '{VLANInterfaceMembershipTable}'
+```
+
+> **`te1`–`te4` are deliberately not saved.** `te2` carries the management
+> VLAN this tool talks over, and `te1`/`te3`/`te4` are the module fabric that
+> the firmware configures itself on VLANs 2350/2351. Replaying a stale copy of
+> those is a good way to cut your own session. `save`/`--save` writes `gi` and
+> `LAG` interfaces only.
+
+Verified end to end on hardware: create a VLAN, tag a port into it, save,
+delete both, replay — VLAN and membership both come back identical.
 
 ## 30-poe.xml — Power over Ethernet
 
@@ -179,6 +219,49 @@ Only the `gi` front ports are PoE-capable. 802.3bt has been confirmed working
 on real hardware.
 
 ---
+
+## What NFVIS could do that this cannot
+
+`switch-confd` subscribed to 23 top-level ConfD paths and drove 91 distinct
+`wcd` tables. This project implements a deliberate subset — the things needed
+to get a switch forwarding and keep it that way across a power cycle.
+
+**Implemented** (read *and* write):
+
+| Area | NFVIS path | Here |
+|---|---|---|
+| Port admin state | `/switch/interface/gigabitEthernet` | Ports view, `space` |
+| VLANs | `/switch/vlan` | VLANs view, `n` / `d` |
+| VLAN port membership | `/switch/switchports` | saved + replayed (no UI editor yet) |
+| Link aggregation | `/switch/port-channel`, `channel-group` | Ports view, `g` |
+| PoE | `/switch/power` | PoE view, `space` |
+| MAC table, counters | `/switch/mac`, statistics | read-only views |
+
+**Not implemented.** All of these have working `wcd` tables and Cisco XML
+templates in `switch-confd`, so any of them is a tractable addition — nothing
+here is blocked, just unwritten:
+
+| Area | NFVIS path | wcd tables |
+|---|---|---|
+| Spanning tree (STP/RSTP/MSTP) | `/switch/spanning-tree` | `STP`, `RSTP`, `MSTP*`, `SpanningTreeGlobalParam` |
+| QoS: class maps, policy maps, policers, queueing | `/switch/qos`, `/switch/class-map`, `/switch/policy-map`, `/switch/priority-queue`, `/switch/wrr-queue` | `ClassMapList`, `PolicyMapList`, `AggregatePolicerList`, `CoS*`, `DSCP*`, `QoSBandwidthList` |
+| ACLs | `/switch/interface/*/service-acl` | `ACLList`, `ACEList`, `ACLBindingList`, `IPStandardACLList` |
+| 802.1X + RADIUS | `/switch/dot1x`, `/switch/radius-server` | `Standard_802_1x*`, `RadiusServerList`, `EAPStatisticsList` |
+| IGMP/MLD snooping, multicast filtering | `/switch/ip/igmp`, `/switch/bridge` | `IGMPMLD*`, `MulticastGlobalSetting`, `UnregedMulticastList` |
+| Storm control | `/switch/interface/*/storm-control` | `StormControlTable` |
+| LLDP / CDP | `/switch/lldp` | `LLDP*`, `CDPInterfaceList` |
+| L3: ARP, static routes, default gateway | `/switch/arp`, `/switch/ip/route`, `/switch/ip/routing` | `ARPList`, `IPv4RouteList`, `IPv4GatewayList`, `IPv4InterfaceList` |
+| Port mirroring (SPAN) | `/switch/monitor` | `SpanDestinationTable` |
+| Private VLANs | — | `PrivateVLAN*` |
+| Static MAC entries, aging | `/switch/mac` | `ForwardingStaticTable`, `ForwardingGlobalSetting` |
+| LACP system priority, port priority/timeout | `/switch/lacp` | `LACPGlobalSetting`, `LACPPortList` |
+
+Two practical notes. Everything above is **volatile** like the rest of the
+config, so anything you add by hand via `encs-switch-api` also needs a file in
+`/etc/encs-switch/` to survive a power cycle. And the switch defaults are
+sane for a flat L2 deployment — no STP is running, which is fine until you
+create a loop, so be careful cabling two front ports to the same upstream
+switch.
 
 ## Enum reference
 

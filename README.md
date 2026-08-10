@@ -216,8 +216,19 @@ encs-switch-tui        # press ? for the built-in manual
 ```
 
 Ports, VLANs, PoE, link aggregation, MAC table, statistics, and config
-save/replay. The active view is highlighted in the tab bar; the running
-version sits at the right-hand end of the title bar.
+save/replay. The active view is highlighted in the tab bar, the running
+version sits at the right-hand end of the title bar, and if a newer release
+exists the title bar says so.
+
+Two columns that are easy to confuse: **`link`** is whether the PHY has a
+signal; **`admin`** is whether *you* have enabled the port (`UP` / `DOWN`,
+`space` toggles it). A port can be `admin UP` with no link, or — on the
+internal backplane ports — show `link UP` while disabled.
+
+`docs/CONFIG.md` lists [what NFVIS could do that this
+cannot](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot) — STP, QoS, ACLs,
+802.1X, IGMP snooping and more. All of them have working `wcd` tables behind
+them, so they are unwritten rather than blocked.
 
 **Reading the front panel.** The API calls the switch ports `gi0`–`gi7`; the
 chassis silkscreen calls them `GE1/0`–`GE1/7`, and the TUI shows both. They are
@@ -269,11 +280,11 @@ screen /dev/ttyUSB0 115200        # Linux
 screen /dev/cu.usbserial-XXXX 115200   # macOS
 ```
 
-**Front ports come up administratively SHUT with PoE off** after a bootstrap —
+**Front ports come up disabled (`admin DOWN`) with PoE off** after a bootstrap —
 that is the firmware default, and NFVIS's own init is what used to enable them.
 Open the Ports view and press `space`, or apply a saved config.
 
-**The TUI refuses to shut `te1`–`te4`.** Those are internal backplane ports
+**The TUI refuses to disable `te1`–`te4`.** Those are internal backplane ports
 with no front-panel jack, and the switch owns its end of each link — it will
 accept the shut. `te2` carries the management VLAN, so shutting it ends your
 session, and with no flash on the ASIC only a cold power cycle undoes it.

@@ -54,14 +54,16 @@ CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
 
 # Single source of truth for the version. scripts/release.sh reads this line
 # to name the tag and the tarball, so keep the literal on one line.
-VERSION = "0.0.4"
+VERSION = "0.0.5"
 
 # Where --update looks. Override for a fork or a test repo.
 GITHUB_REPO = os.environ.get("ENCS_REPO", "foureight84/encs5400-almalinux")
 
 # ------------------------------------------------------------------ enums
-# switch_interfaces.py: SWITCH_ADMIN_STATE_UP="1", SWITCH_ADMIN_STATE_DOWN="2"
-ADMIN = {"1": "up", "2": "SHUT"}
+# switch_interfaces.py: SWITCH_ADMIN_STATE_UP="1", SWITCH_ADMIN_STATE_DOWN="2".
+# Displayed as UP/DOWN rather than up/SHUT - "shut" is Cisco CLI idiom and
+# reads as jargon next to a link column that already says up/down.
+ADMIN = {"1": "UP", "2": "DOWN"}
 LINK = {"1": "UP", "2": "down", "6": "n/p"}
 MEDIA = {"1": "copper", "2": "fiber"}
 
@@ -137,6 +139,14 @@ STAT_FIELDS = ["interfaceName", "receivePacketByteCount",
                "receiveUnicastPacketCount", "transmitPacketByteCount",
                "transmitUnicastPacketCount", "packetErrorCount"]
 MAC_FIELDS = ["VLANID", "MACAddress", "interfaceName", "addressType"]
+# Per-interface VLAN config: which VLANs a port is in and how it tags them.
+# switchportModeAdmin: 10 general, 11 access, 12 trunk, 13 private, 15 customer
+# (switch_interfaces.py SWITCH_SWPORT_MODE_*).
+VLANIF_FIELDS = ["interfaceName", "switchportModeAdmin", "generalPVID",
+                 "generalTaggedVLANs", "generalUntaggedVLANs",
+                 "accessPVID", "trunkNativeVID", "trunkMemberVLANs"]
+SWPORT_MODE = {"10": "general", "11": "access", "12": "trunk",
+               "13": "private-vlan", "15": "customer"}
 
 
 def panel_label(ifname):
@@ -334,6 +344,34 @@ class Switch:
         return self._rows(self.get("VLANInterfaceMembershipTable"), "Entry",
                           ["VLANID", "VLANName", "taggedPorts", "untaggedPorts"])
 
+    def vlan_interfaces(self):
+        """Per-port VLAN config - which VLANs a port carries and how."""
+        return self._rows(self.get("VLANInterfaceISList"), "Entry",
+                          VLANIF_FIELDS)
+
+    def set_vlan_interface(self, ifname, mode, pvid, tagged, untagged):
+        """Restore one port's VLAN configuration.
+
+        Same shape switch-confd used for switchport mode / PVID / tagged /
+        untagged (xml_post_giga_swport_mode_str and friends), collapsed into
+        one Entry so a port lands in a consistent state in a single write.
+        """
+        body = f"<interfaceName>{ifname}</interfaceName>"
+        if mode:
+            body += f"<switchportModeAdmin>{mode}</switchportModeAdmin>"
+        if pvid:
+            body += f"<generalPVID>{pvid}</generalPVID>"
+        if tagged:
+            body += f"<generalTaggedVLANs>{tagged}</generalTaggedVLANs>"
+        if untagged:
+            body += f"<generalUntaggedVLANs>{untagged}</generalUntaggedVLANs>"
+        return self.post(
+            "<?xml version='1.0' encoding='utf-8'?>\n"
+            "<DeviceConfiguration>\n    <version>1.0</version>\n"
+            '    <VLANInterfaceISList action="set">\n'
+            f"        <Entry>{body}</Entry>\n"
+            "    </VLANInterfaceISList>\n</DeviceConfiguration>")
+
     def macs(self):
         return self._rows(self.get("ForwardingTable"), "Entry",
                           ["VLANID", "MACAddress", "interfaceName", "addressType"])
@@ -455,6 +493,34 @@ def save_config(sw, path=CFG_DIR):
                            "<DeviceConfiguration>\n    <version>1.0</version>\n"
                            '    <VLANList action="set">\n' + ent +
                            "    </VLANList>\n</DeviceConfiguration>\n")
+        written.append(f)
+
+    # Per-port VLAN membership, AFTER 20-vlans.xml so the VLANs it references
+    # already exist. Without this a replay recreates empty VLANs and every
+    # port falls back to VLAN 1 - the switch comes back looking configured
+    # while forwarding everything flat.
+    #
+    # gi and LAG only. te1-te4 are deliberately skipped: te2 carries the
+    # management VLAN this tool talks over, and te1/te3/te4 are the module
+    # fabric that switch-confd sets up from firmware defaults. Replaying a
+    # stale copy of those would be a good way to cut your own session.
+    ent = ""
+    for r in sorted(sw.vlan_interfaces(), key=lambda r: r["interfaceName"]):
+        n = r["interfaceName"]
+        if not (n.startswith("gi") or n.startswith("LAG")):
+            continue
+        body = "".join(
+            f"<{k}>{r[k]}</{k}>" for k in
+            ("switchportModeAdmin", "generalPVID",
+             "generalTaggedVLANs", "generalUntaggedVLANs") if r.get(k))
+        if body:
+            ent += f"        <Entry><interfaceName>{n}</interfaceName>{body}</Entry>\n"
+    if ent:
+        f = os.path.join(path, "25-vlan-ports.xml")
+        open(f, "w").write("<?xml version='1.0' encoding='utf-8'?>\n"
+                           "<DeviceConfiguration>\n    <version>1.0</version>\n"
+                           '    <VLANInterfaceISList action="set">\n' + ent +
+                           "    </VLANInterfaceISList>\n</DeviceConfiguration>\n")
         written.append(f)
 
     pe = sw.poe()
@@ -760,12 +826,15 @@ with ENCS_ALLOW_TE_SHUT=1 if you genuinely mean it.
   LAG1-4    link aggregation groups - no media. Empty until you put ports
             in them with g; the lag column then shows the member count.
 
-  link      UP        trained AND receiving - green
+  link      whether the PHY has a signal - not whether you enabled it
+            UP        trained AND receiving - green
             UP idle   trained but NOTHING has arrived - yellow
             down      no link
             n/p       not present
-  admin     up   = enabled
-            SHUT = administratively disabled, shown in red
+  admin     whether YOU have enabled the port - SPACE toggles it
+            UP        enabled
+            DOWN      disabled, shown in red. Cisco's CLI calls this
+                      "shut"; the switch will not pass traffic on it.
   lag       which LAG this port is bundled into, from the port's own LAGID.
             The suffix is operational state, NOT whether it is a member:
               (none)  active - in the group and forwarding
@@ -849,7 +918,18 @@ The ASIC has no flash, so its configuration lives in RAM.
 
 So the files under {cfg} are the switch's real source of truth. Use the
 Config view to write them, keep them in version control, and let
-encs-switch-replay.service reapply them after a power loss."""),
+encs-switch-replay.service reapply them after a power loss.
+
+What w writes, applied in filename order on replay:
+  10-ports.xml       admin up/down per front port
+  15-lag.xml         LAG membership and mode
+  20-vlans.xml       which VLANs exist
+  25-vlan-ports.xml  which ports are in them, and how they tag
+  30-poe.xml         PoE on/off per port
+
+te1-te4 are deliberately NOT saved. te2 carries the management VLAN and
+te1/te3/te4 are the module fabric the firmware sets up itself; replaying a
+stale copy of those is a good way to cut your own session."""),
 
     ("THINGS THAT WILL RUIN YOUR DAY", """\
 DO NOT restart the bootstrap service, and avoid stopping the bootstrap VM.
@@ -885,8 +965,10 @@ credentials reset on power loss, keep it that way."""),
 
     ("KEYS", """\
   up/down, j/k    move selection
-  space           toggle (Ports: admin state, PoE: power)
+  space           Ports: enable/disable the port, PoE: power on/off
   g               Ports: add the port to a LAG, or remove it from one
+  ESC             cancel any prompt (prompts wait for you - they no longer
+                  time out and vanish)
   n / d           VLANs: new / delete
   w / a           Config: write / apply
   u               Config: check GitHub for a newer release
@@ -1074,19 +1156,17 @@ class UI:
         h, w = self.s.getmaxyx()
 
         state = "connected" if self.connected else "UNREACHABLE"
-        age = ("" if not self.last_refresh
-               else f"  updated {int(time.time()-self.last_refresh)}s ago")
-        title = f" ENCS 5412 switch  {self.sw.ip}  [{state}]{age} "
+        # No "updated Ns ago": the views that need it auto-refresh anyway, so
+        # the age was noise. That space now carries the update notice instead.
+        note = (f"   UPDATE {self.update_tag} AVAILABLE - Config view, u"
+                if self.update_tag else "")
+        title = f" ENCS 5412 switch  {self.sw.ip}  [{state}]{note} "
         attr = curses.A_REVERSE | (0 if self.connected
                                    else curses.color_pair(C_BAD))
         self.s.addnstr(0, 0, title.ljust(w - 1), w - 1, attr)
-        # Right-hand end of the title bar: the running version, or a nudge
-        # once the background check has found a newer release.
-        ver = (f" v{VERSION} -> {self.update_tag} available (c) "
-               if self.update_tag else f" v{VERSION} ")
+        ver = f" v{VERSION} "
         if len(title) + len(ver) < w:
-            self.s.addnstr(0, w - 1 - len(ver), ver, len(ver),
-                           attr | (curses.A_BOLD if self.update_tag else 0))
+            self.s.addnstr(0, w - 1 - len(ver), ver, len(ver), attr)
 
         # Draw the tabs one at a time so the active one can carry its own
         # attribute - a single addnstr can only paint the whole strip.
@@ -1116,9 +1196,9 @@ class UI:
                 self.draw_detail(h - dh - 3, h, w)
 
         keys = {
-            "ports": ("SPACE toggle admin   g LAG   r refresh   i detail   "
-                      "? help   q quit"),
-            "poe": "SPACE toggle PoE   r refresh   i detail   ? help   q quit",
+            "ports": ("SPACE enable/disable port   g LAG   r refresh   "
+                      "i detail   ? help   q quit"),
+            "poe": "SPACE PoE on/off   r refresh   i detail   ? help   q quit",
             "vlans": "n new   d delete   r refresh   i detail   ? help   q quit",
             "config": ("w write config   a apply config   u check update   "
                        "? help   q quit"),
@@ -1210,8 +1290,8 @@ class UI:
                     out.append("  cannot run LACP. It is still saved and will "
                                "be replayed.")
             if r["adminState"] == "2":
-                out.append("  ADMIN SHUT - this port will not pass traffic. "
-                           "SPACE enables it.")
+                out.append("  DISABLED - you have not enabled this port, so "
+                           "it will not pass traffic. SPACE enables it.")
             elif r["linkState"] != "1" and not n.startswith("LAG"):
                 out.append("  enabled but no link - nothing plugged in, "
                            "or the far end is down.")
@@ -1360,7 +1440,7 @@ class UI:
             ("T", f"These files are the switch's real source of truth: {CFG_DIR}"),
             ("T", ""),
             ("H", "ACTIONS"),
-            ("T", "  w   write the running ports / LAGs / VLANs / PoE to disk"),
+            ("T", "  w   write ports / LAGs / VLANs + port membership / PoE"),
             ("T", "  a   apply every *.xml there, in filename order"),
             ("T", ""),
             ("H", "CURRENT FILES"),
@@ -1384,20 +1464,41 @@ class UI:
                            if kind == "H" else 0)
 
     # ---------------------------------------------------------- input
-    def prompt(self, question):
+    def prompt(self, question, maxlen=12):
+        """Read a line at the bottom of the screen. Blocking; ESC cancels.
+
+        The screen carries a 1s timeout so the views can auto-refresh. That
+        timeout also applied to getstr(), so the old prompt gave up after a
+        second and vanished if you did not start typing immediately. Block
+        for real here and restore the poll timeout on the way out.
+
+        Returns the text, or None if cancelled.
+        """
         h, w = self.s.getmaxyx()
-        curses.echo()
+        buf = ""
         curses.curs_set(1)
-        self.s.addnstr(h - 1, 0, " " * (w - 1), w - 1)
-        self.s.addnstr(h - 1, 1, question, w - 2, curses.color_pair(C_WARN))
-        self.s.refresh()
+        self.s.timeout(-1)
         try:
-            v = self.s.getstr(h - 1, len(question) + 2, 12).decode().strip()
-        except Exception:
-            v = ""
-        curses.noecho()
-        curses.curs_set(0)
-        return v
+            while True:
+                self.s.move(h - 1, 0)
+                self.s.clrtoeol()
+                self.s.addnstr(h - 1, 1, question, w - 2,
+                               curses.color_pair(C_WARN))
+                x = min(len(question) + 2, w - 2)
+                self.s.addnstr(h - 1, x, buf, max(0, w - 1 - x))
+                self.s.refresh()
+                c = self.s.getch()
+                if c == 27:                                   # ESC
+                    return None
+                if c in (curses.KEY_ENTER, 10, 13):
+                    return buf.strip()
+                if c in (curses.KEY_BACKSPACE, 127, 8):
+                    buf = buf[:-1]
+                elif 32 <= c < 127 and len(buf) < maxlen:
+                    buf += chr(c)
+        finally:
+            curses.curs_set(0)
+            self.s.timeout(1000)
 
     def may_shut(self, ifname):
         """Guard the internal backplane ports against being shut.
@@ -1428,9 +1529,12 @@ class UI:
             return
         cur = self.lag_map().get(name)
         v = self.prompt(
-            f"{name} is in {cur[0]}. LAG 1-{MAX_LAG}, or 0 to remove:" if cur
-            else f"add {name} to which LAG? 1-{MAX_LAG} (0 = none):")
-        if not v:
+            f"{name} is in {cur[0]} - enter LAG 1-{MAX_LAG}, 0 removes it, "
+            f"ESC cancels:" if cur
+            else f"add {name} to which LAG? 1-{MAX_LAG}, 0 = none, "
+                 f"ESC cancels:")
+        if v is None or v == "":
+            self.set_msg("cancelled")
             return
         if not v.isdigit() or not 0 <= int(v) <= MAX_LAG:
             self.set_msg(f"'{v}' is not a LAG number (0-{MAX_LAG})", bad=True)
@@ -1443,10 +1547,14 @@ class UI:
             self.write(f"{name} leaves {cur[0]}",
                        lambda: self.sw.set_channel_group(name, 0, 0))
             return
-        m = self.prompt("mode: (a)uto = LACP, (o)n = static:")
-        mode = {"a": CG_AUTO, "o": CG_ON}.get(m[:1].lower()) if m else None
+        m = self.prompt(f"{name} -> LAG{lag_id} mode: (a)uto = LACP, "
+                        f"(o)n = static, ESC cancels:")
+        if m is None or m == "":
+            self.set_msg("cancelled")
+            return
+        mode = {"a": CG_AUTO, "o": CG_ON}.get(m[:1].lower())
         if mode is None:
-            self.set_msg("cancelled - answer a or o", bad=True)
+            self.set_msg(f"'{m}' is not a mode - answer a or o", bad=True)
             return
         self.write(f"{name} -> LAG{lag_id} ({CG_MODE[mode]})",
                    lambda: self.sw.set_channel_group(name, lag_id, mode))
@@ -1520,8 +1628,10 @@ class UI:
                 self.write(f"PoE {p['interfaceName']} {'on' if on else 'off'}",
                            lambda: self.sw.set_poe(p["interfaceName"], on))
             elif c == ord("n") and self.view == "vlans":
-                vid = self.prompt("new VLAN id (1-4094):")
-                if vid.isdigit() and 1 <= int(vid) <= 4094:
+                vid = self.prompt("new VLAN id (1-4094), ESC cancels:")
+                if vid is None:
+                    self.set_msg("cancelled")
+                elif vid.isdigit() and 1 <= int(vid) <= 4094:
                     self.write(f"create VLAN {vid}",
                                lambda: self.sw.vlan(vid, True))
                 elif vid:
@@ -1578,9 +1688,11 @@ def cli_status(sw):
     gi = [p for p in ports if p["interfaceName"].startswith("gi")]
     up = sum(1 for p in gi if p["linkState"] == "1")
     shut = sum(1 for p in gi if p["adminState"] == "2")
-    print(f"switch {sw.ip}: OK - {len(gi)} front ports, {up} link up, {shut} admin shut")
+    print(f"switch {sw.ip}: OK - {len(gi)} front ports, {up} link up, "
+          f"{shut} disabled")
     if shut:
-        print("  WARNING: shut ports will not pass traffic (run the TUI, press SPACE)")
+        print("  WARNING: disabled ports will not pass traffic "
+              "(run the TUI, select the port, press SPACE)")
     sw.logout()
     return 0
 
