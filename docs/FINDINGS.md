@@ -189,7 +189,7 @@ rather than ENCS; `switch-service.service` is explicitly *disabled* by the RPM s
 
 ## 4c. Verified on live hardware
 
-Unit at `<host-ip>`, running **NFVIS 4.15.5-FC4** — the exact build this ISO installs.
+Test unit running **NFVIS 4.15.5-FC4** — the exact build this ISO installs.
 Chassis `FGLxxxxxxxx`, board `FOCxxxxxxxx`. All checks read-only via `support show`.
 
 | Question | Result |
@@ -419,8 +419,8 @@ ever appear in the switch's forwarding table.
 |---|---|---|
 | **CONSOLE** (top) | `ttyS0` — real 16550A, `0x3F8` IRQ 4 | serial console to the host CPU, 115200 8N1. See below. |
 | **CIMC** (bottom) | the BMC's serial port | out-of-band CLI to the CIMC |
-| **MGMT CPU** (top) | I210, `0f:00.0`, `enp15s0` | `Port: Twisted Pair`, link up 1000. Proxmox at `<host-ip>`. This is the jack NFVIS used for its own management. |
-| **MGMT CIMC** (bottom) | the BMC's own NIC — invisible to the host, absent from `lspci` | CIMC at `<cimc-ip>` |
+| **MGMT CPU** (top) | I210, `0f:00.0`, `enp15s0` | `Port: Twisted Pair`, link up 1000 — the hypervisor's management NIC. This is the jack NFVIS used for its own management. |
+| **MGMT CIMC** (bottom) | the BMC's own NIC — invisible to the host, absent from `lspci` | the CIMC's own address |
 | **GE0/0** (top row) | I350 `02:00.0`, `enp2s0f0` | RJ45 **and** SFP jack, one logical port |
 | **GE0/1** (bottom row) | I350 `02:00.1`, `enp2s0f1` | RJ45 **and** SFP jack, one logical port |
 
@@ -452,7 +452,7 @@ config is volatile, and a mis-set `BACKPLANE` or a shut `te2` can cut you off fr
 CONSOLE port depends on none of that.
 
 **MGMT CPU and MGMT CIMC are two physically separate jacks**, not one port shared over a BMC
-sideband. The host reaches `<cimc-ip>` out `vmbr0`/`enp15s0` — i.e. out of the MGMT CPU jack,
+sideband. The host reaches the CIMC out `vmbr0`/`enp15s0` — i.e. out of the MGMT CPU jack,
 across the external LAN, and back in through the MGMT CIMC jack. They share a subnet only because
 both are patched into the same LAN. (An earlier revision of this document claimed the CIMC shared
 the I210 PHY via NC-SI. It does not.)
@@ -713,12 +713,12 @@ This directly threatens the Proxmox plan, because **you need BIOS access to enab
 change boot order** — without it, PCI passthrough of the Marvell device is impossible and the
 whole §6 design collapses. It is also not obviously reversible.
 
-**Current firmware state of the unit at `<host-ip>` — verified unmodified:**
+**Current firmware state of the test unit — verified unmodified:**
 
 | | |
 |---|---|
 | BIOS | `ENCS54_2.5.022720181334` (v2.5, dated 2018-02-27), DMI revision 5.1, "upgradeable" |
-| CIMC | `3.2(14.26)`, reachable at `<cimc-ip>` |
+| CIMC | `3.2(14.26)`, reachable on the MGMT CIMC jack |
 | PID / SN | `ENCS5412/K9` / `FGLxxxxxxxx`, hardware-version M3 |
 | CPU / RAM / disk | Xeon D-1557, 12 cores / 64 GB / 200 GB |
 | Hypervisor stack | QEMU 6.2.0, libvirt 8.0.0, OVS 2.17.6 |
@@ -753,7 +753,7 @@ reframes this project from optional to necessary:
 
 ## 8. The custom ISO build
 
-Build assets live on the build server at `<build-server>:<build-dir>/build/`.
+Build assets live in the project's `scripts/` directory.
 Output: `AlmaLinux-8.9-ENCS5412-switch.iso`, volume label `ENCS_SW_89`.
 
 ### Strategy
@@ -830,7 +830,7 @@ selection, and rescue. Kickstart uses `clearpart --all` + `autopart --type=lvm`,
 ### Build result (2026-08-06)
 
 ```
-<build-dir>/AlmaLinux-8.9-ENCS5412-switch.iso
+out/AlmaLinux-8.9-ENCS5400-switch.iso
 2,705,516,544 bytes   1316 files
 sha256  f082a7e60e2009078f063679f436ac1b50ea2154a82ef5f4a8b36d90e92e78b0
 ```
@@ -1432,60 +1432,20 @@ PoE toggle), each restored to its original state afterwards.
 `install.sh` finds the backplane by **driver and enumeration order** (second `i40e` port), never by
 name — it is `enp8s0f1np1` on this unit and will differ elsewhere.
 
-## 9. Where everything lives (as of 2026-08-07)
+## 9. Repository layout
 
-### Mac — `<project-dir>/`
+Everything this project produces is described in the README's
+[repository layout](../README.md#repository-layout). The build writes its
+deliverables to `out/` in the project directory:
 
-| Path | Size | What |
+| Artifact | Approx size | What |
 |---|---|---|
-| `AlmaLinux-8.9-ENCS5412-switch-slim.iso` | 1.56 GB | **deliverable** — installer ISO, UEFI+BIOS |
-| `AlmaLinux-8.9-ENCS5412-switch.qcow2` | 937 MB | **deliverable** — pre-installed disk for Proxmox |
-| `Cisco_NFVIS-4.15.5-FC4.iso` | 2.71 GB | source; the ONLY source of `switch_firmware.bin` |
-| `Cisco_NFVIS-4.18.1-FC2.iso` | 2.66 GB | comparison build (firmware blob removed) |
-| `payload/extract/opt/switch-confd/` | 31 MB | extracted switch bootstrap — the critical files |
-| `payload/rpms/` | 44 MB | `mv_pciboot.ko` + 6 Cisco RPMs |
-| `build/` | 168 KB | kickstart + build/verify scripts (reproducible) |
-| `FINDINGS.md` | — | this document |
+| `out/AlmaLinux-8.9-ENCS5400-switch.iso` | 1.6 GB | installer ISO, UEFI + BIOS |
+| `out/AlmaLinux-8.9-ENCS5400-switch.qcow2` | 940 MB | pre-installed disk for Proxmox |
 
-Transfer verified by checksum after copy:
+Both are gitignored — they embed Cisco proprietary software extracted from the
+NFVIS ISO you supply and must never be committed or redistributed.
 
-```
-4d9afdf4ed8172de4a3d5832c494809edca4e56fa1ff56e2d5f41cfc4f50591b  slim.iso
-4d273c28ab4e5ac076ed05b6416da2c02f46e5eee98304aabc17826f808c8a96  qcow2
-e7f4500d1f2808d6ed4711f1927dcc60ebb3dad55aa24e5756effa94f7983b46  switch_firmware.bin
-```
-
-`build/` contents worth keeping:
-
-| File | Purpose |
-|---|---|
-| `ks-encs.cfg` | the kickstart — carries comments explaining each of the 4 defects fixed |
-| `build-iso-slim.sh` | trim + repodata regen + remaster (needs `bsdtar`, `xorriso`, `createrepo_c`) |
-| `build-iso.sh` | untrimmed variant |
-| `build-qcow2.sh` | runs the kickstart under QEMU/KVM to produce the disk image |
-| `verify-qcow2.py` | **boots the image and asserts the post-install state — re-run after any kickstart change** |
-| `sigtest.py` | the ENOKEY-vs-EPERM discriminator from §8f |
-| `keep.txt` | the 331-package closure |
-| `files/` | runtime payload (systemd unit + both helper scripts) |
-
-### Build server — `<build-server>:<build-dir>/` (5.2 GB after cleanup)
-
-Kept: `Cisco_NFVIS-4.15.5-FC4.iso` (2.6 GB), the untrimmed
-`AlmaLinux-8.9-ENCS5412-switch.iso` (2.6 GB, superseded — safe to delete),
-`extract/`, `rpms/`, `build/`. Removed: the extracted ISO tree, the raw qcow2
-intermediate, verify copies, OVMF vars, and the two deliverables (now on the Mac).
-
-Tools installed on that server for the build: `libarchive-tools`, `xorriso`,
-`isomd5sum`, `createrepo-c`, `qemu-system-x86`, `qemu-utils`, `ovmf`; user added to `kvm`.
-
-## Artifacts
-
-Local (session scratchpad, clears on reboot):
-`<scratch-dir>/.../scratchpad/` — `x/switch-confd/`, `x/nic/`, `x/dbgsrc/`, `repo/`
-
-Remote `<build-server>:<build-dir>/` (74 MB):
-- `extract/opt/switch-confd/` — all switch bootstrap files
-- `rpms/` — mv_pciboot.ko + 6 Cisco RPMs
-
-The ISO itself was **not** copied to the remote (not needed; the rsync also failed because
-macOS's bundled rsync 2.6.9 rejects `--info=progress2`).
+Intermediate build state lives in `work/` (also gitignored) and can be deleted
+at any time; `build.sh` recreates it. The only input you need to keep is the
+NFVIS ISO itself, which is the sole source of `switch_firmware.bin`.
