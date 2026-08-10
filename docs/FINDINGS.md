@@ -1184,6 +1184,29 @@ Membership is not a property of the group. It is set on the **member port's own*
 | `LACPEnabled` | `s_cg_mode_on=1` / `s_cg_mode_auto=2` (`switch_ns.py:298,338`). |
 | unbind | `LAGID` 0 **and** `LACPEnabled` 0 — what confd sends for `no channel-group` (`switch_interfaces.py:7061`). |
 
+#### `LAGID` is membership; `membershipType` is not
+
+Measured on hardware by binding two shut ports and reading everything back:
+
+| Port state | `LAGID` | `LACPEnabled` | `membershipType` |
+|---|---|---|---|
+| unbound | `0` | `0` | absent from LAGList |
+| bound to LAG2, mode **auto**, port shut | `2` | `2` | **3** — "not candidate" |
+| bound to LAG2, mode **on**, port shut | `2` | `1` | **2** — "inactive" |
+| unbound again | `0` | `0` | absent |
+
+**`LAGID` on the port's own `Standard802_3List` entry is the configuration** — unambiguous, and
+independent of admin/link state. `membershipType` is an *operational* signal describing whether the
+port can currently aggregate, and it varies with the mode: the same shut port reads 3 under
+auto/LACP but 2 under on/static.
+
+This bit us. `encs-switch-tui` 0.0.1–0.0.3 derived membership from `membershipType ∈ {1,2}`, so a
+port bound in LACP mode while shut (state 3) was treated as **not a member**: the Ports view showed
+no LAG, and — worse — `save_config` omitted `15-lag.xml` entirely, so the membership was silently
+lost on the next cold power cycle. Since every front port comes up SHUT after a bootstrap, that was
+the *normal* path, not an edge case. Fixed in 0.0.4 by keying membership off `LAGID` and using
+`membershipType` only for the active/inactive/not-candidate display.
+
 **Reading membership back is a different table.** `{LAGList}` returns `LAGEntry` →
 `PortList` → `PortEntry` with `portName` and `membershipType` (1 = active, 2 = inactive,
 3 = not candidate — `switch_port_info.py:573-579`). Cisco fetches it in the *same* GET as the port

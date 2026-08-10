@@ -54,7 +54,7 @@ CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
 
 # Single source of truth for the version. scripts/release.sh reads this line
 # to name the tag and the tarball, so keep the literal on one line.
-VERSION = "0.0.3"
+VERSION = "0.0.4"
 
 # Where --update looks. Override for a fork or a test repo.
 GITHUB_REPO = os.environ.get("ENCS_REPO", "foureight84/encs5400-almalinux")
@@ -129,7 +129,10 @@ PORT_ROLE = {
 # value as "unknown" rather than assuming a mode, in case a different
 # firmware build is less forthcoming.
 PORT_FIELDS = ["interfaceName", "linkState", "adminState", "mediaType",
-               "speedOper", "duplexOperMode", "MACAddress", "LACPEnabled"]
+               "speedOper", "duplexOperMode", "MACAddress",
+               # LAGID is the authoritative record of LAG membership and
+               # LACPEnabled of its mode; both are read back per port.
+               "LAGID", "LACPEnabled"]
 STAT_FIELDS = ["interfaceName", "receivePacketByteCount",
                "receiveUnicastPacketCount", "transmitPacketByteCount",
                "transmitUnicastPacketCount", "packetErrorCount"]
@@ -395,8 +398,7 @@ def save_config(sw, path=CFG_DIR):
     os.makedirs(path, exist_ok=True)
     written = []
 
-    snap = sw.port_snapshot()
-    allports, lags = snap["ports"], snap["lags"]
+    allports = sw.port_snapshot()["ports"]
     ports = [p for p in allports if p["interfaceName"].startswith("gi")]
     ent = "".join(f"        <Entry><interfaceName>{p['interfaceName']}</interfaceName>"
                   f"<adminState>{p['adminState']}</adminState></Entry>\n"
@@ -415,11 +417,14 @@ def save_config(sw, path=CFG_DIR):
     # withholds it, fall back to auto/LACP: a static bundle facing a far end
     # that speaks LACP silently black-holes traffic, so auto is the safer
     # thing to guess.
+    # Membership from the port's own LAGID, never from LAGList's
+    # membershipType - see UI.lag_map() for why that distinction matters.
     mode_of = {p["interfaceName"]: p["LACPEnabled"] for p in allports}
-    bound = [(m["portName"], lag["interfaceName"])
-             for lag in lags for m in lag["members"]
-             if m["membershipType"] in ("1", "2")
-             and m["portName"].startswith("gi")]
+    bound = []
+    for p in allports:
+        n, lid = p["interfaceName"], (p.get("LAGID") or "").strip()
+        if n.startswith("gi") and lid.isdigit() and int(lid) > 0:
+            bound.append((n, f"LAG{int(lid)}"))
     lag_ent = ""
     for pname, lagname in sorted(bound):
         lag_id = lagname.replace("LAG", "")
@@ -761,8 +766,13 @@ with ENCS_ALLOW_TE_SHUT=1 if you genuinely mean it.
             n/p       not present
   admin     up   = enabled
             SHUT = administratively disabled, shown in red
-  lag       which LAG this port is bundled into, "(i)" if it is a member
-            but inactive (in the group, not forwarding)
+  lag       which LAG this port is bundled into, from the port's own LAGID.
+            The suffix is operational state, NOT whether it is a member:
+              (none)  active - in the group and forwarding
+              (i)     inactive - in the group, not forwarding
+              (x)     not candidate - configured, but cannot join yet; a
+                      shut or link-down port cannot run LACP
+            All three are members and all three are saved by Config/w.
   attached  the host NIC found on the other end, from the MAC table
     to      (blank until that end sends a frame - a down NIC never does)
 
@@ -984,14 +994,29 @@ class UI:
         return self.data.get(self.view, [])
 
     def lag_map(self):
-        """member port name -> (LAG name, membershipType).
+        """member port name -> (LAG name, membershipType or "").
 
-        "Not candidate" (3) means the port is listed against the group but is
-        not part of it, so it is not membership and is left out.
+        Membership comes from the port's own LAGID, which is the stored
+        CONFIGURATION and is unambiguous: 0 unbound, N bound to LAGN,
+        regardless of admin or link state.
+
+        It deliberately does NOT come from LAGList's membershipType. That is
+        an OPERATIONAL signal and varies with mode - measured on hardware, a
+        bound-but-down port reads 3 ("not candidate") under auto/LACP but 2
+        ("inactive") under on/static. Treating 3 as "not a member" made a
+        freshly bound port look unbound and silently dropped it from the
+        saved config, which on a switch whose ports boot SHUT is the normal
+        case, not an edge case.
         """
-        return {m["portName"]: (lag["interfaceName"], m["membershipType"])
-                for lag in self.data.get("lags", [])
-                for m in lag["members"] if m["membershipType"] in ("1", "2")}
+        state = {m["portName"]: m["membershipType"]
+                 for lag in self.data.get("lags", []) for m in lag["members"]}
+        out = {}
+        for p in self.data.get("ports", []):
+            n = p["interfaceName"]
+            lid = (p.get("LAGID") or "").strip()
+            if not n.startswith("LAG") and lid.isdigit() and int(lid) > 0:
+                out[n] = (f"LAG{int(lid)}", state.get(n, ""))
+        return out
 
     def peer_map(self):
         """switch port -> name of the host NIC on the other end of it.
@@ -1171,12 +1196,19 @@ class UI:
                     out.append("  no members - select a gi port and press g "
                                "to add one.")
             elif n in lm:
-                g, st = lm[n]
-                out.append(f"  bundled into {g} - {LAG_MEMBER.get(st, st)}. "
-                           f"g rebinds or removes it.")
+                gname, st = lm[n]
+                mode = CG_MODE.get(r.get("LACPEnabled", ""), "unknown mode")
+                out.append(f"  bundled into {gname} ({mode})"
+                           + (f" - {LAG_MEMBER[st]}" if st in LAG_MEMBER else "")
+                           + ".  g rebinds or removes it.")
                 if st == "2":
                     out.append("  inactive: in the group but not forwarding. "
                                "Usually the far end is not bundling this port.")
+                elif st == "3":
+                    out.append("  not candidate: configured, but cannot join "
+                               "yet - a shut or link-down port")
+                    out.append("  cannot run LACP. It is still saved and will "
+                               "be replayed.")
             if r["adminState"] == "2":
                 out.append("  ADMIN SHUT - this port will not pass traffic. "
                            "SPACE enables it.")
@@ -1238,8 +1270,11 @@ class UI:
             g = lm.get(n)
             if not g:
                 return "-"
-            # (i) = bound but inactive: in the group, not currently forwarding.
-            return g[0] + ("" if g[1] == "1" else "(i)")
+            # Bound either way; the suffix is operational state.
+            #   (i) inactive      - in the group, not forwarding
+            #   (x) not candidate - cannot participate yet, e.g. LACP mode
+            #                       on a port that is shut or has no link
+            return g[0] + {"1": "", "2": "(i)", "3": "(x)"}.get(g[1], "")
 
         def link_col(r):
             s = LINK.get(r["linkState"], "?")
