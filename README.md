@@ -220,15 +220,66 @@ save/replay. The active view is highlighted in the tab bar, the running
 version sits at the right-hand end of the title bar, and if a newer release
 exists the title bar says so.
 
+![Ports view](https://raw.githubusercontent.com/foureight84/encs5400-almalinux/main/docs/img/tui-ports.png)
+
+*Ports view. `panel` gives the label silkscreened on the chassis, `attached to`
+is worked out live from the MAC table, and `UP idle` marks a backplane link
+that is trained but carrying nothing. MAC addresses are partially redacted in
+these screenshots.*
+
+![PoE view](https://raw.githubusercontent.com/foureight84/encs5400-almalinux/main/docs/img/tui-poe.png)
+
+*PoE view — per-port state, class, draw and limit. 802.3bt has been confirmed
+working on real hardware.*
+
 Two columns that are easy to confuse: **`link`** is whether the PHY has a
 signal; **`admin`** is whether *you* have enabled the port (`UP` / `DOWN`,
 `space` toggles it). A port can be `admin UP` with no link, or — on the
 internal backplane ports — show `link UP` while disabled.
 
-`docs/CONFIG.md` lists [what NFVIS could do that this
-cannot](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot) — STP, QoS, ACLs,
-802.1X, IGMP snooping and more. All of them have working `wcd` tables behind
-them, so they are unwritten rather than blocked.
+### What this does and does not do
+
+NFVIS's `switch-confd` drove 23 top-level ConfD paths and 91 `wcd` tables.
+This implements the subset needed to get a switch forwarding and keep it that
+way across a power cycle.
+
+| Implemented | Where |
+|---|---|
+| Port enable/disable | Ports view, `space` |
+| VLAN create/delete | VLANs view, `n` / `d` |
+| VLAN port membership | saved and replayed — no UI editor yet |
+| Link aggregation | Ports view, `g` |
+| PoE on/off | PoE view, `space` |
+| MAC table, counters | read-only views |
+
+**Not implemented.** Every one of these has a working `wcd` table and a Cisco
+XML template sitting in `switch-confd`, so they are unwritten rather than
+blocked — the same pattern used for LAG and VLAN membership applies:
+
+| Area | wcd tables that exist |
+|---|---|
+| Spanning tree (STP/RSTP/MSTP) | `STP`, `RSTP`, `MSTP*` |
+| QoS — class/policy maps, policers, queueing | `ClassMapList`, `PolicyMapList`, `AggregatePolicerList`, `CoS*`, `DSCP*` |
+| ACLs | `ACLList`, `ACEList`, `ACLBindingList` |
+| 802.1X + RADIUS | `Standard_802_1x*`, `RadiusServerList` |
+| IGMP/MLD snooping, multicast filtering | `IGMPMLD*`, `MulticastGlobalSetting` |
+| Storm control | `StormControlTable` |
+| LLDP / CDP | `LLDP*`, `CDPInterfaceList` |
+| L3 — ARP, static routes, default gateway | `ARPList`, `IPv4RouteList`, `IPv4GatewayList` |
+| Port mirroring (SPAN) | `SpanDestinationTable` |
+| Private VLANs | `PrivateVLAN*` |
+| Static MAC entries, aging | `ForwardingStaticTable` |
+| LACP tuning — system/port priority, timeout | `LACPGlobalSetting`, `LACPPortList` |
+
+> **No spanning tree is running.** Fine for a flat L2 deployment — until
+> someone cables two front ports to the same upstream switch and there is
+> nothing to break the loop.
+
+`encs-switch-api` can drive any of these by hand today. Anything you configure
+that way is as volatile as the rest, so it needs its own file in
+`/etc/encs-switch/` to survive a power cycle — the replay service applies
+every `*.xml` there, so `40-acl.xml` works fine. Full detail with the ConfD
+paths is in [docs/CONFIG.md](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot).
 
 **Reading the front panel.** The API calls the switch ports `gi0`–`gi7`; the
 chassis silkscreen calls them `GE1/0`–`GE1/7`, and the TUI shows both. They are
