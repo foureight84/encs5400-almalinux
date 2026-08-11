@@ -1516,19 +1516,60 @@ platform gate before being attributed to the ENCS. `switch-confd` **is** ENCS-on
 A PCIe path to the slot is also visible: a Pericom PI7C9X2G304 switch fans out to `0b:02.0` → bus
 `0e` (the Marvell switch) and `0b:01.0` → bus `0c`, **empty and reporting `Slot #0`**.
 
-### Where this leaves it
+### RESOLVED: the CIMC/BMC is the gatekeeper
 
-Every measurement says a `NIM-SSD` gets identified over I²C and no further, and everything about
-the slot's design points at networking rather than storage. But the *mechanism* — whether the
-chassis lacks SATA lanes to the slot, or the BMC declines to enable an unlisted module — is **not
-established**, and cannot be from the host side.
+Extracting the CIMC firmware settles it. `CIMC_3.2.14.2.bin` carries a uImage kernel at `0x40280`
+and a **squashfs 4.0 root filesystem at `0x7ffbac`** (gzip, 31 MB, 8870 inodes). Inflating its
+blocks and reading the strings gives the BMC's own source references:
 
-Untried: install NFVIS with the module removed, then hot-insert (ENCS supports OIR) and watch
-whether anything appears. That at least tests the vendor stack on vendor hardware. Note this is
-*not* the "patch the allowlist" experiment suggested earlier — there is no ENCS allowlist to patch.
+```
+../spa/bmc_spa.c: Read idprom for bay %d failed
+../spa/bmc_spa.c: Failed to retrieve IRPROM model string for bay %d
+../spa/bmc_spa.c: the Auth for bay %d NIM failed          <-- authentication step
+../spa/bmc_spa.c: NIM OIR thread init failed
+../spa/bmc_spa.c: NIM status monitor thread init failed
+../spa/bmc_spa_util.c: dash_fpga_ngwic_power_status_ok for bay %d
+../spa/bmc_spa_util.c: Err: dash_fpga_ngwic_present
+../spa/bmc_spa.c: NGWIC Power Enable Failed - %d
+```
 
-**Obtaining IOS XE would not help.** The blocker is not a missing driver; nothing enumerates on any
-bus for a driver to bind to, and IOS XE has no ENCS support regardless.
+**The `dash_fpga` is BMC-owned.** That is why it never appears on the host's PCI bus — it was never
+a host peripheral on this platform. The BMC runs the NIM insertion/removal and status threads,
+reads the IDPROM over I²C, **authenticates the module**, and drives `NGWIC` power enable.
+
+The authentication string is significant: this is not a string comparison against a list, it is a
+crypto check, consistent with the TAM/ACT2 trust-anchor components elsewhere in the stack
+(`libtam_act2.so`, `libtam_aikido.so`, `tam-service`).
+
+The only NIM model named anywhere in the CIMC firmware is **`ENCS-INLN`** — the ENCS's own
+fail-to-wire module — matched by `f2w_main.c`, the WAAS fail-to-wire agent:
+
+```
+f2w_main.c: Module is %s          f2w_main.c: Power enable F2W NIM failed
+f2w_main.c: Not WAAS Applicance or no NIM presented, waasagent terminated
+```
+
+The BIOS (`ENCS54_BIOS_2.6.SPA`, a `[CISCO UCS BIOS CIMCPackage]` wrapping a 16 MB AMI image with
+UEFI firmware volumes at `0x800828` onward) contains no NIM PID strings at all, and the CIMC's BIOS
+setup exposes SATA options only for the two front bays.
+
+### Conclusion
+
+**NIM enablement on the ENCS happens entirely below the host OS.** No host software — NFVIS or
+Proxmox — powers or enables the slot, which is consistent with NFVIS containing no ENCS NIM code
+whatsoever. A module is read and authenticated by the BMC; anything that does not pass gets
+identified in the inventory and nothing more. That is exactly the observed behaviour with a
+`NIM-SSD`: the CIMC shows PID and serial, and no bus anywhere sees a device.
+
+So the practical answers:
+
+- **This is not a driver problem.** Obtaining IOS XE, or any other image, changes nothing — no
+  device ever enumerates for a driver to bind to.
+- **It is not fixable from Proxmox**, and would not have been fixable from NFVIS either.
+- The only lever is the BMC, and it authenticates modules cryptographically.
+
+A `NIM-SSD` belongs in an ISR 4331/4351/4431/4451. The module Cisco intends for this chassis is the
+`ENCS-INLN-GE-4T` fail-to-wire NIM, which is the one the CIMC firmware explicitly knows about.
 
 ## 9. Repository layout
 

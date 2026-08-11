@@ -275,22 +275,17 @@ blocked — the same pattern used for LAG and VLAN membership applies:
 > someone cables two front ports to the same upstream switch and there is
 > nothing to break the loop.
 
-**The NIM slot does not work under Proxmox**, and the reason is not a driver.
-NFVIS has **no host-side NIM code for the ENCS at all** — the platform's own
-pnic list is `GE0-0, GE0-1, int-LAN, int-ngio, MGMT`, and nothing in the image
-mentions both ENCS and NIM. On this chassis a NIM is BMC territory: the CIMC
-reads its IDPROM over I²C and inventories it, and no host OS — NFVIS or
-Proxmox — powers or enables the slot.
+**The NIM slot cannot be driven from the host — by any OS.** Extracting the
+CIMC firmware settles why: the FPGA that powers the slot (`dash_fpga`) is
+**BMC-owned**, not a host peripheral. The BMC runs the NIM insertion and
+status threads, reads the module's IDPROM over I²C, **authenticates it**, and
+controls power enable. NFVIS contains no ENCS NIM code at all, which fits.
 
-Measured with a `NIM-SSD` seated and a disk fitted, across a full cold start:
-no block device, six SATA ports rescanned to nothing, PCI count unchanged,
-SMBIOS unchanged, no kernel event, and no BIOS SATA option beyond the two
-front bays. Everything about the slot points at networking — `switch-confd`
-maps module port 0 → `te3` and port 1 → `te4` on VLANs 2350/2351. See
-[docs/FINDINGS.md §8m](docs/FINDINGS.md), which also records a retraction
-worth reading if you go digging in the NFVIS image: it ships platform
-packages for the ENCS, C8200 *and* C8300 side by side, and code must be
-checked against its platform gate before being attributed to the ENCS.
+So a `NIM-SSD` from an ISR 4000 gets identified in the CIMC inventory and goes
+no further: measured across a full cold start with a disk fitted, no block
+device, no PCI change, no SMBIOS change, no kernel event. Not a driver
+problem, and not fixable from Proxmox or NFVIS. See
+[docs/FINDINGS.md §8m](docs/FINDINGS.md).
 
 `encs-switch-api` can drive any of these by hand today. Anything you configure
 that way is as volatile as the rest, so it needs its own file in
