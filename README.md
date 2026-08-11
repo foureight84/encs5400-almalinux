@@ -275,6 +275,21 @@ blocked — the same pattern used for LAG and VLAN membership applies:
 > someone cables two front ports to the same upstream switch and there is
 > nothing to break the loop.
 
+**The NIM slot does not work under Proxmox — at all, for any module.** Not a
+missing driver: the slot is powered and its PCIe link released by NFVIS's
+`chassis_mgrd`, talking to an FPGA over `/dev/dash_fpga`. That FPGA
+(`1137:0130/0240/01d3`, `1172:e001`) **does not appear on an ENCS 5412's PCI
+bus at all**, so there is nothing for the driver to bind to on any kernel or
+in any VM. A module will be read over I²C and shown in the CIMC inventory,
+and get no further.
+
+Cisco also gates modules on a plaintext allowlist in `chassis_mgr.py` — 22
+PIDs, all WAN/LAN, **no storage NIM of any kind**. A `NIM-SSD` fits the slot
+and identifies itself, but the slot is wired for networking (`te3`/`te4`).
+Verified across a full cold start with a disk fitted: no block device, no PCI
+change, no SMBIOS change, nothing in the kernel log. See
+[docs/FINDINGS.md §8m](docs/FINDINGS.md) for the seven checks and the code.
+
 `encs-switch-api` can drive any of these by hand today. Anything you configure
 that way is as volatile as the rest, so it needs its own file in
 `/etc/encs-switch/` to survive a power cycle — the replay service applies
