@@ -1571,6 +1571,34 @@ So the practical answers:
 A `NIM-SSD` belongs in an ISR 4331/4351/4431/4451. The module Cisco intends for this chassis is the
 `ENCS-INLN-GE-4T` fail-to-wire NIM, which is the one the CIMC firmware explicitly knows about.
 
+### Why the same module works on an ISR 4000 but not here
+
+Three Cisco platforms take NIMs, and **each drives the slot from a different place** — which is why
+the same `dash_fpga` API turns up in all three but never in the same location:
+
+| Platform | Who powers/enables the NIM slot |
+|---|---|
+| ISR 4000 (4331/4351/4431/4451) | **IOS XE**, on the main CPU |
+| Catalyst 8200/8300 | host platform stack — `chassis_mgr.py` + a **host-side** `dash_fpga` PCI device |
+| ENCS 5400 | the **BMC/CIMC**, with `dash_fpga` behind it |
+
+The ISR 4000 has **no CIMC of its own** — it is managed by IOS XE. (A CIMC only appears in an ISR
+4000 if you fit an optional UCS-E server blade, and that CIMC manages the blade, not the router's
+NIM slots.)
+
+This reframes the auth question. A `NIM-SSD` runs fine on an ISR 4000, so the module is genuine and
+authenticates — the ENCS's `the Auth for bay %d NIM failed` is therefore more likely "no handler
+for this model on this BMC" than "counterfeit". But that does not open a path: on the ISR the slot
+is lit by the router OS, and the ENCS deliberately keeps the host away from that slot and runs a
+separate signed BMC you cannot put IOS XE on. The ISR proves the *module* carries a storage path;
+it says nothing about whether the *ENCS board* routes SATA lanes to that connector — and every
+ENCS-specific signal (te3/te4, MAC-keyed inventory, the `ENCS-INLN` fail-to-wire module) says the
+slot is wired for networking.
+
+So the barrier is **architectural, not trust**: the ENCS is a different machine that happens to
+share a NIM connector, its slot is BMC-owned, and it is very likely not wired for storage in the
+first place.
+
 ## 9. Repository layout
 
 Everything this project produces is described in the README's
