@@ -275,20 +275,22 @@ blocked — the same pattern used for LAG and VLAN membership applies:
 > someone cables two front ports to the same upstream switch and there is
 > nothing to break the loop.
 
-**The NIM slot does not work under Proxmox — at all, for any module.** Not a
-missing driver: the slot is powered and its PCIe link released by NFVIS's
-`chassis_mgrd`, talking to an FPGA over `/dev/dash_fpga`. That FPGA
-(`1137:0130/0240/01d3`, `1172:e001`) **does not appear on an ENCS 5412's PCI
-bus at all**, so there is nothing for the driver to bind to on any kernel or
-in any VM. A module will be read over I²C and shown in the CIMC inventory,
-and get no further.
+**The NIM slot does not work under Proxmox**, and the reason is not a driver.
+NFVIS has **no host-side NIM code for the ENCS at all** — the platform's own
+pnic list is `GE0-0, GE0-1, int-LAN, int-ngio, MGMT`, and nothing in the image
+mentions both ENCS and NIM. On this chassis a NIM is BMC territory: the CIMC
+reads its IDPROM over I²C and inventories it, and no host OS — NFVIS or
+Proxmox — powers or enables the slot.
 
-Cisco also gates modules on a plaintext allowlist in `chassis_mgr.py` — 22
-PIDs, all WAN/LAN, **no storage NIM of any kind**. A `NIM-SSD` fits the slot
-and identifies itself, but the slot is wired for networking (`te3`/`te4`).
-Verified across a full cold start with a disk fitted: no block device, no PCI
-change, no SMBIOS change, nothing in the kernel log. See
-[docs/FINDINGS.md §8m](docs/FINDINGS.md) for the seven checks and the code.
+Measured with a `NIM-SSD` seated and a disk fitted, across a full cold start:
+no block device, six SATA ports rescanned to nothing, PCI count unchanged,
+SMBIOS unchanged, no kernel event, and no BIOS SATA option beyond the two
+front bays. Everything about the slot points at networking — `switch-confd`
+maps module port 0 → `te3` and port 1 → `te4` on VLANs 2350/2351. See
+[docs/FINDINGS.md §8m](docs/FINDINGS.md), which also records a retraction
+worth reading if you go digging in the NFVIS image: it ships platform
+packages for the ENCS, C8200 *and* C8300 side by side, and code must be
+checked against its platform gate before being attributed to the ENCS.
 
 `encs-switch-api` can drive any of these by hand today. Anything you configure
 that way is as volatile as the rest, so it needs its own file in

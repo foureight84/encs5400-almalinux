@@ -1432,19 +1432,18 @@ PoE toggle), each restored to its original state afterwards.
 `install.sh` finds the backplane by **driver and enumeration order** (second `i40e` port), never by
 name — it is `enp8s0f1np1` on this unit and will differ elsewhere.
 
-## 8m. NIM modules: why none of them work under Proxmox (2026-08-11)
+## 8m. NIM modules on the ENCS: what is known, and what is not (2026-08-11)
 
 **Question:** a `NIM-SSD` — an ISR 4000-series storage carrier — fits the ENCS 5412's NIM slot and
 the CIMC reports it. Can it be used under Proxmox?
 
-**Answer: no, and no other NIM will work either.** Not for want of a driver: the slot is never
-powered, and the chip that would power it does not exist on this chassis's PCI bus.
+**Answer so far: no, and the reason is not established.** What follows separates measurement from
+inference, because a first pass at this got the explanation badly wrong (see the retraction below).
 
-### The evidence
+### What was measured
 
-Tested with the module seated and a SATA SSD installed in it, across a **full cold start** (AC
-removed, so POST enumerated from scratch — the ASIC's uptime counter confirmed the reset by
-dropping from ~68 h to ~3 min):
+Module seated with a SATA SSD fitted, across a **full cold start** (AC removed, so POST enumerated
+from scratch — the ASIC's uptime counter confirmed the reset by dropping from ~68 h to ~3 min):
 
 | Check | Result |
 |---|---|
@@ -1455,95 +1454,81 @@ dropping from ~68 h to ~3 min):
 | BIOS SATA options in CIMC | only the two front bays |
 | Kernel log | not one new event |
 
-### The gatekeeper is a plaintext Python list
+The module *is* identified: the CIMC's **Cisco NIM Modules** inventory shows PID `NIM-SSD`, part
+`73-9276-03`, with MAC `00:00:00:00:00:00`. That read is done by the BMC over **I²C from the
+module's IDPROM**, which works for any seated module and implies nothing about a data path. The
+all-zero MAC is itself informative — that column exists because the table is built for *network*
+modules.
 
-`chassis_mgr.py`, shipped in `tabei-plat` and run by `chassis_mgrd.service`, holds the allowlist:
+### NFVIS has no host-side NIM support on ENCS at all
+
+Searched the whole 4.15.5 media. **No file mentions both ENCS and NIM.** The ENCS platform code —
+`platform-info/encs_basic.py`, `nfvis_platform.py`, `platform-config/` — contains zero NIM
+handling, and `nfvis_platform.py` enumerates the ENCS's physical NICs as exactly:
+
+```
+# On ENCS, pnics include GE0-0, GE0-1, int-LAN, int-ngio, and MGMT
+```
+
+So on this chassis a NIM is **BMC territory**, not host software. Neither NFVIS nor Proxmox powers
+or enables that slot. This is the key structural fact, and it means the question "which driver
+does Proxmox need" is the wrong question — no host OS drives NIMs here.
+
+### Retraction: the allowlist and FPGA belong to a different platform
+
+An earlier revision of this section claimed the ENCS gates NIMs via a `supported_nim_list` in
+`chassis_mgr.py`, and that a `dash_fpga` PCI device powers the slot. **Both were wrong.**
+`chassis_mgr.py` ships in `tabei-plat`, which is the **Catalyst 8200/8300** platform package:
 
 ```python
-supported_nim_list = ["NIM-4G-LTE-VZ", "NIM-4G-LTE-ST", "NIM-4G-LTE-NA", "NIM-4G-LTE-GA",
-                      "NIM-4G-LTE-LA", "NIM-LTEA-EA", "NIM-LTEA-LA", "NIM-1MFT-T1/E1",
-                      "NIM-2MFT-T1/E1", "NIM-4MFT-T1/E1", "NIM-8MFT-T1/E1", "NIM-1CE1T1-PRI",
-                      "NIM-2CE1T1-PRI", "NIM-8CE1T1-PRI", "NIM-16A", "NIM-24A", "NIM-VA-B",
-                      "NIM-VAB-A", "NIM-VAB-M", "NIM-4SHDSL-EA", "NIM-1GE-CU-SFP",
-                      "NIM-2GE-CU-SFP"]
+def is_platform(platform):
+    pid = platform_info["pid"]
+    if platform == 'tabei-m':
+        current_platform = ("C8300" in pid)
+    else:   # tabei-l
+        current_platform = ("C8200" in pid)
 ```
 
-Twenty-two PIDs — cellular, T1/E1, DSL, serial, SFP. **No storage NIM of any kind**, `NIM-SSD`
-included. On insertion:
+`tabei-l` = C8200, `tabei-m` = C8300. Neither is the ENCS. Consequently:
 
-```python
-self.update_state(MODULE_POWER_ENABLE, MODULE_BASE_IDX)   # power the slot
-...                                                        # read + decode the IDPROM cookie
-if nim_model in ('NIM-ES2-8-P','NIM-ES2-8','NIM-ES2-4'):
-    os.system('virsh nodedev-dettach pci_0000_04_00_0')    # switch NIM: stays powered, passed through
-elif nim_model in supported_nim_list:
-    libtam.power_off_nim_module(self.bay_id)               # powered back off for its own subsystem
-else:
-    LOGGER.info("Un-supported NIM model %s" % nim_model)   # marked ABSENT
-    self.msg_state = nim_state.s_removed
-```
+- the 22-PID `supported_nim_list` describes **C8200/C8300** NIM support, not ENCS. There is no
+  equivalent ENCS allowlist anywhere in NFVIS.
+- `dash_fpga_driver.ko` (a PCI driver for `1172:e001`, `1137:0130/0240/01d3`) is C8200/C8300
+  hardware. Its absence from the ENCS PCI bus is expected and proves nothing here.
+- "the NFVIS installer aborted because `chassis_mgr` rejected an unsupported NIM" does not hold —
+  that code does not run on ENCS. Why an NFVIS install fails with this module seated is **still
+  unexplained**.
 
-No signing, no crypto, no binary patching — anyone running NFVIS can add a PID with a one-line
-edit. **This is almost certainly why an NFVIS install fails with an unsupported NIM seated**: the
-installer runs the platform stack, hits the `else` branch and aborts. It is not the installer
-being confused between disks.
+The lesson worth keeping: NFVIS is one image serving ENCS, C8200 and C8300, so platform-specific
+packages sit side by side on the media. Anything read out of it must be checked against the
+platform gate before being attributed to the ENCS. `switch-confd` **is** ENCS-only — it gates on
+`str_begin_with(prod_name, "ENCS5406")` — which is why the te3/te4 findings below survive.
 
-**The CIMC is not the gatekeeper.** It reads the IDPROM over I²C purely for inventory, which is why
-it happily displays `NIM-SSD`, PID `73-9276-03`. The accept/reject decision is host-side software.
+### What still stands: the slot is wired for networking
 
-### Why the allowlist is unreachable anyway
+`switch-confd` is ENCS code, so this is genuinely this chassis:
 
-Editing that list is moot under Proxmox, because the stack containing it never runs, and cannot:
+- `set_module_default_setting()` configures te1–te4 for the module fabric on VLANs **2351 (control
+  plane)** and **2350 (data plane)**
+- `lan1_bsm_l2_op_cfg(slot, bay, port, ...)` maps module **port 0 → te3** and **port 1 → te4**
+- the CIMC's NIM inventory is keyed on MAC address
 
-1. `chassis_mgrd` needs `/dev/dash_fpga*`, provided by `dash_fpga_driver.ko` (`tabei-plat`).
-2. That driver is a **PCI** driver — `__pci_register_driver`, `pci_enable_device`,
-   `pci_request_regions`, `ioremap_nocache`. Its `dash_pci_tbl` claims:
+A PCIe path to the slot is also visible: a Pericom PI7C9X2G304 switch fans out to `0b:02.0` → bus
+`0e` (the Marvell switch) and `0b:01.0` → bus `0c`, **empty and reporting `Slot #0`**.
 
-   | vendor:device | |
-   |---|---|
-   | `1172:e001` | Altera FPGA |
-   | `1137:0130`, `1137:0240`, `1137:01d3` | Cisco |
+### Where this leaves it
 
-3. **None of those devices exist on an ENCS 5412.** `lspci -d 1137:` and `-d 1172:` both return
-   nothing; the only non-Intel devices are two Pericom bridges, the Marvell switch and the Matrox
-   VGA.
+Every measurement says a `NIM-SSD` gets identified over I²C and no further, and everything about
+the slot's design points at networking rather than storage. But the *mechanism* — whether the
+chassis lacks SATA lanes to the slot, or the BMC declines to enable an unlisted module — is **not
+established**, and cannot be from the host side.
 
-So there is nothing for the driver to bind to — on any kernel, in any VM. Note this also rules out
-the trick that makes the Marvell switch work: a PCI device can be VFIO-passed to the AlmaLinux 8.9
-bootstrap VM where an el8 `.ko` loads natively, but only if it enumerates in the first place.
+Untried: install NFVIS with the module removed, then hot-insert (ENCS supports OIR) and watch
+whether anything appears. That at least tests the vendor stack on vendor hardware. Note this is
+*not* the "patch the allowlist" experiment suggested earlier — there is no ENCS allowlist to patch.
 
-The FPGA API is the right shape for the job, which makes its absence the more conclusive:
-
-```
-dash_fpga_ngwic_power         dash_fpga_module_set_pcie_rdy    dash_fpga_msata_present
-dash_fpga_ngwic_present       dash_fpga_module_get_pcie_rdy    dash_fpga_module_i2c_enable
-```
-
-### The slot's PCIe path is visible but empty
-
-A Pericom PI7C9X2G304 3-port PCIe switch fans out to:
-
-| Downstream port | Bus | Contents |
-|---|---|---|
-| `0b:02.0` | `0e` | the Marvell switch |
-| `0b:01.0` | `0c` | **empty, reports `Slot #0`** — almost certainly the NIM |
-
-### Conclusion
-
-The ENCS NIM slot is wired for **networking**, consistent with everything else: the allowlist is
-entirely WAN/LAN modules, the CIMC's NIM table is keyed on MAC address, and `switch-confd` maps
-module port 0 → `te3` and port 1 → `te4`. A `NIM-SSD` identifies itself over I²C and gets no
-further. It belongs in an ISR 4331/4351/4431/4451.
-
-**Getting IOS XE would not help.** The blocker is not a missing driver — `tabei-plat` already *is*
-the ENCS's own platform stack, the correct software for this exact hardware. IOS XE is ISR software
-for ISR hardware and has no ENCS support. A driver cannot attach to a device the bus never offers.
-
-The only untried path is to install NFVIS with the module removed, add the PID to
-`supported_nim_list`, and hot-insert (ENCS supports OIR). That runs the vendor stack on vendor
-hardware with the gate open, and would settle whether a data path exists behind it. Given the
-seven checks above, expectations should be low.
-
+**Obtaining IOS XE would not help.** The blocker is not a missing driver; nothing enumerates on any
+bus for a driver to bind to, and IOS XE has no ENCS support regardless.
 
 ## 9. Repository layout
 
