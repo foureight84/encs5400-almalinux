@@ -243,37 +243,76 @@ NFVIS's `switch-confd` drove 23 top-level ConfD paths and 91 `wcd` tables.
 This implements the subset needed to get a switch forwarding and keep it that
 way across a power cycle.
 
-| Implemented | Where |
+Seven views have a tab and a hotkey; the rest are behind `TAB`, which opens a
+grouped menu. Inside any menu view the grammar is the same: `ENTER` edits the
+selected row, `SPACE` toggles its main setting, `g` reaches that view's global
+settings, `n`/`d` create and delete. `ESC` cancels, and nothing is written
+until the last prompt is answered.
+
+The **Tested** column is deliberate. Everything below is implemented and every
+write has been checked against a real 5412 — but "the switch accepted the
+write and read it back" is a weaker claim than "traffic behaved differently",
+and the table says which one applies.
+
+- **data plane** — observed changing what the switch does with frames
+- **on hardware** — written to a real switch and read back
+- **writes only** — accepted by the switch, effect never measured
+
+| Implemented | Where | Tested |
+|---|---|---|
+| Port enable/disable | Ports view, `space` | **data plane** |
+| Port description, speed, duplex, flow control | Ports view, `ENTER` | **data plane** (speed + duplex forced on a live link) |
+| VLAN create/delete/rename | VLANs view, `n` / `d` / `N` | **on hardware** |
+| VLAN port membership | VLANs view, `ENTER` — access, trunk or general | **data plane** (isolation measured) |
+| PoE on/off | PoE view, `space` | **data plane** (two PDs, 7.5 W) |
+| PoE per-port power limit | PoE view, `ENTER` | **data plane** (enforced at classification) |
+| Port mirroring (local SPAN) | `TAB` → mirror | **data plane** (copies counted) |
+| Static MAC entries, aging | `TAB` → staticmac | **on hardware** |
+| Storm control | `TAB` → storm | **on hardware** — rate limiting not measured |
+| LLDP / CDP advertisement | `TAB` → lldp | **on hardware** — no neighbour table exists |
+| LACP tuning — system/port priority, timeout | `TAB` → lacp | **on hardware** |
+| MAC ACLs — rules and port bindings | `TAB` → acl | **on hardware** — filtering not measured |
+| Spanning tree (STP/RSTP) | `TAB` → stp | **on hardware** per port — see the warning below |
+| Link aggregation | Ports view, `g` | **on hardware** (0.0.4) — negotiation untested |
+| MAC table, counters | read-only views, `f` flush, `z` zero | **on hardware** reads; flush/zero writes only |
+| QoS — mode, trust, port CoS, CoS→queue, policers | `TAB` → qos | writes only |
+| 802.1X + RADIUS | `TAB` → dot1x, radius | writes only |
+| IGMP/MLD snooping | `TAB` → igmp | writes only |
+| Private VLANs | `TAB` → pvlan | writes only |
+| L3 — static routes, gateway, static ARP | `TAB` → l3 | writes only |
+
+Every one of these is saved and replayed. The config directory only grows
+with what you actually configure. See [docs/CONFIG.md](docs/CONFIG.md).
+
+### What has not been tested
+
+Nothing here is known broken — it is unmeasured, and the missing piece is
+hardware rather than code. Grouped by what you would need:
+
+| Needs | Untested |
 |---|---|
-| Port enable/disable | Ports view, `space` |
-| VLAN create/delete | VLANs view, `n` / `d` |
-| VLAN port membership | saved and replayed — no UI editor yet |
-| Link aggregation | Ports view, `g` |
-| PoE on/off | PoE view, `space` |
-| MAC table, counters | read-only views |
+| **A second switch** | LAG/LACP negotiation (including the `auto` vs `on` black-hole trap), STP loop breaking, root guard, BPDU guard |
+| **A traffic generator** | Storm-control rate limiting, QoS marking and queueing, policers |
+| **Endpoints with IP addresses** | ACL filtering, IGMP snooping, private VLAN isolation, L3 routing and static ARP |
+| **Nothing — just never run** | MAC flush, counter clear, MSTP, DSCP maps, per-port shaping |
 
-**Not implemented.** Every one of these has a working `wcd` table and a Cisco
-XML template sitting in `switch-confd`, so they are unwritten rather than
-blocked — the same pattern used for LAG and VLAN membership applies:
+> ⚠ **Spanning tree has never been enabled globally on real hardware.** `te1`
+> and `te2` are both X710 ports to the same host, so the switch may see a loop
+> and block one of them — and if it blocks `te2` the management VLAN goes with
+> it, recoverable only by physical AC removal. Set `STPEnabled=2` on `te1`–`te4`
+> first, and do it with hands on the chassis.
 
-| Area | wcd tables that exist |
+**Still not implemented.** Three of these are blocked on missing information
+rather than effort:
+
+| Area | Why |
 |---|---|
-| Spanning tree (STP/RSTP/MSTP) | `STP`, `RSTP`, `MSTP*` |
-| QoS — class/policy maps, policers, queueing | `ClassMapList`, `PolicyMapList`, `AggregatePolicerList`, `CoS*`, `DSCP*` |
-| ACLs | `ACLList`, `ACEList`, `ACLBindingList` |
-| 802.1X + RADIUS | `Standard_802_1x*`, `RadiusServerList` |
-| IGMP/MLD snooping, multicast filtering | `IGMPMLD*`, `MulticastGlobalSetting` |
-| Storm control | `StormControlTable` |
-| LLDP / CDP | `LLDP*`, `CDPInterfaceList` |
-| L3 — ARP, static routes, default gateway | `ARPList`, `IPv4RouteList`, `IPv4GatewayList` |
-| Port mirroring (SPAN) | `SpanDestinationTable` |
-| Private VLANs | `PrivateVLAN*` |
-| Static MAC entries, aging | `ForwardingStaticTable` |
-| LACP tuning — system/port priority, timeout | `LACPGlobalSetting`, `LACPPortList` |
-
-> **No spanning tree is running.** Fine for a flat L2 deployment — until
-> someone cables two front ports to the same upstream switch and there is
-> nothing to break the loop.
+| IPv4 ACL rules | `switch-confd` only ever built **MAC** ACLs. The element names inside `<IPv4Parameters>` appear nowhere in the extracted source, and a guessed rule is one the switch accepts and never matches. MAC ACLs are complete. |
+| LLDP neighbour table | Does not exist. confd touches only `LLDPGlobalSetting` and `LLDPInterfaceList`, so there is nothing that answers "what is plugged into GE1/3". LLDP can be enabled and timed; it cannot be read back. |
+| Remote SPAN | Needs a reflector port and a remote VLAN. Local SPAN works. |
+| MSTP instances | The client can write region, revision, instance priorities and instance→VLAN maps; there is no view. MSTP on an 8-port edge switch with one region is not worth the screen — use `encs-switch-api`. |
+| DSCP mutation/remark, per-port shaping, class/policy maps | The client can write all of them; there is no view. Reach them with `encs-switch-api`, or see [docs/CONFIG.md](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot). |
+| Port security | `InterfaceSecurityTable` templates exist, but the mode and violation enums were never pinned down. |
 
 **The NIM slot cannot be driven from the host — by any OS.** Extracting the
 CIMC firmware settles why: the FPGA that powers the slot (`dash_fpga`) is
@@ -287,11 +326,31 @@ device, no PCI change, no SMBIOS change, no kernel event. Not a driver
 problem, and not fixable from Proxmox or NFVIS. See
 [docs/FINDINGS.md §8m](docs/FINDINGS.md).
 
-`encs-switch-api` can drive any of these by hand today. Anything you configure
+`encs-switch-api` can drive anything the TUI does not. Whatever you configure
 that way is as volatile as the rest, so it needs its own file in
 `/etc/encs-switch/` to survive a power cycle — the replay service applies
-every `*.xml` there, so `40-acl.xml` works fine. Full detail with the ConfD
-paths is in [docs/CONFIG.md](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot).
+every `*.xml` there in filename order, and one file must hold exactly one
+table. Full detail with the ConfD paths is in
+[docs/CONFIG.md](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot).
+
+**Verified on hardware (2026-08-12).** All 49 wcd tables read back as expected; VLAN isolation,
+port mirroring, PoE on two ports, speed forcing and live VLAN changes all confirmed on a real
+5412 with two PoE devices attached. The duplex enums were resolved (`duplexAdminMode` and
+`duplexOperMode` are inverted relative to each other), and two ways to hang the ASIC were found
+and blocked. Full detail in [docs/FINDINGS.md §8n](docs/FINDINGS.md).
+
+**Testing without the hardware.** `scripts/60-test-tui.py` runs the TUI
+against a fake switch — no network, no chassis. It checks that every view
+fetches and renders (including at 40 columns and with tables missing), that
+every write produces the element names `switch-confd` used, that config
+save/replay round-trips in dependency order, and that cancelling a prompt
+writes nothing. What it *cannot* check is whether the firmware accepts those
+writes: the fixtures come from Cisco's templates, not from a capture. Run it
+before a release; verify on the box before believing a new view works.
+
+```sh
+python3 scripts/60-test-tui.py        # -v to list every check
+```
 
 **Reading the front panel.** The API calls the switch ports `gi0`–`gi7`; the
 chassis silkscreen calls them `GE1/0`–`GE1/7`, and the TUI shows both. They are

@@ -38,6 +38,13 @@ python3 -m py_compile "$TUI" || die "encs-switch-tui does not compile"
 bash -n "$BUNDLE/install.sh" || die "install.sh is not valid bash"
 bash -n "$BUNDLE/encs-switch-api" || die "encs-switch-api is not valid bash"
 
+# The offline suite. It cannot prove the firmware accepts a write, but it
+# does prove every view renders, every write is well-formed XML with the
+# element names switch-confd used, and config save/replay round-trips.
+# Shipping a release that fails it is never right.
+say "Running the offline test suite"
+python3 "$HERE/60-test-tui.py" || die "offline tests failed - not releasing"
+
 if git -C "$ROOT" rev-parse "$TAG" >/dev/null 2>&1; then
     die "tag $TAG already exists - bump VERSION in $TUI first"
 fi

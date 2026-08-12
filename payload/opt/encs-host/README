@@ -39,8 +39,18 @@ Then just run:
 
     encs-switch-tui          press ? for the built-in manual
 
-Ports, VLANs, PoE, link aggregation (Ports view, 'g'), MAC table, statistics
-and config save/replay.
+Seven views have a tab and a hotkey: Ports, VLANs, PoE, MAC, Stats, Config,
+Help. TAB opens a menu with the rest — spanning tree, storm control, port
+mirroring, static MACs, LLDP/CDP, LACP tuning, private VLANs, ACLs, QoS,
+802.1X, RADIUS, IGMP snooping and L3.
+
+Inside a menu view the keys are always the same: ENTER edits the selected
+row, SPACE toggles its main setting, 'g' reaches that view's global settings,
+'n'/'d' create and delete, ESC cancels. Nothing is written until the last
+prompt is answered.
+
+NOTE: the switch boots with SPANNING TREE OFF. Nothing breaks a cabling loop
+until you turn it on (TAB -> stp -> g -> enable).
 
 UPDATING
 --------
@@ -76,7 +86,14 @@ THE TWO THINGS TO REMEMBER
 1. Config is volatile. The ASIC has no flash. VM restarts are fine — they do
    not power-cycle it — but any real power loss wipes the config back to
    VLAN 1 + 2363 with every front port SHUT and PoE off. Save your config
-   (TUI: c then w) and let encs-switch-replay put it back.
+   (TUI: c then w) and let encs-switch-replay put it back. Only the areas
+   you have actually configured are saved, so a plain L2 switch writes five
+   files rather than thirty.
+
+   If you configure a RADIUS server, /etc/encs-switch/70-radius.xml holds
+   its shared secret in clear text — the switch reports it back that way and
+   it cannot be replayed without it. That file is created 0600 and the
+   directory 0700. Think before committing it anywhere.
 
 2. Never restart the bootstrap service, and avoid stopping the VM. The loader
    can only bootstrap an ASIC in WFI; re-running it against a live switch

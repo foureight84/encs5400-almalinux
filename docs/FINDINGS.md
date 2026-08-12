@@ -1599,6 +1599,110 @@ So the barrier is **architectural, not trust**: the ENCS is a different machine 
 share a NIM connector, its slot is BMC-owned, and it is very likely not wired for storage in the
 first place.
 
+## 8n. Hardware verification of the 0.1.0 management features (2026-08-12)
+
+`encs-switch-tui` 0.1.0 added spanning tree, storm control, mirroring, static MACs, LLDP/CDP,
+LACP tuning, private VLANs, ACLs, QoS, 802.1X, RADIUS, IGMP snooping and L3 — all written from
+`switch-confd`'s templates, none of it ever run against the ASIC. Three scripts now verify it:
+`scripts/61-verify-on-switch.py` (API tables), `62-verify-with-device.py` (one link),
+`63-verify-two-devices.py` (forwarding).
+
+### Confirmed by reading every table
+
+All **49** tables the tool touches exist and parse, with the element names and iteration tags it
+expects. Three were **wrong** and were only caught here — a write the switch accepts and silently
+ignores is the worst failure mode available:
+
+| Table | Assumed | Actually |
+|---|---|---|
+| `Standard_802_1xGlobalSetting` | `systemAuthControl` | **`enabled`** |
+| `MulticastGlobalSetting` | `IGMPSnoopingEnbl` | **`IGMPSnoopEnbl`** |
+| `MulticastGlobalSetting` | `IGMPQuerierEnbl` | **`querierEnbl`** |
+
+`PoEPSEInterfaceList` returns only `adminEnable`, `detectionStatus`, `interfaceName`,
+`outputPower`, `powerClassification`, `powerLimit`. **Per-port PoE priority and 4-pair are not on
+this firmware**, despite Cisco having templates for them.
+
+### The duplex enums — RESOLVED
+
+There are **two** enums and they are **inverted relative to each other**, which is why Cisco's
+constants appeared to contradict the observed values:
+
+| | 2 | 3 | 4 |
+|---|---|---|---|
+| `duplexOperMode` (read) | **full** | half | n/a |
+| `duplexAdminMode` (write) | half | **full** | — |
+
+Proven by forcing `duplexAdminMode=3` at 100 Mb/s with autonegotiation off: the link came up
+reporting `duplexOperMode=2`. Forcing `2` gave oper `4` (n/a) rather than half — evidence about the
+test device, which does not support half duplex, not about the enum. **`3=full` is proven;
+`2=half` is Cisco's value, unrefuted but unverified.**
+
+### Confirmed on a live link (one PoE device on GE1/0)
+
+- PoE delivering, class 1, 4.6 W of a 30 W limit.
+- Speed forcing: 1000 → forced 100 → autonegotiation restored 1000.
+- Moving a **live** port between VLANs keeps the link up and keeps forwarding.
+- A PoE access point sent 4255 rx **bytes** with **zero unicast** and the switch learned **no MAC**
+  from it — reserved multicast (LLDP `01:80:c2:…`, CDP `01:00:0c:…`) is neither learned nor
+  forwarded. "UP idle" in the Ports view means *no unicast*, which is not the same as *no traffic*;
+  the detail panel now distinguishes the two.
+
+### PoE control and the power limit
+
+Cutting PoE stops delivery (`detectionStatus` → 1, disabled) and restoring it re-powers the device
+— PoE is genuinely controllable, not just observable.
+
+**`powerLimit` is enforced at CLASSIFICATION ONLY.** Dropping the limit from 30 W to 2.1 W while a
+device drew 4.2 W changed nothing: it kept its power indefinitely. Forcing a re-detection (PoE off,
+then on, limit still low) made the switch **refuse power and report a fault** (`detectionStatus` 4).
+Restoring the limit brought it straight back.
+
+So the limit is real policy, not a display value — but an operator who lowers it on a live port and
+watches for something to happen will conclude, reasonably and wrongly, that it does nothing. The
+TUI now says so when the limit is set below the current draw.
+
+### Confirmed on the data plane (two PoE devices, GE1/0 and GE1/7)
+
+Traffic source is the host itself: `te2` carries VLAN 1 untagged, so a raw Ethernet broadcast
+(EtherType `0x88b5`) injected on the backplane NIC floods every VLAN 1 front port. Counting each
+port's tx bytes then measures the forwarding decision directly — no traffic generator needed.
+
+| Test | Result |
+|---|---|
+| Two PDs at once | class 1 @ 4.4 W + class 5 @ 3.1 W = 7.5 W, independent |
+| Baseline flooding | broadcast reached both ports, 2600 B each |
+| **VLAN isolation** | after moving GE1/7 to its own VLAN: GE1/0 still received, **GE1/7 received 0 B** |
+| **Port mirroring** | destination in a different VLAN (so flooding could not reach it) emitted **3028 B** of copies of a source carrying 2756 B |
+
+Mirroring also confirms `span_index()`: the SPAN tables index ports by number, `gi0`→1 … `gi7`→8,
+`te1`→9 … `te4`→12 — not by name like every other table in this API.
+
+### ⚠ Two ways to hang the switch, both found the hard way
+
+Both required **physical AC removal** to recover, per §8j.
+
+1. **An empty-value element in a `set`.** Posting
+   `<VLANInterfaceISList action="set"><generalTaggedVLANs></generalTaggedVLANs>` — which is what
+   removing a port from its last VLAN naively produces — hangs the ASIC. Cisco clears a field with
+   `action="restore"` and a **self-closing** `<generalTaggedVLANs/>`
+   (`xml_post_no_giga_tagged_vlan_str`). The two are **not** interchangeable. Reproduced twice at
+   the identical write.
+2. **Replaying per-port settings onto `te1`–`te4`.** `25-vlan-ports.xml` has excluded the backplane
+   since 0.0.4; when storm control, LLDP, LACP and port settings were added in 0.1.0 the rule was
+   not carried over. Since `encs-switch-replay.service` applies these unattended after every cold
+   boot, a `te` entry breaks management on *every* boot, not once.
+
+Both are now blocked in code and by tests that fail if the fix is reverted.
+
+### Still unverified
+
+Needs a second switch: LAG/LACP negotiation, STP loop breaking, root/BPDU guard. Needs a traffic
+generator: storm-control rate limiting, QoS marking. Needs endpoints with addresses: ACL filtering,
+IGMP snooping, private VLAN isolation, L3 routing. **Spanning tree has never been enabled globally**
+— `te1` and `te2` are both X710 ports to the same host, so STP may block one; set `STPEnabled=2` on
+`te1`–`te4` first and do it with hands on the chassis.
+
 ## 9. Repository layout
 
 Everything this project produces is described in the README's

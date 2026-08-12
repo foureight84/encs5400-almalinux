@@ -9,6 +9,11 @@ RUN THIS ON THE HYPERVISOR. The switch answers on 169.254.1.0 over VLAN 2363
 on the X710 backplane, and that NIC belongs to the host. The bootstrap VM only
 boots the ASIC over PCIe and cannot reach the switch at all.
 
+Seven views have a tab and a hotkey (ports, vlans, poe, mac, stats, config,
+help); TAB opens a menu with the rest - spanning tree, storm control, port
+mirroring, static MACs, LLDP/CDP, LACP tuning, private VLANs, ACLs, QoS,
+802.1X, RADIUS, IGMP snooping and L3. Press ? for the full manual.
+
 Environment:
     SW_IP      default 169.254.1.0
     SW_USER    default cisco
@@ -54,7 +59,7 @@ CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
 
 # Single source of truth for the version. scripts/release.sh reads this line
 # to name the tag and the tarball, so keep the literal on one line.
-VERSION = "0.0.5"
+VERSION = "0.1.0"
 
 # Where --update looks. Override for a fork or a test repo.
 GITHUB_REPO = os.environ.get("ENCS_REPO", "foureight84/encs5400-almalinux")
@@ -82,7 +87,23 @@ def media_label(ifname, mediatype):
     if ifname.startswith("LAG"):
         return "-"
     return MEDIA.get(mediatype, "-")
+# duplexOperMode - what the link actually negotiated. Verified on hardware
+# 2026-08-12: a 1000BASE-T link to a live device reports 2, and 1000BASE-T
+# has no half-duplex mode, so 2=full is settled.
 DUPLEX = {"2": "full", "3": "half", "4": "-"}
+
+# duplexAdminMode - what you ASK for. A DIFFERENT enum from the one above,
+# and inverted relative to it, which is why Cisco's constants looked like
+# they contradicted the operational values (switch_interfaces.py:463-464).
+#
+# Verified on hardware 2026-08-12: forcing duplexAdminMode=3 at 100 Mb/s
+# with autonegotiation off brought the link up reporting duplexOperMode=2,
+# i.e. full. So 3=full is proven. 2=half is Cisco's value and consistent
+# with what was observed (forcing it did NOT come up full), but could not
+# be confirmed - the test device does not support half duplex, as most
+# modern equipment does not.
+DUPLEX_ADMIN_HALF, DUPLEX_ADMIN_FULL = "2", "3"
+DUPLEX_ADMIN = {DUPLEX_ADMIN_HALF: "half", DUPLEX_ADMIN_FULL: "full"}
 
 # switch_ns.py: s_cg_mode_on=1, s_cg_mode_auto=2. "on" is a static bundle,
 # "auto" negotiates with LACP. 0 is not a mode - it is what confd sends
@@ -134,7 +155,13 @@ PORT_FIELDS = ["interfaceName", "linkState", "adminState", "mediaType",
                "speedOper", "duplexOperMode", "MACAddress",
                # LAGID is the authoritative record of LAG membership and
                # LACPEnabled of its mode; both are read back per port.
-               "LAGID", "LACPEnabled"]
+               "LAGID", "LACPEnabled",
+               # Admin-side settings, as opposed to the Oper fields above.
+               # Read so they can be saved and replayed; absent on a
+               # firmware that does not report them, which _rows renders as
+               # "" and save_config then skips.
+               "interfaceDescription", "speedAdmin",
+               "autoNegotiationAdminEnabled", "flowControlAdminType"]
 STAT_FIELDS = ["interfaceName", "receivePacketByteCount",
                "receiveUnicastPacketCount", "transmitPacketByteCount",
                "transmitUnicastPacketCount", "packetErrorCount"]
@@ -147,6 +174,177 @@ VLANIF_FIELDS = ["interfaceName", "switchportModeAdmin", "generalPVID",
                  "accessPVID", "trunkNativeVID", "trunkMemberVLANs"]
 SWPORT_MODE = {"10": "general", "11": "access", "12": "trunk",
                "13": "private-vlan", "15": "customer"}
+# The reverse map, for the switchport-mode prompt.
+SWPORT_MODE_BY_NAME = {v: k for k, v in SWPORT_MODE.items()}
+
+# ---------------------------------------------------------------- spanning tree
+# switch_stp.py:235-238. Note 1 is not a mode - the enum skips it.
+STP_MODE = {"0": "STP", "2": "RSTP", "3": "MSTP"}
+STP_MODE_BY_NAME = {v.lower(): k for k, v in STP_MODE.items()}
+STP_ON, STP_OFF = "1", "2"
+ENABLED = {"1": "yes", "2": "no"}
+# switch_stp.py:69-73. Filtering drops BPDUs, flooding forwards them; the
+# firmware default is 2.
+BPDU_MODE = {"1": "filtering", "2": "flooding", "3": "bridging"}
+# switch_stp.py:96-99. Cisco's comment says the CLI default is LONG.
+PATHCOST_TYPE = {"1": "short", "2": "long"}
+# 802.1D port roles/states as this firmware reports them. Only used for
+# display, and anything unrecognised falls through as the raw number.
+STP_PORT_STATE = {"1": "disabled", "2": "blocking", "3": "listening",
+                  "4": "learning", "5": "forwarding", "6": "broken"}
+STP_PORT_ROLE = {"1": "disabled", "2": "root", "3": "designated",
+                 "4": "alternate", "5": "backup", "6": "boundary"}
+# RSTP link type (xml_post_iface_stp_link_type_str).
+P2P_MODE = {"0": "auto", "1": "point-to-point", "2": "shared"}
+
+# ---------------------------------------------------------------- storm control
+# switch_interfaces.py:5328-5334 - "For unit type level, the value is 2".
+STORM_KBPS, STORM_LEVEL = "1", "2"
+STORM_UNIT = {STORM_KBPS: "kbps", STORM_LEVEL: "%"}
+
+# ---------------------------------------------------------------------- SPAN
+# switch_monitor.py:49-53 (MarvellSrcDir) and :35-37 (MonDestPortType).
+SPAN_RX, SPAN_TX, SPAN_BOTH = "1", "2", "3"
+SPAN_DIR = {SPAN_RX: "rx", SPAN_TX: "tx", SPAN_BOTH: "both"}
+SPAN_DIR_BY_NAME = {v: k for k, v in SPAN_DIR.items()}
+SPAN_ANALYZER, SPAN_NETWORK = "1", "2"
+SPAN_PORT_TYPE = {SPAN_ANALYZER: "analyzer", SPAN_NETWORK: "network"}
+SPAN_SRC_TYPE = {"1": "interface", "2": "vlan", "4": "remote vlan"}
+# switch_monitor.py:59-61. The API indexes SPAN ports by number, not name.
+SPAN_GE_OFFSET, SPAN_TE_OFFSET, SPAN_VLAN_OFFSET = 1, 8, 100000
+
+
+def span_index(ifname):
+    """Port name -> the ifIndex the SPAN tables use.
+
+    gi0-gi7 are 1-8 and te1-te4 are 9-12 (switch_monitor.py:449 on the way
+    in, :164 on the way back). Every other table in this API takes the port
+    NAME, so this is the one place a number is required.
+    """
+    m = re.fullmatch(r"(gi|te)(\d+)", ifname or "")
+    if not m:
+        raise SwitchError(f"{ifname} cannot be a SPAN port")
+    n = int(m.group(2))
+    return str(n + SPAN_GE_OFFSET if m.group(1) == "gi"
+               else n + SPAN_TE_OFFSET)
+
+
+def span_ifname(index):
+    """The inverse, for displaying what a session is already mirroring."""
+    try:
+        i = int(index)
+    except (TypeError, ValueError):
+        return str(index)
+    if i >= SPAN_VLAN_OFFSET:
+        return f"VLAN {i - SPAN_VLAN_OFFSET + 1}"
+    return f"gi{i - SPAN_GE_OFFSET}" if i <= SPAN_TE_OFFSET \
+        else f"te{i - SPAN_TE_OFFSET}"
+
+
+def span_vlan_index(vid):
+    """VLAN id -> source index (switch_monitor.py:345). Off by one: VLAN 1
+    is the offset itself, not offset+1."""
+    return str(SPAN_VLAN_OFFSET + int(vid) - 1)
+
+
+# ------------------------------------------------------------------ static MAC
+# switch_mac.py:31-40. The YANG_* names are ConfD-side; these are the
+# switch-side values that actually go on the wire.
+MAC_SECURE, MAC_PERMANENT = "1", "3"
+MAC_DELETE_ON_RESET, MAC_DELETE_ON_TIMEOUT = "4", "5"
+MAC_STATUS = {MAC_SECURE: "secure", MAC_PERMANENT: "permanent",
+              MAC_DELETE_ON_RESET: "delete-on-reset",
+              MAC_DELETE_ON_TIMEOUT: "delete-on-timeout"}
+
+# ------------------------------------------------------------------- LLDP/CDP
+# switch_interfaces.py:182-185.
+LLDP_TX, LLDP_RX, LLDP_TXRX, LLDP_OFF = "1", "2", "3", "4"
+LLDP_STATE = {LLDP_TX: "tx only", LLDP_RX: "rx only", LLDP_TXRX: "tx+rx",
+              LLDP_OFF: "disabled"}
+LLDP_STATE_BY_NAME = {"tx": LLDP_TX, "rx": LLDP_RX, "both": LLDP_TXRX,
+                      "off": LLDP_OFF}
+
+# ----------------------------------------------------------------------- ACLs
+# switch_mac.py:41-46 for the actions; ACLType 1 is a MAC ACL
+# (xml_mac_acl_name_str). IPv4 ACLs use the same tables with type 2.
+ACL_MAC, ACL_IPV4 = "1", "2"
+ACL_TYPE = {ACL_MAC: "MAC", ACL_IPV4: "IPv4"}
+ACL_PERMIT, ACL_DENY = "1", "2"
+ACL_ACTION = {ACL_PERMIT: "permit", ACL_DENY: "deny"}
+ACL_ACTION_BY_NAME = {"permit": ACL_PERMIT, "deny": ACL_DENY}
+
+# ------------------------------------------------------------------------ QoS
+# QoSMode 3 is what confd always set (xml_set_qos_mode_str); 1 is disabled
+# and 2 basic, per the CLI's three modes.
+QOS_DISABLED, QOS_BASIC, QOS_ADVANCED = "1", "2", "3"
+QOS_MODE = {QOS_DISABLED: "disabled", QOS_BASIC: "basic",
+            QOS_ADVANCED: "advanced"}
+QOS_TRUST = {"1": "CoS", "2": "DSCP", "3": "CoS-DSCP"}
+POLICE_DROP, POLICE_REMARK = "1", "2"
+POLICE_ACTION = {POLICE_DROP: "drop", POLICE_REMARK: "remark-DSCP"}
+
+# ------------------------------------------------------------------------- L3
+# routeType on IPv4RouteList (xml_ip_source_interface_route_str).
+ROUTE_LOCAL, ROUTE_REMOTE = "1", "2"
+ROUTE_TYPE = {ROUTE_LOCAL: "connected", ROUTE_REMOTE: "static"}
+
+# ---------------------------------------------------------- private VLANs
+# privateVLANType on PrivateVLANTable.
+PVLAN_PRIMARY, PVLAN_ISOLATED, PVLAN_COMMUNITY = "1", "2", "3"
+PVLAN_TYPE = {PVLAN_PRIMARY: "primary", PVLAN_ISOLATED: "isolated",
+              PVLAN_COMMUNITY: "community"}
+PVLAN_TYPE_BY_NAME = {v: k for k, v in PVLAN_TYPE.items()}
+
+# --------------------------------------------------------------------- 802.1X
+DOT1X_PORT_CTRL = {"1": "force-authorized", "2": "force-unauthorized",
+                   "3": "auto"}
+DOT1X_HOST_MODE = {"1": "multi-host", "2": "single-host", "3": "multi-session"}
+
+
+# ------------------------------------------------------------- VLAN lists
+# generalTaggedVLANs and friends are comma-separated with ranges ("1,100-102").
+# switch_interfaces.py:5310-5326 parses exactly that shape on the way in.
+#
+# These exist because the per-port VLAN write is action="set" on the WHOLE
+# list: sending one VLAN id replaces everything the port was in. Adding a
+# port to a second VLAN has to send both, or it silently leaves the first.
+def vlan_list_parse(s):
+    out = set()
+    for part in (s or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            if a.isdigit() and b.isdigit():
+                out.update(range(int(a), int(b) + 1))
+        elif part.isdigit():
+            out.add(int(part))
+    return out
+
+
+def vlan_list_format(vids):
+    """Back to "1,100-102" - collapsed, because a trunk carrying 400 VLANs
+    would otherwise produce a list too long for the switch to accept."""
+    out, start, prev = [], None, None
+    for n in sorted(vids):
+        if start is None:
+            start = prev = n
+        elif n == prev + 1:
+            prev = n
+        else:
+            out.append(str(start) if start == prev else f"{start}-{prev}")
+            start = prev = n
+    if start is not None:
+        out.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(out)
+
+
+def vlan_list_add(current, vid):
+    return vlan_list_format(vlan_list_parse(current) | {int(vid)})
+
+
+def vlan_list_remove(current, vid):
+    return vlan_list_format(vlan_list_parse(current) - {int(vid)})
 
 
 def panel_label(ifname):
@@ -197,6 +395,91 @@ def local_nics():
 
 class SwitchError(Exception):
     pass
+
+
+# ============================================================ XML builders
+# switch-confd carried one hand-written xml_*_str template per setting -
+# roughly 200 of them, all the same envelope around a different element path.
+# Reproducing that here would be 200 near-identical methods, so the envelope
+# is built instead and only the element path is written out per call. The
+# generated bytes are byte-for-byte what confd sent, modulo whitespace, which
+# the switch does not care about.
+def xesc(s):
+    """Escape a value for XML text.
+
+    Cisco never did this - its callers were ConfD, which had already
+    validated every string. Ours come from a prompt, so an ACL named
+    'a&b' or a port description with an angle bracket in it would
+    otherwise produce a body the switch rejects as malformed.
+    """
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def el(tag, inner, indent=8):
+    """<tag>inner</tag>, laid out like Cisco's templates."""
+    pad = " " * indent
+    if "\n" in inner:
+        return f"{pad}<{tag}>\n{inner}\n{pad}</{tag}>"
+    return f"{pad}<{tag}>{inner}</{tag}>"
+
+
+def fields(pairs, indent=8):
+    """{k: v} -> one <k>v</k> per line, skipping None AND empty strings.
+
+    Empty strings are dropped rather than sent as <foo></foo>. That is not
+    a tidiness choice - it is a hard-won one. An earlier version kept them,
+    on the theory that an empty value means "clear this field". It does
+    not: confd clears a field with action="restore" and a SELF-CLOSING
+    <foo/> (xml_post_no_giga_tagged_vlan_str). Sending action="set" with an
+    empty-text <generalTaggedVLANs></generalTaggedVLANs> instead wedged the
+    switch hard enough to need a physical power cycle, twice, on
+    2026-08-11 - reproducibly, at the same write both times.
+
+    So: to clear something, use the restore path (clear_vlan_interface),
+    never an empty value here.
+    """
+    if isinstance(pairs, dict):
+        pairs = pairs.items()
+    return "\n".join(f"{' ' * indent}<{k}>{xesc(v)}</{k}>"
+                     for k, v in pairs if v is not None and v != "")
+
+
+def doc(table, body, action="set"):
+    """The DeviceConfiguration envelope every wcd write uses.
+
+    action is "set" (creates and modifies), "delete", "add" or "restore" -
+    the four verbs confd used. "restore" resets a field to its firmware
+    default and takes an empty element rather than a value.
+    """
+    return ("<?xml version='1.0' encoding='utf-8'?>\n"
+            "<DeviceConfiguration>\n    <version>1.0</version>\n"
+            f'    <{table} action="{action}">\n'
+            f"{body}\n"
+            f"    </{table}>\n</DeviceConfiguration>")
+
+
+def entry_doc(table, values, action="set", tag="Entry", indent=8):
+    """The most common shape by far: one <Entry> of flat fields in a table."""
+    return doc(table, el(tag, fields(values, indent + 4), indent), action)
+
+
+def mac_ace_param(side, value, indent=16):
+    """One address half of a MAC ACL rule.
+
+    Copied from how confd assembled these by hand (switch_mac.py:253-276)
+    rather than from a template, because it is the one block it built as a
+    string: addressType 4 means "any" and carries no address, while type 1
+    carries an address and a mask width. Getting that wrong produces an ACE
+    the switch accepts and then never matches.
+    """
+    pad = " " * indent
+    if (value or "").strip().lower() == "any":
+        return f"{pad}<{side}AddressType>4</{side}AddressType>"
+    mac, _, bits = value.partition("/")
+    return (f"{pad}<{side}AddressType>1</{side}AddressType>\n"
+            f"{pad}<{side}MACAddress>{xesc(mac.strip())}</{side}MACAddress>\n"
+            f"{pad}<{side}MaskBits>{xesc(bits.strip() or '48')}</{side}MaskBits>")
 
 
 # ================================================================== client
@@ -349,28 +632,50 @@ class Switch:
         return self._rows(self.get("VLANInterfaceISList"), "Entry",
                           VLANIF_FIELDS)
 
-    def set_vlan_interface(self, ifname, mode, pvid, tagged, untagged):
-        """Restore one port's VLAN configuration.
+    def set_vlan_interface(self, ifname, mode=None, pvid=None, tagged=None,
+                           untagged=None, forbidden=None, trunk_native=None,
+                           trunk_members=None, access_pvid=None):
+        """Set one port's VLAN configuration.
 
         Same shape switch-confd used for switchport mode / PVID / tagged /
         untagged (xml_post_giga_swport_mode_str and friends), collapsed into
         one Entry so a port lands in a consistent state in a single write.
+
+        Every field is optional and an omitted one is left alone, because the
+        access and trunk fields are only meaningful in their own mode - a
+        general-mode port has no trunkNativeVID, and writing one anyway makes
+        the switch reject the whole Entry.
         """
-        body = f"<interfaceName>{ifname}</interfaceName>"
-        if mode:
-            body += f"<switchportModeAdmin>{mode}</switchportModeAdmin>"
-        if pvid:
-            body += f"<generalPVID>{pvid}</generalPVID>"
-        if tagged:
-            body += f"<generalTaggedVLANs>{tagged}</generalTaggedVLANs>"
-        if untagged:
-            body += f"<generalUntaggedVLANs>{untagged}</generalUntaggedVLANs>"
-        return self.post(
-            "<?xml version='1.0' encoding='utf-8'?>\n"
-            "<DeviceConfiguration>\n    <version>1.0</version>\n"
-            '    <VLANInterfaceISList action="set">\n'
-            f"        <Entry>{body}</Entry>\n"
-            "    </VLANInterfaceISList>\n</DeviceConfiguration>")
+        return self.post(entry_doc("VLANInterfaceISList", {
+            "interfaceName": ifname,
+            "switchportModeAdmin": mode,
+            "generalPVID": pvid,
+            "generalTaggedVLANs": tagged,
+            "generalUntaggedVLANs": untagged,
+            "generalForbiddenVLANs": forbidden,
+            "accessPVID": access_pvid,
+            "trunkNativeVID": trunk_native,
+            "trunkMemberVLANs": trunk_members,
+        }))
+
+    def clear_vlan_interface(self, ifname, *field_names):
+        """Clear VLAN list fields on a port, the way confd did.
+
+        action="restore" with SELF-CLOSING elements
+        (xml_post_no_giga_tagged_vlan_str / _untagged_ / _forbid_). This is
+        NOT interchangeable with setting an empty value: posting
+        action="set" with <generalTaggedVLANs></generalTaggedVLANs> hangs
+        the switch until AC is removed. Verified the hard way twice on
+        2026-08-11.
+        """
+        if not field_names:
+            raise SwitchError("clear_vlan_interface: nothing to clear")
+        body = ["        <Entry>",
+                f"            <interfaceName>{xesc(ifname)}</interfaceName>"]
+        body += [f"            <{f}/>" for f in field_names]
+        body.append("        </Entry>")
+        return self.post(doc("VLANInterfaceISList", "\n".join(body),
+                             "restore"))
 
     def macs(self):
         return self._rows(self.get("ForwardingTable"), "Entry",
@@ -382,24 +687,85 @@ class Switch:
                            "receiveUnicastPacketCount", "transmitPacketByteCount",
                            "transmitUnicastPacketCount", "packetErrorCount"])
 
+    # ---- generic reads --------------------------------------------------
+    @staticmethod
+    def _any(body, tag, within=None):
+        """Rows as {element: text} for EVERY child, not a fixed field list.
+
+        The named-field reader above exists for the views whose columns were
+        worked out against hardware. For the tables added later there is no
+        such certainty: switch-confd only ever wrote most of them, so the
+        exact set of elements the firmware reports back is not documented
+        anywhere and differs per table. Taking whatever arrives keeps a
+        column that happens to be missing from blanking the whole view, and
+        lets the detail panel show fields nobody predicted.
+        """
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as e:
+            raise SwitchError(f"bad XML: {e}")
+        scope = root if within is None else root.find(f".//{within}")
+        if scope is None:
+            return []
+        out = []
+        for e in scope.iter(tag):
+            row = {}
+            for child in e:
+                # Flatten one level of nesting so <BridgeSetting><maxAge>
+                # lands as "maxAge" rather than vanishing.
+                if len(child):
+                    for g in child:
+                        row[g.tag] = (g.text or "").strip()
+                else:
+                    row[child.tag] = (child.text or "").strip()
+            out.append(row)
+        return out
+
+    def read(self, table, tag="Entry", within=None):
+        """GET one table and return its rows with every element they carry."""
+        return self._any(self.get(table), tag, within if within else table)
+
+    def read_one(self, table, tag=None):
+        """A table that holds a single settings block rather than a list."""
+        rows = self._any(self.get(table), tag or table)
+        return rows[0] if rows else {}
+
     # ---- writes -------------------------------------------------------
     def set_port_admin(self, ifname, up):
-        return self.post(
-            "<?xml version='1.0' encoding='utf-8'?>\n"
-            "<DeviceConfiguration>\n    <version>1.0</version>\n"
-            '    <Standard802_3List action="set">\n'
-            f"        <Entry><interfaceName>{ifname}</interfaceName>"
-            f"<adminState>{'1' if up else '2'}</adminState></Entry>\n"
-            "    </Standard802_3List>\n</DeviceConfiguration>")
+        return self.post(entry_doc("Standard802_3List", {
+            "interfaceName": ifname, "adminState": "1" if up else "2"}))
+
+    def set_port(self, ifname, values):
+        """Any other Standard802_3List field on one port.
+
+        Covers speed (speedAdmin), duplex (duplexAdminMode), autonegotiation,
+        flow control, MDIX and the interface description - all of which are
+        separate xml_post_giga_*_str templates in confd and the same one-field
+        write here.
+        """
+        values = dict(values)
+        values["interfaceName"] = ifname
+        return self.post(entry_doc("Standard802_3List", values))
 
     def set_poe(self, ifname, on):
-        return self.post(
-            "<?xml version='1.0' encoding='utf-8'?>\n"
-            "<DeviceConfiguration>\n    <version>1.0</version>\n"
-            '    <PoEPSEInterfaceList action="set">\n'
-            f"        <Interface><interfaceName>{ifname}</interfaceName>"
-            f"<adminEnable>{'1' if on else '2'}</adminEnable></Interface>\n"
-            "    </PoEPSEInterfaceList>\n</DeviceConfiguration>")
+        return self.post(entry_doc("PoEPSEInterfaceList", {
+            "interfaceName": ifname, "adminEnable": "1" if on else "2"},
+            tag="Interface"))
+
+    def set_poe_port(self, ifname, values):
+        """Other PoE fields on one port - in practice, the power limit.
+
+        Cisco's templates also write priority, 4-pair and powered-device
+        class, but this firmware does not report those back: measured
+        2026-08-12, PoEPSEInterfaceList returns only adminEnable,
+        detectionStatus, interfaceName, outputPower, powerClassification
+        and powerLimit. Writing the others is accepted and unverifiable,
+        so treat powerLimit as the only useful field here.
+        """
+        values = dict(values)
+        values["interfaceName"] = ifname
+        return self.post(entry_doc("PoEPSEInterfaceList", values,
+                                   tag="Interface"))
 
     # LAG membership is a property of the MEMBER PORT, not of the LAG: the
     # write targets the port's own Standard802_3List entry and names the group
@@ -409,31 +775,584 @@ class Switch:
     # Unbinding is LAGID 0 with mode 0, which is what confd sends for
     # "no channel-group" (switch_interfaces.py:7061).
     def set_channel_group(self, ifname, lag_id, mode):
-        return self.post(
-            "<?xml version='1.0' encoding='utf-8'?>\n"
-            "<DeviceConfiguration>\n    <version>1.0</version>\n"
-            '    <Standard802_3List action="set">\n'
-            f"        <Entry><interfaceName>{ifname}</interfaceName>"
-            f"<LACPEnabled>{mode}</LACPEnabled>"
-            f"<LAGID>{lag_id}</LAGID></Entry>\n"
-            "    </Standard802_3List>\n</DeviceConfiguration>")
+        return self.post(entry_doc("Standard802_3List", {
+            "interfaceName": ifname, "LACPEnabled": mode, "LAGID": lag_id}))
 
-    def vlan(self, vid, create=True):
-        return self.post(
-            "<?xml version='1.0' encoding='utf-8'?>\n"
-            "<DeviceConfiguration>\n    <version>1.0</version>\n"
-            f'    <VLANList action="{"set" if create else "delete"}">\n'
-            f"        <VLAN><VLANID>{vid}</VLANID></VLAN>\n"
-            "    </VLANList>\n</DeviceConfiguration>")
+    def vlan(self, vid, create=True, name=None):
+        """Create/modify or delete a VLAN.
+
+        A name is optional; confd sent it as a second write
+        (xml_vlanlist_name_str) but the element belongs to the same VLAN
+        entry, so one write does both.
+        """
+        return self.post(doc(
+            "VLANList",
+            el("VLAN", fields({"VLANID": vid, "VLANName": name}, 12)),
+            "set" if create else "delete"))
+
+    def flush_macs(self, ifname=None):
+        """Forget learned MAC addresses - all of them, or one port's.
+
+        Two different shapes, both from switch_action.py:4773-4786. The
+        deleteAll form is a self-closing element and carries no <version>;
+        that is exactly what confd sent, so it is reproduced rather than
+        tidied up.
+        """
+        if ifname:
+            return self.post(entry_doc("ForwardingTable",
+                                       {"interfaceName": ifname},
+                                       action="delete"))
+        return self.post("<?xml version='1.0' encoding='utf-8'?>\n"
+                         "<DeviceConfiguration>\n"
+                         '    <ForwardingTable action="deleteAll"/>\n'
+                         "</DeviceConfiguration>")
+
+    def clear_counters(self, ifname):
+        """Zero the statistics for one port (xml_post_clear_counters_str).
+
+        Note this is a table of its own, not an Entry - the port name goes
+        straight into <clearPorts>.
+        """
+        return self.post(doc("PortStatisticsClear",
+                             fields({"clearPorts": ifname})))
+
+    # ---- spanning tree ---------------------------------------------------
+    # Two tables, and the split is not obvious: whether STP runs at all and
+    # in which mode lives in SpanningTreeGlobalParam, while the timers, the
+    # bridge priority and everything per-port live in STP. RSTP and MSTP*
+    # hold only the fields unique to those modes.
+    def stp_global(self):
+        return self.read_one("SpanningTreeGlobalParam")
+
+    def stp(self):
+        """Global STP settings plus the per-port list, in one GET."""
+        body = self.get("STP")
+        glob = self._any(body, "GlobalSetting")
+        ports = self._any(body, "InterfaceEntry")
+        return {"global": glob[0] if glob else {}, "ports": ports}
+
+    def set_stp_enabled(self, on):
+        return self.post(doc("SpanningTreeGlobalParam",
+                             fields({"enabled": "1" if on else "2"})))
+
+    def set_stp_mode(self, mode):
+        return self.post(doc("SpanningTreeGlobalParam",
+                             fields({"STPOperationMode": mode})))
+
+    def set_stp_bridge(self, values):
+        """forwardDelay / helloTime / maxAge / bridgePriority.
+
+        These sit one level deeper than the rest of GlobalSetting, inside
+        BridgeSetting - see xml_post_stp_forward_time_str.
+        """
+        return self.post(doc("STP", el("GlobalSetting", el(
+            "BridgeSetting", fields(values, 16), 12), 8)))
+
+    def set_stp_setting(self, values):
+        """BPDUHandlingMode / pathCostDefaultValueType / loopbackGuardEnable."""
+        return self.post(doc("STP", el("GlobalSetting", fields(values, 12), 8)))
+
+    def set_stp_port(self, ifname, values, table="STP"):
+        """Per-port STP. table="RSTP" for the point-to-point link type."""
+        values = dict(values)
+        values["interfaceName"] = ifname
+        return self.post(doc(table, el("InterfaceList", el(
+            "InterfaceEntry", fields(values, 16), 12), 8)))
+
+    def mstp_global(self):
+        return self.read_one("MSTPGlobalSetting")
+
+    def set_mstp_global(self, values):
+        return self.post(doc("MSTPGlobalSetting", fields(values, 8)))
+
+    def set_mstp_region(self, name):
+        return self.post(doc("MSTP", el("GlobalSetting",
+                                        fields({"regionName": name}, 12), 8)))
+
+    def mstp_instances(self):
+        return self.read("MSTPInstanceList")
+
+    def set_mstp_instance(self, inst, values):
+        values = dict(values)
+        values["instanceID"] = inst
+        return self.post(entry_doc("MSTPInstanceList", values))
+
+    def mstp_vlans(self):
+        return self.read("MSTPVLANList")
+
+    def set_mstp_vlans(self, inst, vlanlist, add=True):
+        return self.post(entry_doc(
+            "MSTPVLANList", {"instanceID": inst, "VLANList": vlanlist},
+            action="add" if add else "delete"))
+
+    def set_mstp_port(self, inst, ifname, values):
+        values = dict(values)
+        values["instanceID"], values["interfaceName"] = inst, ifname
+        return self.post(entry_doc("MSTPInterfaceList", values))
+
+    # ---- storm control ---------------------------------------------------
+    def storm(self):
+        return self.read("StormControlTable")
+
+    def set_storm(self, ifname, kind, value, unit=STORM_LEVEL):
+        """Rate-limit broadcast / unicast / multicast flooding on one port.
+
+        kind is "broadcast", "unicast" or "multicast". A value of 0 is how
+        confd turns a class off (xml_no_storm_control_broadcast_str), not a
+        delete. Multicast additionally needs multicastType, which confd
+        always sent as 4.
+        """
+        values = {"interfaceName": ifname,
+                  f"{kind}RateValue": value,
+                  f"{kind}UnitType": unit}
+        if kind == "multicast":
+            values["multicastType"] = "4"
+        return self.post(entry_doc("StormControlTable", values))
+
+    # ---- port mirroring (SPAN) -------------------------------------------
+    def span_sources(self):
+        return self.read("SpanSourceTable")
+
+    def span_destinations(self):
+        return self.read("SpanDestinationTable")
+
+    def add_span_source(self, session, ifname=None, vlan=None,
+                        direction=SPAN_BOTH):
+        """Mirror a port or a VLAN into a session.
+
+        sourceType 1 is an interface and 2 a local VLAN; the index is not the
+        port name but Cisco's own numbering - see span_index().
+        """
+        if vlan:
+            stype, idx = "2", span_vlan_index(vlan)
+        else:
+            stype, idx = "1", span_index(ifname)
+        return self.post(entry_doc("SpanSourceTable", {
+            "sessionId": session, "sourceType": stype, "sourceIdx": idx,
+            "sourceDirection": direction}, action="add"))
+
+    def del_span_source(self, session, ifname=None, vlan=None,
+                        direction=SPAN_BOTH):
+        if vlan:
+            stype, idx = "2", span_vlan_index(vlan)
+        else:
+            stype, idx = "1", span_index(ifname)
+        return self.post(entry_doc("SpanSourceTable", {
+            "sessionId": session, "sourceType": stype, "sourceIdx": idx,
+            "sourceDirection": direction}, action="delete"))
+
+    def set_span_destination(self, session, ifname, analyzer=True):
+        """Where the mirrored copy comes out.
+
+        isReflector 1 and a port type of analyzer/network is the local-SPAN
+        case; remote SPAN needs a reflector port and a remote VLAN, which
+        this does not do.
+        """
+        return self.post(entry_doc("SpanDestinationTable", {
+            "sessionId": session, "ifIndex": span_index(ifname),
+            "isReflector": "1",
+            "portType": SPAN_ANALYZER if analyzer else SPAN_NETWORK,
+            "remoteVlanId": "0"}, action="add"))
+
+    def del_span_destination(self, session):
+        return self.post(entry_doc("SpanDestinationTable",
+                                   {"sessionId": session}, action="delete"))
+
+    # ---- static MAC and aging --------------------------------------------
+    def static_macs(self):
+        return self.read("ForwardingStaticTable")
+
+    def forwarding_global(self):
+        return self.read_one("ForwardingGlobalSetting")
+
+    def set_mac_aging(self, seconds):
+        return self.post(doc("ForwardingGlobalSetting",
+                             fields({"agingInterval": seconds})))
+
+    def set_static_mac(self, vid, mac, ifname, status=MAC_PERMANENT):
+        return self.post(entry_doc("ForwardingStaticTable", {
+            "VLANID": vid, "MACAddress": mac, "interfaceName": ifname,
+            "addressStatus": status}))
+
+    def del_static_mac(self, vid, mac):
+        """Delete takes the key plus an EMPTY addressStatus element.
+
+        That empty element is not decoration - it is what
+        xml_mac_address_status_restore_str sends, and the switch matches the
+        entry on the pair (VLANID, MACAddress).
+        """
+        return self.post(doc("ForwardingStaticTable", el(
+            "Entry", fields({"VLANID": vid, "MACAddress": mac}, 12)
+            + "\n            <addressStatus/>"), "delete"))
+
+    # ---- LLDP / CDP ------------------------------------------------------
+    def lldp_global(self):
+        return self.read_one("LLDPGlobalSetting")
+
+    def lldp_ports(self):
+        return self.read("LLDPInterfaceList", tag="InterfaceEntry")
+
+    def cdp_ports(self):
+        return self.read("CDPInterfaceList")
+
+    def set_lldp_global(self, values):
+        return self.post(doc("LLDPGlobalSetting", fields(values)))
+
+    def set_lldp_port(self, ifname, state):
+        return self.post(entry_doc("LLDPInterfaceList", {
+            "interfaceName": ifname, "portState": state},
+            tag="InterfaceEntry"))
+
+    def set_cdp_port(self, ifname, on):
+        return self.post(entry_doc("CDPInterfaceList", {
+            "interfaceName": ifname, "enbl": "1" if on else "2"}))
+
+    # ---- LACP tuning -----------------------------------------------------
+    def lacp_global(self):
+        return self.read_one("LACPGlobalSetting")
+
+    def lacp_ports(self):
+        return self.read("LACPPortList")
+
+    def set_lacp_global(self, values):
+        return self.post(doc("LACPGlobalSetting", fields(values)))
+
+    def set_lacp_port(self, ifname, values):
+        values = dict(values)
+        values["interfaceName"] = ifname
+        return self.post(entry_doc("LACPPortList", values))
+
+    # ---- ACLs ------------------------------------------------------------
+    def acls(self):
+        return self.read("ACLList", tag="ACLEntry")
+
+    def aces(self):
+        return self.read("ACEList")
+
+    def acl_bindings(self):
+        return self.read("ACLBindingList", tag="ACLBindingEntry")
+
+    def acl(self, name, acl_type=ACL_MAC, create=True):
+        return self.post(entry_doc(
+            "ACLList", {"ACLName": name, "ACLType": acl_type},
+            action="set" if create else "delete", tag="ACLEntry"))
+
+    def set_ace(self, name, priority, action_, params, rule_type=ACL_MAC,
+                create=True):
+        """One rule inside an ACL.
+
+        params is the already-built <MACParameters>/<IPv4Parameters> block,
+        because the two rule types carry completely different children and
+        collapsing them would hide which fields are legal where.
+        """
+        return self.post(doc("ACEList", el("Entry", fields({
+            "ACLName": name, "ruleType": rule_type, "ruleAction": action_,
+            "rulePriority": priority}, 12) + "\n" + params),
+            "set" if create else "delete"))
+
+    def bind_acl(self, ifname, name, action_=ACL_DENY, outbound=False):
+        """Attach an ACL to a port.
+
+        interfaceType 2 and bindingType 5 are what confd sent for a physical
+        port (xml_post_acl_input_action_str); the outbound direction uses
+        different element names for the same two values.
+        """
+        if outbound:
+            names = {"defaultRuleActionOut": action_,
+                     "ACLIPv4MACNameOut": name}
+        else:
+            names = {"defaultRuleAction": action_, "ACLIPv4MACName": name}
+        values = {"interfaceType": "2", "interfaceName": ifname}
+        values.update(names)
+        values["bindingType"] = "5"
+        return self.post(entry_doc("ACLBindingList", values,
+                                   tag="ACLBindingEntry"))
+
+    # ---- QoS -------------------------------------------------------------
+    def qos_global(self):
+        return self.read_one("QoSSettingGlobalParam")
+
+    def class_maps(self):
+        return self.read("ClassMapList", tag="ClassMapEntry")
+
+    def policy_maps(self):
+        return self.read("PolicyMapList", tag="PolicyMapEntry")
+
+    def policers(self):
+        return self.read("AggregatePolicerList")
+
+    def cos_settings(self):
+        return self.read("CoSSetting", tag="Interface")
+
+    def cos_queue_map(self):
+        return self.read("CoSToQueueMappingList", tag="CoSMappingEntry")
+
+    def dscp_queue_map(self):
+        return self.read("DSCPMapping")
+
+    def set_qos_mode(self, mode):
+        return self.post(doc("QoSSettingGlobalParam",
+                             fields({"QoSMode": mode})))
+
+    def set_qos_trust(self, trust):
+        """What basic-mode QoS trusts: CoS, DSCP, or both."""
+        return self.post(doc("QoSSettingGlobalParam",
+                             fields({"basicTrustMode": trust})))
+
+    def set_port_cos(self, ifname, cos):
+        return self.post(doc("CoSSetting", el("InterfaceList", el(
+            "Interface", fields({"interfaceName": ifname, "CoS": cos}, 16),
+            12), 8)))
+
+    def set_cos_queue(self, cos, queue):
+        return self.post(entry_doc(
+            "CoSToQueueMappingList", {"CoS": cos, "queueNumber": queue},
+            tag="CoSMappingEntry"))
+
+    def set_class_map(self, name, values=None, create=True):
+        values = dict(values or {})
+        values["className"] = name
+        return self.post(entry_doc("ClassMapList", values,
+                                   action="set" if create else "delete",
+                                   tag="ClassMapEntry"))
+
+    def set_policy_map(self, name, values=None, create=True):
+        values = dict(values or {})
+        values["policyName"] = name
+        return self.post(entry_doc("PolicyMapList", values,
+                                   action="set" if create else "delete",
+                                   tag="PolicyMapEntry"))
+
+    def set_policer(self, name, cir, cbs, action_=POLICE_DROP, create=True):
+        """An aggregate policer: commit rate, burst, and what to do past it.
+
+        PIR/PBS/markVal are sent as 0 exactly as confd did
+        (xml_set_qos_aggre_str) - this firmware's single-rate policer ignores
+        them, but omitting them entirely gets the Entry rejected.
+        """
+        return self.post(entry_doc("AggregatePolicerList", {
+            "policerName": name, "CIR": cir, "CBS": cbs, "PIR": "0",
+            "PBS": "0", "action": action_, "markVal": "0"},
+            action="set" if create else "delete"))
+
+    def set_port_shaper(self, ifname, cir, cbs):
+        """Egress rate limit on one port.
+
+        Despite the table name, QoSBandwidthList is indexed by INTERFACE,
+        not by queue. The four constants are what confd sent
+        (xml_post_giga_traffic_cir_str) and the switch wants all of them.
+        """
+        return self.post(entry_doc("QoSBandwidthList", {
+            "interfaceName": ifname, "interfaceType": "1",
+            "rateLimitEnable": "2", "shaperEnable": "1",
+            "shaperCIR": cir, "shaperCBS": cbs}))
+
+    def dscp_mutations(self):
+        return self.read("DSCPMutationTable")
+
+    def set_dscp_mutation(self, dscp_in, dscp_out):
+        return self.post(entry_doc("DSCPMutationTable",
+                                   {"DSCPIn": dscp_in, "DSCPOut": dscp_out}))
+
+    def set_dscp_queue(self, dscp_in, queue):
+        """DSCP -> egress queue. Nested a level deeper than the mutation
+        table, for no reason anyone recorded."""
+        return self.post(doc("DSCPMapping", el("DSCPList", el(
+            "DSCPEntry", fields({"DSCPIn": dscp_in, "queueNumber": queue},
+                                16), 12), 8)))
+
+    def set_dscp_remark(self, dscp_in, dscp_out):
+        return self.post(doc("DSCPRemark", el("DSCPRemarkList", el(
+            "DSCPRemarkEntry", fields({"DSCPIn": dscp_in,
+                                       "DSCPOut": dscp_out}, 16), 12), 8)))
+
+    # ---- 802.1X and RADIUS -----------------------------------------------
+    # The global on/off element is <enabled>, NOT <systemAuthControl> as
+    # the ConfD-side naming suggests. Confirmed by reading the table off a
+    # live 5412 (2026-08-11): it returns enabled, failureTraps, guestVlanID,
+    # guestVlanTimeout, radiusAuthenticationMethod, successTraps and
+    # nothing else. Writing systemAuthControl was accepted and silently
+    # ignored, which is the worst kind of wrong.
+    def dot1x_global(self):
+        return self.read_one("Standard_802_1xGlobalSetting")
+
+    def dot1x_ports(self):
+        return self.read("Standard_802_1xInterfaceList")
+
+    def set_dot1x_global(self, values):
+        return self.post(doc("Standard_802_1xGlobalSetting", fields(values)))
+
+    def set_dot1x_port(self, ifname, values):
+        values = dict(values)
+        values["interfaceName"] = ifname
+        return self.post(entry_doc("Standard_802_1xInterfaceList", values))
+
+    def radius_servers(self):
+        return self.read("RadiusServerList", tag="RadiusServer")
+
+    def radius_defaults(self):
+        return self.read_one("RadiusDefaultParam")
+
+    def set_radius_default(self, values):
+        return self.post(doc("RadiusDefaultParam", fields(values)))
+
+    def set_radius_server(self, host, values=None, create=True):
+        values = dict(values or {})
+        values["IPAddress"] = host
+        return self.post(entry_doc("RadiusServerList", values,
+                                   action="set" if create else "delete",
+                                   tag="RadiusServer"))
+
+    # ---- IGMP / MLD snooping ---------------------------------------------
+    # Snooping is IGMPSnoopEnbl and the querier is querierEnbl - not
+    # IGMPSnoopingEnbl / IGMPQuerierEnbl. Read off a live 5412 2026-08-11;
+    # the table also carries MLDSnoopEnbl, MLDQuerierEnbl, the proxy flags
+    # and the entry counters, which this does not currently expose.
+    def multicast_global(self):
+        return self.read_one("MulticastGlobalSetting")
+
+    def igmp_vlans(self):
+        return self.read("IGMPMLDSnoopVLANList")
+
+    def igmp_router_ports(self):
+        return self.read("IGMPMLDSnoopRouterPortList")
+
+    def igmp_groups(self):
+        return self.read("IGMPMLDSnoopGroupList")
+
+    def set_multicast_global(self, values):
+        return self.post(doc("MulticastGlobalSetting", fields(values)))
+
+    def set_igmp_vlan(self, vid, values):
+        values = dict(values)
+        values["VLANID"] = vid
+        return self.post(entry_doc("IGMPMLDSnoopVLANList", values))
+
+    def set_igmp_router_ports(self, vid, portlist, static=True):
+        key = "staticPortList" if static else "forbiddenPortList"
+        return self.post(entry_doc("IGMPMLDSnoopRouterPortList",
+                                   {"VLANID": vid, key: portlist}))
+
+    # ---- L3 --------------------------------------------------------------
+    def arp_entries(self):
+        return self.read("ARPList", tag="ARPEntry")
+
+    def arp_global(self):
+        return self.read_one("ARPGlobalSetting")
+
+    def ipv4_global(self):
+        return self.read_one("IPv4GlobalSetting")
+
+    def ipv4_interfaces(self):
+        return self.read("IPv4InterfaceList")
+
+    def routes(self):
+        return self.read("IPv4RouteList")
+
+    def gateways(self):
+        return self.read("IPv4GatewayList", tag="GWEntry")
+
+    def set_arp_timeout(self, seconds):
+        return self.post(doc("ARPGlobalSetting", fields({"timeout": seconds})))
+
+    def set_arp(self, ifname, ip, mac, create=True):
+        """A static ARP entry. The MAC element is physicalAddress here, not
+        MACAddress as everywhere else in this API."""
+        return self.post(entry_doc("ARPList", {
+            "interfaceName": ifname, "IPAddress": ip, "physicalAddress": mac},
+            action="set" if create else "delete", tag="ARPEntry"))
+
+    def set_ip_routing(self, on):
+        return self.post(doc("IPv4GlobalSetting",
+                             fields({"unicastRoutingEnable":
+                                     "1" if on else "2"})))
+
+    def set_route(self, prefix, prefix_len, nexthop, metric=None,
+                  route_type=ROUTE_REMOTE, create=True):
+        """A static route. Note the prefix LENGTH, not a dotted netmask."""
+        return self.post(entry_doc("IPv4RouteList", {
+            "destinationIPv4Address": prefix,
+            "destinationPrefixLength": prefix_len,
+            "nextHopIPv4Address": nexthop,
+            "routeType": route_type, "metric": metric},
+            action="add" if create else "delete"))
+
+    def set_gateway(self, ip, create=True):
+        """Default gateway. fwdStatus/owner/replaceAction are the constants
+        confd sent (xml_ipv4_gateway_str); the switch rejects the entry
+        without them."""
+        return self.post(entry_doc("IPv4GatewayList", {
+            "IPAddr": ip, "fwdStatus": "1", "owner": "1",
+            "replaceAction": "1"},
+            action="set" if create else "delete", tag="GWEntry"))
+
+    # ---- private VLANs ---------------------------------------------------
+    def private_vlans(self):
+        return self.read("PrivateVLANTable")
+
+    def private_vlan_assoc(self):
+        return self.read("PrivateVLANAssociationTable")
+
+    def private_vlan_hosts(self):
+        return self.read("PrivateVLANHostPortTable")
+
+    def private_vlan_promisc(self):
+        return self.read("PrivateVLANPromiscuousPortTable")
+
+    def set_private_vlan(self, vid, mode, create=True):
+        return self.post(entry_doc(
+            "PrivateVLANTable", {"VLANID": vid, "privateVLANType": mode},
+            action="set" if create else "delete"))
+
+    def set_private_vlan_assoc(self, primary, community, create=True):
+        return self.post(entry_doc("PrivateVLANAssociationTable", {
+            "primaryVLANID": primary, "communityVLANsList": community},
+            action="set" if create else "delete"))
+
+    def set_private_vlan_host(self, ifname, primary, secondary, create=True):
+        return self.post(entry_doc("PrivateVLANHostPortTable", {
+            "interfaceName": ifname, "primaryVLAN": primary,
+            "secondaryVLAN": secondary},
+            action="set" if create else "delete"))
+
+    def set_private_vlan_promisc(self, ifname, primary, secondaries,
+                                 create=True):
+        return self.post(entry_doc("PrivateVLANPromiscuousPortTable", {
+            "interfaceName": ifname, "primaryVLAN": primary,
+            "secondaryVLANList": secondaries},
+            action="add" if create else "delete"))
 
 
 def ok(body):
     return "<statusString>OK</statusString>" in body
 
 
+def _try(fn, default=None):
+    """A read that is allowed to fail.
+
+    Views and save_config both assemble several tables, and not every
+    firmware build carries all of them. A missing side table should cost
+    one column, not the whole view - so only a view's PRIMARY read is left
+    unguarded, where a real connection failure still surfaces as
+    UNREACHABLE.
+    """
+    try:
+        return fn()
+    except SwitchError:
+        return [] if default is None else default
+
+
 # ============================================================ config files
 def save_config(sw, path=CFG_DIR):
     os.makedirs(path, exist_ok=True)
+    # A saved RADIUS server carries its shared secret in the clear, because
+    # that is how the switch reports it back. Lock the directory down on
+    # every save rather than only when one happens to exist - the cost is
+    # nothing and the failure mode is a leaked secret.
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
     written = []
 
     allports = sw.port_snapshot()["ports"]
@@ -486,8 +1405,15 @@ def save_config(sw, path=CFG_DIR):
     # firmware recreates on every bootstrap.
     vl = [v for v in sw.vlans() if v["VLANID"] not in ("1", "2363")]
     if vl:
-        ent = "".join(f"        <VLAN><VLANID>{v['VLANID']}</VLANID></VLAN>\n"
-                      for v in vl)
+        # The name goes in too. It is part of the VLAN entry, and leaving it
+        # out meant a renamed VLAN came back nameless after a power cycle -
+        # the switch would look configured while every label was gone.
+        ent = "".join(
+            f"        <VLAN><VLANID>{v['VLANID']}</VLANID>"
+            + (f"<VLANName>{xesc(v['VLANName'])}</VLANName>"
+               if v.get("VLANName") else "")
+            + "</VLAN>\n"
+            for v in vl)
         f = os.path.join(path, "20-vlans.xml")
         open(f, "w").write("<?xml version='1.0' encoding='utf-8'?>\n"
                            "<DeviceConfiguration>\n    <version>1.0</version>\n"
@@ -534,6 +1460,397 @@ def save_config(sw, path=CFG_DIR):
                            '    <PoEPSEInterfaceList action="set">\n' + ent +
                            "    </PoEPSEInterfaceList>\n</DeviceConfiguration>\n")
         written.append(f)
+
+    written += save_extended(sw, path, allports)
+    return written
+
+
+# ------------------------------------------------- the rest of the config
+# One file per TABLE, not per area. apply_config posts each file as a single
+# request body, and a request body is one <DeviceConfiguration> around one
+# table - so an area that spans three tables is three files, numbered so
+# they replay in dependency order.
+#
+# Areas are saved only when they are actually configured. Replaying firmware
+# defaults would be harmless but would turn a plain L2 switch's config
+# directory into thirty files of nothing, and hide the handful that matter.
+# Each predicate below says what "configured" means for that area, with the
+# default it is measured against.
+def entries_doc(table, rows, tag="Entry", action="set"):
+    """One table, many entries - the shape most of these files take."""
+    body = "\n".join(el(tag, fields(r, 12)) for r in rows)
+    return doc(table, body, action) + "\n"
+
+
+def _write(path, name, body, written, secret=False):
+    """Write one replay file.
+
+    secret=True means the body contains a credential the switch handed back
+    in the clear. Created 0600 rather than chmod'd afterwards, so the
+    secret is never briefly world-readable between the two calls.
+    """
+    f = os.path.join(path, name)
+    if secret:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(f, flags, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(body)
+        os.chmod(f, 0o600)          # in case the file already existed
+    else:
+        with open(f, "w") as fh:
+            fh.write(body)
+    written.append(f)
+
+
+def _no_backplane(rows):
+    """Drop te1-te4 from anything destined for a replay file.
+
+    te2 carries the management VLAN and te1/te3/te4 are the module fabric
+    the firmware sets up itself. These files are applied UNATTENDED by
+    encs-switch-replay.service after every cold power cycle, so a single te
+    entry anywhere in them breaks management on every boot - not once, but
+    every time the box loses power.
+
+    25-vlan-ports.xml has excluded te ports since 0.0.4. When the other
+    per-port tables were added in 0.1.0 the rule was not carried over, and
+    storm control, LLDP, LACP and port settings all quietly swept the
+    backplane in. Caught by the on-hardware static check 2026-08-12; hence
+    one shared helper rather than the same filter written out six times.
+    """
+    return [r for r in rows
+            if not (r.get("interfaceName") or "").startswith("te")]
+
+
+def _pick(rows, keys, require="interfaceName"):
+    """Keep only the fields we intend to replay, dropping blanks.
+
+    Read-only operational fields (port state, role, whether a LAG member is
+    forwarding) come back in the same Entry as the settings. Replaying them
+    is at best ignored and at worst rejected, so the save is an explicit
+    allowlist rather than an echo of whatever arrived.
+    """
+    out = []
+    for r in rows:
+        if require and not r.get(require):
+            continue
+        vals = {k: r[k] for k in keys if r.get(k) not in (None, "")}
+        if not vals:
+            continue
+        if require:
+            vals = {require: r[require], **vals}
+        out.append(vals)
+    return out
+
+
+def save_extended(sw, path, allports=None):
+    written = []
+
+    # ---- per-port settings that are not admin state. Kept out of
+    # 10-ports.xml on purpose: that file is the one thing standing between
+    # a cold power cycle and a switch that forwards nothing, and it has
+    # been replayed against hardware in this exact shape. Anything new goes
+    # in its own file so a firmware that rejects it cannot take the port
+    # enables down with it.
+    #
+    # gi ports ONLY. te1-te4 are the internal backplane serdes: te2 carries
+    # the management VLAN this tool talks over, and writing speedAdmin or
+    # autoNegotiationAdminEnabled at a 10GBASE-KR link is at best
+    # meaningless and at worst renegotiates the link you are managing
+    # through. 25-vlan-ports.xml has excluded te ports since 0.0.4 for
+    # exactly this reason; this file must too, and did not - a replay was
+    # observed to take the management VLAN down on live hardware
+    # (2026-08-11). LAGs have no PHY settings either.
+    #
+    # This matters more than a one-off: encs-switch-replay.service applies
+    # these files unattended after every cold power cycle, so a te entry
+    # here would break management on every single boot.
+    settings = _pick(_no_backplane(allports or []),
+                     ["interfaceDescription", "speedAdmin",
+                      "autoNegotiationAdminEnabled", "flowControlAdminType"])
+    # Only ports that have actually been given a setting - autoneg on with
+    # no description is the default and not worth a file.
+    settings = [s for s in settings
+                if s.get("interfaceDescription")
+                or s.get("speedAdmin")
+                or s.get("autoNegotiationAdminEnabled") == "2"
+                or s.get("flowControlAdminType") == "1"]
+    if settings:
+        _write(path, "11-port-settings.xml",
+               entries_doc("Standard802_3List", settings), written)
+
+    # ---- spanning tree. Saved only when it is running: a cold boot brings
+    # the switch back with STP off, which is also the default, so an
+    # untouched switch has nothing to restore.
+    g = _try(sw.stp_global, {})
+    if (g.get("enabled") or "") == "1":
+        _write(path, "35-stp-global.xml",
+               doc("SpanningTreeGlobalParam", fields({
+                   "enabled": g.get("enabled"),
+                   "STPOperationMode": g.get("STPOperationMode")})) + "\n",
+               written)
+        d = sw.stp()
+        gs = d["global"]
+        bridge = {k: gs[k] for k in ("forwardDelay", "helloTime", "maxAge",
+                                     "bridgePriority") if gs.get(k)}
+        if bridge:
+            _write(path, "36-stp-bridge.xml",
+                   doc("STP", el("GlobalSetting",
+                                 el("BridgeSetting", fields(bridge, 16), 12),
+                                 8)) + "\n", written)
+        ports = _pick(_no_backplane(d["ports"]), ["STPEnabled", "pathCost", "portPriority",
+                                   "portFastEnabled", "BPDUGuardEnabled",
+                                   "rootGuardEnabled"])
+        if ports:
+            body = "\n".join(el("InterfaceEntry", fields(p, 16), 12)
+                             for p in ports)
+            _write(path, "37-stp-ports.xml",
+                   doc("STP", el("InterfaceList", body, 8)) + "\n", written)
+
+    # ---- storm control. Default is 0 (off) on every class.
+    storm = _pick(_no_backplane(_try(sw.storm)), ["broadcastRateValue", "broadcastUnitType",
+                                   "unicastRateValue", "unicastUnitType",
+                                   "multicastRateValue", "multicastUnitType",
+                                   "multicastType"])
+    if any(r.get(k, "0") not in ("", "0")
+           for r in storm for k in ("broadcastRateValue", "unicastRateValue",
+                                    "multicastRateValue")):
+        _write(path, "40-storm.xml", entries_doc("StormControlTable", storm),
+               written)
+
+    # ---- port mirroring. Destination first: it is what creates the
+    # session, and a source naming a session that does not exist yet is
+    # rejected. Both tables take action="add", not "set".
+    dests = _pick(_try(sw.span_destinations),
+                  ["sessionId", "ifIndex", "isReflector", "portType",
+                   "remoteVlanId"], require="sessionId")
+    if dests:
+        _write(path, "41-span-dest.xml",
+               entries_doc("SpanDestinationTable", dests, action="add"),
+               written)
+        srcs = _pick(_try(sw.span_sources),
+                     ["sessionId", "sourceType", "sourceIdx",
+                      "sourceDirection"], require="sessionId")
+        if srcs:
+            _write(path, "42-span-src.xml",
+                   entries_doc("SpanSourceTable", srcs, action="add"), written)
+
+    # ---- LLDP/CDP. Default is enabled, tx+rx on every port, so only save
+    # when something has been turned off or retimed.
+    lg = _try(sw.lldp_global, {})
+    lports = _pick(_no_backplane(_try(sw.lldp_ports)), ["portState"])
+    if (lg.get("LLDPEnabled") or "1") != "1" or \
+            (lg.get("updateInterval") or "30") != "30":
+        _write(path, "45-lldp-global.xml",
+               doc("LLDPGlobalSetting", fields({
+                   "LLDPEnabled": lg.get("LLDPEnabled"),
+                   "updateInterval": lg.get("updateInterval")})) + "\n",
+               written)
+    if any(p.get("portState") != LLDP_TXRX for p in lports):
+        _write(path, "46-lldp-ports.xml",
+               entries_doc("LLDPInterfaceList", lports, tag="InterfaceEntry"),
+               written)
+    cports = _pick(_no_backplane(_try(sw.cdp_ports)), ["enbl"])
+    if any(p.get("enbl") != "1" for p in cports):
+        _write(path, "47-cdp-ports.xml",
+               entries_doc("CDPInterfaceList", cports), written)
+
+    # ---- LACP tuning. Defaults are system priority 1, port priority 1,
+    # long timeout (1).
+    ag = _try(sw.lacp_global, {})
+    if (ag.get("LACPSystemPriority") or "1") != "1" or \
+            (ag.get("LAGLoadBalance") or "1") != "1":
+        _write(path, "50-lacp-global.xml",
+               doc("LACPGlobalSetting", fields({
+                   "LACPSystemPriority": ag.get("LACPSystemPriority"),
+                   "LAGLoadBalance": ag.get("LAGLoadBalance")})) + "\n",
+               written)
+    aports = _pick(_no_backplane(_try(sw.lacp_ports)), ["actorPortPriority",
+                                         "actorPortAdminTimeout"])
+    if any(p.get("actorPortPriority", "1") != "1"
+           or p.get("actorPortAdminTimeout", "1") != "1" for p in aports):
+        _write(path, "51-lacp-ports.xml",
+               entries_doc("LACPPortList", aports), written)
+
+    # ---- MAC aging and static entries. Firmware default is 300s.
+    fg = _try(sw.forwarding_global, {})
+    if (fg.get("agingInterval") or "300") != "300":
+        _write(path, "55-mac-aging.xml",
+               doc("ForwardingGlobalSetting",
+                   fields({"agingInterval": fg["agingInterval"]})) + "\n",
+               written)
+    static = _pick(_try(sw.static_macs),
+                   ["VLANID", "MACAddress", "interfaceName", "addressStatus"],
+                   require=None)
+    if static:
+        _write(path, "56-static-mac.xml",
+               entries_doc("ForwardingStaticTable", static), written)
+
+    # ---- ACLs. Three tables and the order matters: an ACE naming an ACL
+    # that does not exist yet is rejected, and so is a binding to a missing
+    # ACL. Hence 60 / 61 / 62.
+    acls = _pick(_try(sw.acls), ["ACLName", "ACLType"], require="ACLName")
+    if acls:
+        _write(path, "60-acls.xml",
+               entries_doc("ACLList", acls, tag="ACLEntry"), written)
+        aces = _pick(_try(sw.aces), ["ACLName", "ruleType", "ruleAction",
+                                     "rulePriority", "sourceAddressType",
+                                     "sourceMACAddress", "sourceMaskBits",
+                                     "destAddressType", "destMACAddress",
+                                     "destMaskBits"], require="ACLName")
+        if aces:
+            _write(path, "61-aces.xml", entries_doc("ACEList", aces), written)
+        binds = _pick(_no_backplane(_try(sw.acl_bindings)),
+                      ["interfaceType", "interfaceName", "bindingType",
+                       "defaultRuleAction", "ACLIPv4MACName",
+                       "defaultRuleActionOut", "ACLIPv4MACNameOut"])
+        if binds:
+            _write(path, "62-acl-bindings.xml",
+                   entries_doc("ACLBindingList", binds,
+                               tag="ACLBindingEntry"), written)
+
+    # ---- QoS. Default mode is disabled, so nothing to restore until it is
+    # switched on.
+    qg = _try(sw.qos_global, {})
+    if (qg.get("QoSMode") or QOS_DISABLED) != QOS_DISABLED:
+        _write(path, "65-qos-global.xml",
+               doc("QoSSettingGlobalParam", fields({
+                   "QoSMode": qg.get("QoSMode"),
+                   "basicTrustMode": qg.get("basicTrustMode")})) + "\n",
+               written)
+        cos = _pick(_no_backplane(_try(sw.cos_settings)), ["CoS"])
+        if any(c.get("CoS", "0") != "0" for c in cos):
+            _write(path, "66-qos-cos.xml",
+                   doc("CoSSetting", el("InterfaceList", "\n".join(
+                       el("Interface", fields(c, 16), 12) for c in cos),
+                       8)) + "\n", written)
+        queues = _pick(_try(sw.cos_queue_map), ["CoS", "queueNumber"],
+                       require=None)
+        if queues:
+            _write(path, "67-cos-queue.xml",
+                   entries_doc("CoSToQueueMappingList", queues,
+                               tag="CoSMappingEntry"), written)
+    pol = _pick(_try(sw.policers),
+                ["policerName", "CIR", "CBS", "PIR", "PBS", "action",
+                 "markVal"], require="policerName")
+    if pol:
+        _write(path, "68-policers.xml",
+               entries_doc("AggregatePolicerList", pol), written)
+
+    # ---- RADIUS before 802.1X: authentication with no server to ask fails
+    # every port closed, so the servers must be back first.
+    #
+    # NOTE the shared secret. The switch hands keyString back in plain
+    # text, so it lands in this file in plain text - there is no way to
+    # replay a RADIUS server without it. The file is created 0600 and the
+    # config directory 0700; treat /etc/encs-switch as secret-bearing from
+    # the moment a RADIUS server exists, and think before committing it.
+    servers = _pick(_try(sw.radius_servers),
+                    ["IPAddress", "authPortNo", "accountPortNo",
+                     "serverPriority", "numberOfRetries", "timeoutForReply",
+                     "deadTime", "keyString", "globalDefaultKeyEnable"],
+                    require="IPAddress")
+    if servers:
+        _write(path, "70-radius.xml",
+               entries_doc("RadiusServerList", servers, tag="RadiusServer"),
+               # Unconditionally 0600, not "0600 when a keyString is
+               # present". If a firmware build reports the secret under an
+               # element we do not recognise, the file is still sensitive
+               # and this is the cheapest way not to depend on guessing right.
+               written, secret=True)
+    dg = _try(sw.dot1x_global, {})
+    if (dg.get("enabled") or "2") == "1":
+        _write(path, "71-dot1x-global.xml",
+               doc("Standard_802_1xGlobalSetting",
+                   fields({"enabled": "1"})) + "\n", written)
+        dports = _pick(_no_backplane(_try(sw.dot1x_ports)), ["portControl", "hostMode"])
+        if dports:
+            _write(path, "72-dot1x-ports.xml",
+                   entries_doc("Standard_802_1xInterfaceList", dports),
+                   written)
+
+    # ---- IGMP snooping. Default is off.
+    mg = _try(sw.multicast_global, {})
+    if (mg.get("IGMPSnoopEnbl") or "2") == "1" or \
+            (mg.get("multicastFilterEnbl") or "2") == "1":
+        _write(path, "75-multicast.xml",
+               doc("MulticastGlobalSetting", fields({
+                   "IGMPSnoopEnbl": mg.get("IGMPSnoopEnbl"),
+                   "multicastFilterEnbl": mg.get("multicastFilterEnbl")}))
+               + "\n", written)
+        vlans = _pick(_try(sw.igmp_vlans),
+                      ["VLANID", "snoopEnbl", "querierEnbl", "immediateLeave",
+                       "querierVersion"], require="VLANID")
+        if vlans:
+            _write(path, "76-igmp-vlans.xml",
+                   entries_doc("IGMPMLDSnoopVLANList", vlans), written)
+        routers = _pick(_try(sw.igmp_router_ports),
+                        ["VLANID", "staticPortList", "forbiddenPortList"],
+                        require="VLANID")
+        if routers:
+            _write(path, "77-igmp-routers.xml",
+                   entries_doc("IGMPMLDSnoopRouterPortList", routers), written)
+
+    # ---- private VLANs, primary before the associations that reference it.
+    pv = _pick(_try(sw.private_vlans), ["VLANID", "privateVLANType"],
+               require="VLANID")
+    if pv:
+        _write(path, "80-pvlan.xml", entries_doc("PrivateVLANTable", pv),
+               written)
+        assoc = _pick(_try(sw.private_vlan_assoc),
+                      ["primaryVLANID", "communityVLANsList"],
+                      require="primaryVLANID")
+        if assoc:
+            _write(path, "81-pvlan-assoc.xml",
+                   entries_doc("PrivateVLANAssociationTable", assoc), written)
+        hosts = _pick(_no_backplane(_try(sw.private_vlan_hosts)),
+                      ["primaryVLAN", "secondaryVLAN"])
+        if hosts:
+            _write(path, "82-pvlan-hosts.xml",
+                   entries_doc("PrivateVLANHostPortTable", hosts), written)
+        promisc = _pick(_no_backplane(_try(sw.private_vlan_promisc)),
+                        ["primaryVLAN", "secondaryVLANList"])
+        if promisc:
+            _write(path, "83-pvlan-promisc.xml",
+                   entries_doc("PrivateVLANPromiscuousPortTable", promisc,
+                               action="add"), written)
+
+    # ---- L3. All of this is off on an L2 switch; only save what exists.
+    #
+    # Routes are deliberately NOT filtered to statics: routeType tells them
+    # apart, and replaying a connected route would be rejected, so only
+    # ROUTE_REMOTE entries are kept.
+    routes = [r for r in _try(sw.routes)
+              if (r.get("routeType") or "") == ROUTE_REMOTE]
+    routes = _pick(routes, ["destinationIPv4Address",
+                            "destinationPrefixLength", "nextHopIPv4Address",
+                            "routeType", "metric"], require=None)
+    gws = _pick(_try(sw.gateways), ["IPAddr", "fwdStatus", "owner"],
+                require="IPAddr")
+    arps = _pick(_no_backplane(_try(sw.arp_entries)),
+                 ["interfaceName", "IPAddress", "physicalAddress"])
+    ag2 = _try(sw.arp_global, {})
+    # Routing on/off comes BEFORE the gateway and routes it governs -
+    # replaying static routes onto a switch with routing still disabled
+    # restores the table and none of the behaviour.
+    ipg = _try(sw.ipv4_global, {})
+    if (ipg.get("unicastRoutingEnable") or "2") == "1":
+        _write(path, "84-ip-routing.xml",
+               doc("IPv4GlobalSetting",
+                   fields({"unicastRoutingEnable": "1"})) + "\n", written)
+    if gws:
+        _write(path, "85-gateway.xml",
+               entries_doc("IPv4GatewayList", gws, tag="GWEntry"), written)
+    if routes:
+        _write(path, "86-routes.xml",
+               entries_doc("IPv4RouteList", routes, action="add"), written)
+    if arps:
+        _write(path, "87-arp.xml",
+               entries_doc("ARPList", arps, tag="ARPEntry"), written)
+    if ag2.get("timeout") and ag2["timeout"] != "60000":
+        _write(path, "88-arp-timeout.xml",
+               doc("ARPGlobalSetting",
+                   fields({"timeout": ag2["timeout"]})) + "\n", written)
+
     return written
 
 
@@ -766,14 +2083,54 @@ THIS tool runs on the HYPERVISOR, which owns the X710 backplane NIC and
 therefore the management VLAN (2363, 169.254.1.1 -> 169.254.1.0)."""),
 
     ("VIEWS", """\
+Seven views have a tab and a hotkey - the ones you need to get a switch
+forwarding:
+
   p  Ports    link/admin state per interface. SPACE toggles admin up/shut,
-              g binds the port into a LAG or takes it out.
-  v  VLANs    VLAN list with tagged/untagged membership. n=new  d=delete.
-  e  PoE      per-port power state and draw. SPACE toggles PoE.
+              g binds the port into a LAG or takes it out, ENTER sets the
+              description / speed / duplex / flow control, z zeroes the counters.
+  v  VLANs    VLAN list with tagged/untagged membership. n=new (and names
+              it), d=delete, ENTER adds a port to the selected VLAN or
+              takes it out, N renames it.
+  e  PoE      per-port power state and draw. SPACE toggles PoE,
+              ENTER sets the port's power limit (which the switch
+              applies at classification, not immediately).
   m  MAC      the forwarding table - which MAC was learned on which port.
-  s  Stats    rx/tx byte and packet counters, error counts.
+              f forgets learned addresses, per port or all of them.
+  s  Stats    rx/tx byte and packet counters, error counts. z zeroes them.
   c  Config   save the running config to disk, or replay it.
-  ?  Help     this manual."""),
+  ?  Help     this manual.
+
+TAB opens everything else. A tab strip cannot hold twenty entries at 80
+columns, so the rest live in a menu:
+
+  Switching
+    stp        spanning tree - see SPANNING TREE below
+    storm      rate-limit broadcast/unicast/multicast flooding per port
+    mirror     port mirroring (SPAN) - copy traffic to an analyser port
+    staticmac  static forwarding entries, and the MAC aging timer
+    lldp       LLDP and CDP advertisement, global and per port
+    lacp       LACP system priority, port priority, timeout
+    pvlan      private VLANs - primary / isolated / community
+  Policy
+    acl        MAC access lists, their rules, and the ports they bind to
+    qos        QoS mode and trust, per-port CoS, CoS->queue map, policers
+    dot1x      802.1X port authentication
+    radius     RADIUS servers
+  Routing and multicast
+    igmp       IGMP/MLD snooping, per VLAN and global
+    l3         static routes, default gateway, static ARP, routing on/off
+
+Inside those views the keys are the same everywhere:
+
+  ENTER   edit the selected row (asks one question at a time)
+  SPACE   toggle the row's main on/off setting, where it has one
+  g       the view's GLOBAL settings, as opposed to the selected row's
+  n / d   create / delete an entry, in the views that are lists
+  ESC     cancel any prompt without writing anything
+
+Nothing is written until the last prompt is answered, so ESC at any point
+leaves the switch untouched."""),
 
     ("READING THE PORTS VIEW", """\
   gi0-gi7   the 8 front-panel RJ45 ports (PoE capable), media "copper".
@@ -831,6 +2188,11 @@ with ENCS_ALLOW_TE_SHUT=1 if you genuinely mean it.
             UP idle   trained but NOTHING has arrived - yellow
             down      no link
             n/p       not present
+  duplex    two enums, and they are INVERTED relative to each other.
+            duplexOperMode (what you see) is 2=full 3=half 4=n/a.
+            duplexAdminMode (what you set) is 3=full, 2=half. Verified on
+            hardware 2026-08-12 by forcing each against a live link; only
+            "full" is proven, since the test device would not do half.
   admin     whether YOU have enabled the port - SPACE toggles it
             UP        enabled
             DOWN      disabled, shown in red. Cisco's CLI calls this
@@ -881,6 +2243,59 @@ The write goes to the MEMBER PORT, not to the LAG: it sets LACPEnabled and
 LAGID on the port's Standard802_3List entry, which is exactly what Cisco's
 switch-confd sent for "channel-group"."""),
 
+    ("SPANNING TREE", """\
+THE SWITCH BOOTS WITH SPANNING TREE OFF. Nothing will break a cabling loop
+until you turn it on, and a loop between two front ports takes the
+management VLAN down with everything else.
+
+TAB -> stp, then g -> enable. Two things to expect:
+
+  - ports do not forward immediately. They go through listening and
+    learning first, which with the default timers is about 30 seconds. A
+    link that worked a moment ago going quiet is the protocol working.
+  - a port with a server on it should have portfast set (ENTER ->
+    portfast), or that server waits 30s for a link every time it reboots.
+    Never set portfast on a port facing another switch.
+
+The view shows per-port state and role as the switch reports them, and
+auto-refreshes while they change.
+
+Modes are STP, RSTP (the default, and what you want) and MSTP. Timers are
+checked against 802.1D before they are sent: max_age must be at least
+2*(hello+1) and no more than 2*(forward_delay-1). The switch enforces the
+same rule but answers a violation with a bare FAILED.
+
+Bridge priority is rounded down to a multiple of 4096 and port priority to
+a multiple of 16, because the switch rejects anything else.
+
+BPDU guard, root guard and link type are per-port under ENTER. Link type
+is written to the RSTP table rather than STP - a detail that matters only
+if you are reading raw XML."""),
+
+    ("WHAT IS NOT HERE", """\
+IPv4 ACL RULES. MAC ACLs are complete - create, rule, bind. IPv4 ACLs are
+not: switch-confd built them through a path that is not in the extracted
+source, so the element names inside <IPv4Parameters> are unknown. Writing
+a guess would produce a rule the switch accepts and never matches, which is
+worse than not offering it. The ACL view says so if you select one.
+
+LLDP NEIGHBOURS. There is no neighbour table. LLDP can be turned on and
+timed, and CDP can be turned on, but this firmware exposes nothing that
+answers "what is plugged into GE1/3". confd only ever touched
+LLDPGlobalSetting and LLDPInterfaceList.
+
+MSTP INSTANCES. The client can write them (region, revision, instance
+priorities, instance-to-VLAN maps) but there is no view - MSTP on an
+eight-port edge switch with one VLAN region is not worth the screen. Use
+encs-switch-api if you need it.
+
+REMOTE SPAN. Mirroring to a port works. Mirroring across a VLAN to another
+switch needs a reflector port and a remote VLAN, and is not implemented.
+
+Everything above is reachable with encs-switch-api by hand. Anything you
+configure that way needs its own file in {cfg} to survive a power cycle -
+the replay service applies every *.xml there, in filename order."""),
+
     ("UPDATING THIS TOOL", """\
 Version {ver}. On startup this tool asks GitHub once, in the background,
 whether a newer release exists. If there is one the title bar says so; if
@@ -920,12 +2335,50 @@ So the files under {cfg} are the switch's real source of truth. Use the
 Config view to write them, keep them in version control, and let
 encs-switch-replay.service reapply them after a power loss.
 
-What w writes, applied in filename order on replay:
+What w writes, applied in filename order on replay. The first five are
+always written; the rest appear only if you have actually configured that
+area, so a plain L2 switch still has five files and not thirty:
+
   10-ports.xml       admin up/down per front port
+  11-port-settings   description, speed, flow control
   15-lag.xml         LAG membership and mode
-  20-vlans.xml       which VLANs exist
+  20-vlans.xml       which VLANs exist, and their names
   25-vlan-ports.xml  which ports are in them, and how they tag
   30-poe.xml         PoE on/off per port
+  35/36/37-stp-*     spanning tree: global, bridge timers, per port
+  40-storm.xml       storm control rates
+  41/42-span-*       mirror destination, then what it mirrors
+  45/46/47-lldp,cdp  LLDP global and per port, CDP per port
+  50/51-lacp-*       LACP system and port tuning
+  55-mac-aging.xml   the aging timer, if it is not the default 300s
+  56-static-mac.xml  static forwarding entries
+  60/61/62-acl*      ACLs, then their rules, then their bindings
+  65..68-qos*        QoS mode/trust, port CoS, CoS->queue, policers
+  70-radius.xml      RADIUS servers      <- MODE 0600, see below
+  71/72-dot1x-*      802.1X global and per port
+  75/76/77-igmp*     multicast global, per-VLAN snooping, router ports
+  80..83-pvlan*      private VLANs, associations, host and promiscuous ports
+  84..88             routing on/off, gateway, routes, static ARP, ARP timeout
+
+11-port-settings.xml is kept out of 10-ports.xml although both write
+Standard802_3List: 10-ports.xml is what stands between a cold power cycle
+and a switch that forwards nothing, and it has been replayed against real
+hardware in exactly its current shape. A firmware that chokes on an
+unfamiliar speedAdmin must not be able to take the port enables with it.
+
+The numbering is dependency order, not decoration: an ACL rule replayed
+before its ACL exists is rejected, and so is a binding to an ACL that is
+not there yet. Same for RADIUS before 802.1X, and a private VLAN before
+its associations.
+
+ONE FILE IS ONE TABLE. Replay posts each file as a single request, and a
+request body is one <DeviceConfiguration> around one table - which is why
+an area that spans three tables is three files.
+
+70-radius.xml CONTAINS THE SHARED SECRET IN CLEAR TEXT. The switch reports
+keyString back in the clear and there is no way to replay a server without
+it, so the file is created 0600 and {cfg} is set to 0700. Think before you
+commit that directory to version control.
 
 te1-te4 are deliberately NOT saved. te2 carries the management VLAN and
 te1/te3/te4 are the module fabric the firmware sets up itself; replaying a
@@ -965,14 +2418,28 @@ credentials reset on power loss, keep it that way."""),
 
     ("KEYS", """\
   up/down, j/k    move selection
-  space           Ports: enable/disable the port, PoE: power on/off
-  g               Ports: add the port to a LAG, or remove it from one
+  TAB             open the menu of everything that is not a tab
+  ENTER           edit the selected row (Ports: description/speed/duplex/
+                  flow control.  PoE: power limit.  VLANs: add or remove a port)
+  space           Ports: enable/disable the port, PoE: power on/off,
+                  elsewhere: toggle the row's main setting
+  g               Ports: add the port to a LAG, or remove it from one.
+                  In a menu view: that view's global settings.
   ESC             cancel any prompt (prompts wait for you - they no longer
-                  time out and vanish)
-  n / d           VLANs: new / delete
+                  time out and vanish). Nothing is written until the last
+                  prompt is answered. With no prompt open, ESC in a menu
+                  view goes back to the menu; in a tabbed view it quits.
+  n / d           new / delete, in the views that are lists
+  N               VLANs: rename
+  z               Ports, Stats: zero this port's counters
+  f               MAC: forget learned addresses
+  b               ACLs: bind the selected ACL to a port
+  t               IGMP: static router ports
+  y / o           QoS: CoS->queue map / aggregate policer
+  a               Mirror: add a source.  L3: static ARP
   w / a           Config: write / apply
   u               Config: check GitHub for a newer release
-  r               refresh now (Ports, PoE and Stats also auto-refresh)
+  r               refresh now (Ports, PoE, Stats and STP also auto-refresh)
   i               toggle the detail panel
   ? or F1         this manual (arrows scroll, any other key exits)
   q               quit"""),
@@ -996,8 +2463,38 @@ A write says FAILED
 
 
 # ==================================================================== UI
+# The views with a hotkey and a tab. Deliberately still seven: these are what
+# you need to get a switch forwarding, and they are the ones worth a
+# single keystroke. Everything else is a menu entry - see GROUPS.
 VIEWS = [("ports", "p"), ("vlans", "v"), ("poe", "e"),
          ("mac", "m"), ("stats", "s"), ("config", "c"), ("help", "?")]
+
+# The rest, reached with TAB. A tab strip cannot hold twenty entries at 80
+# columns, and hotkeys for all of them would collide with the per-view action
+# keys (a is already "apply", n "new", d "delete", g "LAG", w "write"), so
+# the menu is the only place these are named.
+GROUPS = [
+    ("Switching", [
+        ("stp", "spanning tree - the loop protection this box boots without"),
+        ("storm", "storm control - rate-limit broadcast/multicast floods"),
+        ("mirror", "port mirroring (SPAN) - copy traffic to an analyser"),
+        ("staticmac", "static MAC entries and the aging timer"),
+        ("lldp", "LLDP and CDP - advertise this switch to neighbours"),
+        ("lacp", "LACP tuning - system priority, port priority, timeout"),
+        ("pvlan", "private VLANs - primary/isolated/community"),
+    ]),
+    ("Policy", [
+        ("acl", "access lists and the ports they are bound to"),
+        ("qos", "QoS - trust mode, CoS mapping, policers"),
+        ("dot1x", "802.1X port authentication"),
+        ("radius", "RADIUS servers"),
+    ]),
+    ("Routing and multicast", [
+        ("igmp", "IGMP/MLD snooping"),
+        ("l3", "ARP, static routes and the default gateway"),
+    ]),
+]
+MENU_VIEWS = [n for _, items in GROUPS for n, _ in items]
 
 C_OK, C_BAD, C_HDR, C_WARN, C_DIM = 1, 2, 3, 4, 5
 
@@ -1016,6 +2513,8 @@ class UI:
         self.last_refresh = 0
         self.connected = True
         self.update_tag = None
+        # Detail panels that need the view's side tables, not just the row.
+        self.details = {k: f(self) for k, f in DETAIL_FACTORIES.items()}
         self._check_update_bg()
         curses.curs_set(0)
         self.s.timeout(1000)
@@ -1066,6 +2565,8 @@ class UI:
                 self.data["mac"] = self.sw.macs()
             elif self.view == "stats":
                 self.data["stats"] = self.sw.stats()
+            elif self.view in SPECS:
+                self.data[self.view] = SPECS[self.view]["fetch"](self.sw)
             self.connected = True
             self.last_refresh = time.time()
         except SwitchError as e:
@@ -1073,7 +2574,14 @@ class UI:
             self.set_msg(f"{e}", bad=True)
 
     def rows(self):
-        return self.data.get(self.view, [])
+        d = self.data.get(self.view, [])
+        # Spec views store {"rows", "extra"}; the tabbed views store a list.
+        return d.get("rows", []) if isinstance(d, dict) else d
+
+    def extra(self):
+        """A spec view's global settings, which are not part of any row."""
+        d = self.data.get(self.view, {})
+        return d.get("extra", {}) if isinstance(d, dict) else {}
 
     def lag_map(self):
         """member port name -> (LAG name, membershipType or "").
@@ -1126,7 +2634,15 @@ class UI:
         Derived, not assumed: a local NIC's MAC learned in the management
         VLAN. Shutting this port ends the session, and with no flash on the
         ASIC the only way back is a cold power cycle that wipes everything.
+
+        Fetches the MAC table if it is not already loaded. Only the Ports
+        view populates portmacs, so without this the guards that call it
+        from other views - notably "do not mirror the port you are managing
+        over" - silently never fired unless you happened to visit Ports
+        first. A safety check that quietly does nothing is worse than none.
         """
+        if self.data.get("portmacs") is None:
+            self.data["portmacs"] = _try(self.sw.macs)
         nics = local_nics()
         for m in self.data.get("portmacs", []):
             if (m["VLANID"] == MGMT_VLAN
@@ -1171,7 +2687,12 @@ class UI:
         # Draw the tabs one at a time so the active one can carry its own
         # attribute - a single addnstr can only paint the whole strip.
         x = 1
-        for n, k in VIEWS:
+        tabs = list(VIEWS)
+        # A menu view is not in the strip, so show it as an extra tab while
+        # it is open - otherwise nothing on screen says where you are.
+        if self.view in SPECS:
+            tabs = tabs + [(self.view, "TAB")]
+        for n, k in tabs:
             active = n == self.view
             label = f" [{k}] {n.upper()} " if active else f" [{k}] {n} "
             if x >= w - 1:
@@ -1180,30 +2701,46 @@ class UI:
                            curses.A_REVERSE | curses.A_BOLD if active
                            else curses.color_pair(C_HDR))
             x += len(label)
+        if self.view not in SPECS and x < w - 12:
+            self.s.addnstr(1, x, " [TAB] more ", w - 1 - x, curses.A_DIM)
         self.s.hline(2, 0, curses.ACS_HLINE, w)
 
         if self.view == "help":
             self.draw_help(3, h, w)
+        elif self.view == "menu":
+            self.d_menu(3, h - 3, w)
         else:
             # Ports needs the most room: LAG state and the idle-link warning
             # can each add two lines of their own.
+            detailed = self.view in ("ports", "poe", "vlans") or \
+                self.view in SPECS
             dh = ((9 if self.view == "ports" else 6)
-                  if (self.detail and self.view in ("ports", "poe", "vlans")) else 0)
-            {"ports": self.d_ports, "poe": self.d_poe, "vlans": self.d_vlans,
-             "mac": self.d_mac, "stats": self.d_stats,
-             "config": self.d_config}[self.view](3, h - dh - 3, w)
+                  if (self.detail and detailed) else 0)
+            drawer = {"ports": self.d_ports, "poe": self.d_poe,
+                      "vlans": self.d_vlans, "mac": self.d_mac,
+                      "stats": self.d_stats,
+                      "config": self.d_config}.get(self.view, self.d_spec)
+            drawer(3, h - dh - 3, w)
             if dh:
                 self.draw_detail(h - dh - 3, h, w)
 
+        common = "   r refresh   i detail   TAB more   ? help   q quit"
         keys = {
-            "ports": ("SPACE enable/disable port   g LAG   r refresh   "
-                      "i detail   ? help   q quit"),
-            "poe": "SPACE PoE on/off   r refresh   i detail   ? help   q quit",
-            "vlans": "n new   d delete   r refresh   i detail   ? help   q quit",
+            "ports": ("SPACE up/shut   g LAG   ENTER settings   z counters"
+                      + common),
+            "poe": "SPACE PoE on/off   ENTER power limit" + common,
+            "vlans": ("n new   d delete   ENTER add a port   N rename"
+                      + common),
             "config": ("w write config   a apply config   u check update   "
-                       "? help   q quit"),
+                       "TAB more   ? help   q quit"),
+            "stats": "z zero the counters on this port" + common,
+            "mac": "f forget learned MACs" + common,
             "help": "arrows scroll   any other key returns",
-        }.get(self.view, "r refresh   ? help   q quit")
+            "menu": "ENTER open   ESC back   q quit",
+        }.get(self.view)
+        if keys is None:
+            keys = (SPECS[self.view]["keys"] + common
+                    if self.view in SPECS else "r refresh   ? help   q quit")
         self.s.hline(h - 3, 0, curses.ACS_HLINE, w)
         self.s.addnstr(h - 2, 1, keys, w - 2, curses.A_DIM)
         if self.msg:
@@ -1241,7 +2778,9 @@ class UI:
             return
         r = rows[self.sel]
         out = []
-        if self.view == "ports":
+        if self.view in SPECS:
+            out = self.d_spec_detail(r)
+        elif self.view == "ports":
             n = r["interfaceName"]
             role = PORT_ROLE.get(n[:2], "")
             pl = panel_label(n)
@@ -1262,10 +2801,22 @@ class UI:
                       f"   tx {st.get('transmitUnicastPacketCount','?')} pkts"
                       if st else "")]
             if r["linkState"] == "1" and self.rx_idle(n):
-                out.append("  UP BUT IDLE - nothing has arrived on this port. A "
-                           "backplane link stays trained even")
-                out.append("  when the NIC at the far end is down, so UP here "
-                           "means the serdes, not traffic.")
+                # "Idle" means no UNICAST, which is not the same as no
+                # traffic. Measured on hardware 2026-08-12: a PoE access
+                # point sent 4255 bytes of LLDP/CDP and the switch learned
+                # no MAC from it, because reserved multicast is neither
+                # learned nor forwarded. Saying "nothing has arrived" there
+                # is simply false, and sends you looking for a dead cable.
+                if (st.get("receivePacketByteCount") or "0").strip() not in ("", "0"):
+                    out.append("  UP BUT NO UNICAST - frames are arriving, but "
+                               "only broadcast/multicast (LLDP, CDP,")
+                    out.append("  DHCP and the like). Nothing is holding a "
+                               "conversation through this port yet.")
+                else:
+                    out.append("  UP BUT IDLE - nothing at all has arrived. A "
+                               "backplane link stays trained even")
+                    out.append("  when the NIC at the far end is down, so UP "
+                               "here means the serdes, not traffic.")
             lm = self.lag_map()
             if n.startswith("LAG"):
                 mem = [(p, s) for p, (g, s) in sorted(lm.items()) if g == n]
@@ -1463,6 +3014,112 @@ class UI:
                            curses.A_BOLD | curses.color_pair(C_HDR)
                            if kind == "H" else 0)
 
+    def d_menu(self, y, h, w):
+        """The catalogue of everything that is not a tab.
+
+        Rendered as a flat selectable list with group headings interleaved,
+        so ENTER on a row opens it - the same movement keys as every other
+        view rather than a second set to learn.
+        """
+        rows = self.menu_rows()
+        self.s.addnstr(y, 2, "MORE VIEWS - ENTER opens, ESC returns",
+                       w - 3, curses.A_BOLD | curses.A_UNDERLINE)
+        top = y + 2
+        avail = max(1, h - top - 1)
+        # The list is three groups and thirteen entries, which does not fit
+        # a 24-row terminal - and an entry drawn past the bottom edge is one
+        # nobody can find. Scroll to keep the selection on screen.
+        if self.sel < self.top:
+            self.top = self.sel
+        elif self.sel >= self.top + avail:
+            self.top = self.sel - avail + 1
+        self.top = max(0, min(self.top, max(0, len(rows) - avail)))
+        for i, (kind, name, desc) in enumerate(rows[self.top:self.top + avail]):
+            line = top + i
+            if kind == "H":
+                self.s.addnstr(line, 2, name, w - 3,
+                               curses.A_BOLD | curses.color_pair(C_HDR))
+            else:
+                attr = curses.A_REVERSE if self.top + i == self.sel else 0
+                self.s.addnstr(line, 4, f"{name:12}{desc}", w - 5, attr)
+        if len(rows) > avail:
+            self.s.addnstr(y, w - 14, f"{self.sel + 1}/{len(rows)}", 12,
+                           curses.A_DIM)
+
+    def menu_rows(self):
+        """Group headings and entries in one list, so selection can skip
+        the headings without a second index to keep in step."""
+        out = []
+        for title, items in GROUPS:
+            out.append(("H", title, ""))
+            for name, desc in items:
+                out.append(("V", name, desc))
+        return out
+
+    # ------------------------------------------------- generic table views
+    # Everything below the seven tabs is rendered from a SPEC rather than a
+    # bespoke method. The tabbed views keep their own drawing code: they
+    # carry behaviour worked out against hardware (idle-link colouring, the
+    # peer map, LAG state suffixes) that is not worth generalising and would
+    # be easy to regress.
+    def spec(self):
+        return SPECS.get(self.view, {})
+
+    def d_spec(self, y, h, w):
+        sp = self.spec()
+        extra = self.extra()
+        # A summary block for the table's global settings, which are a
+        # different shape from its rows and would not fit as columns.
+        summary = sp.get("summary")
+        if summary:
+            for line in summary(extra):
+                if y >= h - 1:
+                    return
+                self.s.addnstr(y, 2, line, w - 3, curses.color_pair(C_HDR))
+                y += 1
+            y += 1
+        cols = sp["cols"]
+        header = "".join(f"{head:{width}}" if width else head
+                         for head, width, _ in cols)
+
+        def fmt(r):
+            out = ""
+            for _, width, fn in cols:
+                try:
+                    v = fn(r)
+                except Exception:
+                    # A firmware that omits a field must not blank the view.
+                    v = "?"
+                out += f"{v:{width}}" if width else str(v)
+            return out
+
+        rows = self.rows()
+        if not rows:
+            self.s.addnstr(y, 2, header, w - 3,
+                           curses.A_BOLD | curses.A_UNDERLINE)
+            self.s.addnstr(y + 2, 4, sp.get("empty", "nothing configured"),
+                           w - 5, curses.A_DIM)
+            return
+        self._list(y, h, w, header, fmt, rows, sp.get("colour"))
+
+    def d_spec_detail(self, r):
+        """Detail lines for a spec view.
+
+        Falls back to dumping every element the switch returned for the
+        selected row. For tables nobody has run against this firmware that
+        is the difference between seeing a field and not knowing it exists.
+        """
+        if self.view in self.details:
+            return self.details[self.view](r)
+        sp = self.spec()
+        if sp.get("detail"):
+            return sp["detail"](r)
+        skip = {"interfaceName"}
+        head = r.get("interfaceName") or r.get("VLANID") or ""
+        body = "  " + "  ".join(f"{k}={v}" for k, v in sorted(r.items())
+                                if k not in skip and v != "")
+        return [str(head), body]
+
     # ---------------------------------------------------------- input
     def prompt(self, question, maxlen=12):
         """Read a line at the bottom of the screen. Blocking; ESC cancels.
@@ -1499,6 +3156,80 @@ class UI:
         finally:
             curses.curs_set(0)
             self.s.timeout(1000)
+
+    # ------------------------------------------------------ prompt helpers
+    # Every write below is "ask, validate, post, report". These keep that
+    # loop in one place so a new setting is a line of spec rather than
+    # twenty lines of prompt handling, and so cancelling always behaves the
+    # same way.
+    def ask_int(self, question, lo, hi, allow_blank=False):
+        """An integer in [lo, hi]. None means the user cancelled or the
+        answer was rejected - either way the caller should do nothing."""
+        v = self.prompt(f"{question} ({lo}-{hi}), ESC cancels:")
+        if v is None or (v == "" and not allow_blank):
+            self.set_msg("cancelled")
+            return None
+        if v == "":
+            return ""
+        if not v.lstrip("-").isdigit() or not lo <= int(v) <= hi:
+            self.set_msg(f"'{v}' is not a number in {lo}-{hi}", bad=True)
+            return None
+        return v
+
+    def ask_pick(self, question, options):
+        """Pick one of a small set. options is {typed: (value, label)}.
+
+        Shows the choices in the prompt rather than expecting them to be
+        remembered - this tool is used rarely and from a manual.
+        """
+        shown = "  ".join(f"({k}){lbl}" for k, (_, lbl) in options.items())
+        v = self.prompt(f"{question}: {shown}, ESC cancels:", maxlen=16)
+        if v is None or v == "":
+            self.set_msg("cancelled")
+            return None
+        hit = options.get(v[:1].lower())
+        if hit is None:
+            self.set_msg(f"'{v}' is not one of {'/'.join(options)}", bad=True)
+            return None
+        return hit[0]
+
+    def ask_onoff(self, question):
+        return self.ask_pick(question, {"y": ("1", "on"), "n": ("2", "off")})
+
+    def ask_text(self, question, maxlen=32):
+        v = self.prompt(f"{question}, ESC cancels:", maxlen=maxlen)
+        if v is None or v == "":
+            self.set_msg("cancelled")
+            return None
+        return v
+
+    def ask_vlan(self, question="VLAN id"):
+        return self.ask_int(question, 1, 4094)
+
+    def ask_port(self, question="port", allow_te=False):
+        """A port name, checked against the ports the switch actually has.
+
+        Typed rather than picked because these prompts are reached from
+        views that are not listing ports, and an unchecked name produces a
+        write the switch accepts and silently ignores.
+        """
+        v = self.prompt(f"{question} (e.g. gi0), ESC cancels:", maxlen=8)
+        if v is None or v == "":
+            self.set_msg("cancelled")
+            return None
+        v = v.strip()
+        if not re.fullmatch(r"(gi[0-7]|te[1-4]|LAG[1-4])", v):
+            self.set_msg(f"'{v}' is not a port on this switch "
+                         f"(gi0-gi7, te1-te4, LAG1-LAG4)", bad=True)
+            return None
+        if v.startswith("te") and not allow_te:
+            self.set_msg(f"{v} is an internal backplane port - not here",
+                         bad=True)
+            return None
+        return v
+
+    def confirm(self, question):
+        return self.prompt(f"{question} type yes:") == "yes"
 
     def may_shut(self, ifname):
         """Guard the internal backplane ports against being shut.
@@ -1568,6 +3299,1040 @@ class UI:
         except SwitchError as e:
             self.set_msg(f"{label}: {e}", bad=True)
 
+    def cur(self):
+        """The selected row, or None if the view is empty."""
+        rows = self.rows()
+        return rows[self.sel] if rows and self.sel < len(rows) else None
+
+    # ==================================================== spanning tree
+    def act_stp_global(self):
+        what = self.ask_pick("spanning tree", {
+            "e": ("enable", "on/off"), "m": ("mode", "mode"),
+            "p": ("prio", "bridge priority"), "t": ("timers", "timers"),
+            "b": ("bpdu", "BPDU handling"), "l": ("loop", "loopback guard"),
+            "c": ("cost", "path cost style")})
+        if what is None:
+            return
+        if what == "enable":
+            v = self.ask_onoff("spanning tree")
+            if v:
+                on = v == STP_ON
+                self.write(f"spanning tree {'enabled' if on else 'disabled'}",
+                           lambda: self.sw.set_stp_enabled(on))
+                # Turning STP on is the whole point of this view, but it is
+                # not free: ports go through listening and learning before
+                # they forward, so a link that worked a moment ago goes
+                # quiet for ~30s. Say so, or it looks like a fault. This
+                # has to come AFTER the write, which sets its own message.
+                if on and not self.msg_bad:
+                    self.set_msg("spanning tree enabled - ports will hold "
+                                 "down for ~30s while they converge")
+        elif what == "mode":
+            v = self.ask_pick("mode", {"s": ("0", "STP"), "r": ("2", "RSTP"),
+                                       "m": ("3", "MSTP")})
+            if v:
+                self.write(f"STP mode {STP_MODE[v]}",
+                           lambda: self.sw.set_stp_mode(v))
+        elif what == "prio":
+            # 802.1D allows 0-61440 but only in steps of 4096; the switch
+            # rejects anything else, so round rather than pass it through.
+            v = self.ask_int("bridge priority, multiples of 4096", 0, 61440)
+            if v:
+                p = str((int(v) // 4096) * 4096)
+                self.write(f"bridge priority {p}",
+                           lambda: self.sw.set_stp_bridge({"bridgePriority": p}))
+        elif what == "timers":
+            hello = self.ask_int("hello time (s)", 1, 10)
+            if hello is None:
+                return
+            fwd = self.ask_int("forward delay (s)", 4, 30)
+            if fwd is None:
+                return
+            age = self.ask_int("max age (s)", 6, 40)
+            if age is None:
+                return
+            # 802.1D requires 2*(fwd-1) >= age >= 2*(hello+1). The switch
+            # enforces it too, but rejects the whole write with a bare
+            # FAILED, which is not a useful thing to stare at.
+            if 2 * (int(fwd) - 1) < int(age):
+                self.set_msg(f"invalid: 2*(forward_delay-1) must be >= max_age "
+                             f"({2 * (int(fwd) - 1)} < {age})", bad=True)
+                return
+            if int(age) < 2 * (int(hello) + 1):
+                self.set_msg(f"invalid: max_age must be >= 2*(hello+1) "
+                             f"({age} < {2 * (int(hello) + 1)})", bad=True)
+                return
+            self.write("STP timers", lambda: self.sw.set_stp_bridge({
+                "helloTime": hello, "forwardDelay": fwd, "maxAge": age}))
+        elif what == "bpdu":
+            v = self.ask_pick("BPDU handling", {
+                "f": ("1", "filtering"), "l": ("2", "flooding")})
+            if v:
+                self.write(f"BPDU {BPDU_MODE[v]}",
+                           lambda: self.sw.set_stp_setting(
+                               {"BPDUHandlingMode": v}))
+        elif what == "loop":
+            v = self.ask_onoff("loopback guard")
+            if v:
+                self.write(f"loopback guard {ENABLED[v]}",
+                           lambda: self.sw.set_stp_setting(
+                               {"loopbackGuardEnable": v}))
+        elif what == "cost":
+            v = self.ask_pick("path cost style", {
+                "s": ("1", "short"), "l": ("2", "long")})
+            if v:
+                self.write(f"path cost {PATHCOST_TYPE[v]}",
+                           lambda: self.sw.set_stp_setting(
+                               {"pathCostDefaultValueType": v}))
+
+    def act_stp_port(self):
+        r = self.cur()
+        if not r:
+            return
+        n = r.get("interfaceName", "")
+        what = self.ask_pick(f"{n} STP", {
+            "c": ("cost", "path cost"), "p": ("prio", "port priority"),
+            "f": ("fast", "portfast"), "b": ("bpduguard", "BPDU guard"),
+            "r": ("root", "root guard"), "l": ("link", "link type")})
+        if what is None:
+            return
+        if what == "cost":
+            v = self.ask_int("path cost, 0 = auto", 0, 200000000)
+            if v:
+                self.write(f"{n} path cost {v}",
+                           lambda: self.sw.set_stp_port(n, {"pathCost": v}))
+        elif what == "prio":
+            v = self.ask_int("port priority, multiples of 16", 0, 240)
+            if v:
+                p = str((int(v) // 16) * 16)
+                self.write(f"{n} port priority {p}",
+                           lambda: self.sw.set_stp_port(n, {"portPriority": p}))
+        elif what == "fast":
+            v = self.ask_onoff(f"portfast on {n}")
+            if v:
+                self.write(f"{n} portfast {ENABLED[v]}",
+                           lambda: self.sw.set_stp_port(
+                               n, {"portFastEnabled": v}))
+        elif what == "bpduguard":
+            v = self.ask_onoff(f"BPDU guard on {n}")
+            if v:
+                self.write(f"{n} BPDU guard {ENABLED[v]}",
+                           lambda: self.sw.set_stp_port(
+                               n, {"BPDUGuardEnabled": v}))
+        elif what == "root":
+            v = self.ask_onoff(f"root guard on {n}")
+            if v:
+                self.write(f"{n} root guard {ENABLED[v]}",
+                           lambda: self.sw.set_stp_port(
+                               n, {"rootGuardEnabled": v}))
+        elif what == "link":
+            v = self.ask_pick("link type", {
+                "a": ("0", "auto"), "p": ("1", "point-to-point"),
+                "s": ("2", "shared")})
+            if v:
+                # Link type is an RSTP table, not the STP one.
+                self.write(f"{n} link type {P2P_MODE[v]}",
+                           lambda: self.sw.set_stp_port(
+                               n, {"pointToPointAdminStatusMode": v},
+                               table="RSTP"))
+
+    def act_stp_toggle(self):
+        r = self.cur()
+        if not r:
+            return
+        n = r.get("interfaceName", "")
+        on = (r.get("STPEnabled") or "") != "1"
+        self.write(f"{n} STP {'on' if on else 'off'}",
+                   lambda: self.sw.set_stp_port(
+                       n, {"STPEnabled": "1" if on else "2"}))
+
+    # ==================================================== storm control
+    def act_storm(self):
+        r = self.cur()
+        if not r:
+            return
+        n = r.get("interfaceName", "")
+        kind = self.ask_pick(f"{n} storm control", {
+            "b": ("broadcast", "broadcast"), "u": ("unicast", "unknown unicast"),
+            "m": ("multicast", "multicast")})
+        if kind is None:
+            return
+        unit = self.ask_pick("rate unit", {
+            "p": (STORM_LEVEL, "% of link"), "k": (STORM_KBPS, "kbps")})
+        if unit is None:
+            return
+        hi = 100 if unit == STORM_LEVEL else 10000000
+        v = self.ask_int(f"{kind} limit, 0 disables", 0, hi)
+        if v is None:
+            return
+        self.write(f"{n} {kind} storm {v}{STORM_UNIT[unit]}",
+                   lambda: self.sw.set_storm(n, kind, v, unit))
+
+    # ======================================================= mirroring
+    def act_mirror_dest(self):
+        s = self.ask_int("session", 1, 4)
+        if s is None:
+            return
+        n = self.ask_port("destination (analyser) port")
+        if n is None:
+            return
+        # A mirror destination stops being an ordinary switch port: it
+        # transmits copies and nothing else. Doing that to the port you
+        # manage the switch through would be a bad afternoon.
+        if n == self.mgmt_port():
+            self.set_msg(f"REFUSED: {n} carries THIS session", bad=True)
+            return
+        self.write(f"session {s} destination {n}",
+                   lambda: self.sw.set_span_destination(s, n))
+
+    def act_mirror_source(self):
+        s = self.ask_int("session", 1, 4)
+        if s is None:
+            return
+        what = self.ask_pick("mirror what", {
+            "p": ("port", "a port"), "v": ("vlan", "a VLAN")})
+        if what is None:
+            return
+        if what == "port":
+            src = self.ask_port("source port", allow_te=True)
+            if src is None:
+                return
+            vlan = None
+        else:
+            vlan = self.ask_vlan("source VLAN")
+            if vlan is None:
+                return
+            src = None
+        d = self.ask_pick("direction", {
+            "b": (SPAN_BOTH, "both"), "r": (SPAN_RX, "rx"),
+            "t": (SPAN_TX, "tx")})
+        if d is None:
+            return
+        label = src or f"VLAN {vlan}"
+        self.write(f"session {s} mirror {label} {SPAN_DIR[d]}",
+                   lambda: self.sw.add_span_source(s, src, vlan, d))
+
+    def act_mirror_delete(self):
+        r = self.cur()
+        if not r:
+            return
+        s = r.get("sessionId", "")
+        if self.confirm(f"remove mirror session {s}?"):
+            self.write(f"session {s} removed",
+                       lambda: self.sw.del_span_destination(s))
+
+    # ====================================================== static MAC
+    def act_staticmac_new(self):
+        vid = self.ask_vlan()
+        if vid is None:
+            return
+        mac = self.ask_text("MAC address (aa:bb:cc:dd:ee:ff)", maxlen=17)
+        if mac is None:
+            return
+        if not re.fullmatch(r"[0-9a-fA-F]{2}([:-][0-9a-fA-F]{2}){5}", mac):
+            self.set_msg(f"'{mac}' is not a MAC address", bad=True)
+            return
+        n = self.ask_port("forward to port")
+        if n is None:
+            return
+        self.write(f"static {mac} -> {n} on VLAN {vid}",
+                   lambda: self.sw.set_static_mac(vid, mac.replace("-", ":"), n))
+
+    def act_staticmac_delete(self):
+        r = self.cur()
+        if not r:
+            return
+        vid, mac = r.get("VLANID", ""), r.get("MACAddress", "")
+        if self.confirm(f"delete static {mac} on VLAN {vid}?"):
+            self.write(f"deleted {mac}",
+                       lambda: self.sw.del_static_mac(vid, mac))
+
+    def act_mac_aging(self):
+        # 0 disables aging entirely, which turns a learning switch into one
+        # that never forgets - worth spelling out in the prompt.
+        v = self.ask_int("MAC aging seconds, 0 never ages out", 0, 630)
+        if v is None:
+            return
+        self.write(f"MAC aging {v}s", lambda: self.sw.set_mac_aging(v))
+
+    # ======================================================== LLDP/CDP
+    def act_lldp_global(self):
+        what = self.ask_pick("LLDP global", {
+            "e": ("enable", "on/off"), "t": ("timer", "advertise interval")})
+        if what is None:
+            return
+        if what == "enable":
+            v = self.ask_onoff("LLDP")
+            if v:
+                self.write(f"LLDP {ENABLED[v]}",
+                           lambda: self.sw.set_lldp_global({"LLDPEnabled": v}))
+        else:
+            v = self.ask_int("advertise interval (s)", 5, 32768)
+            if v:
+                self.write(f"LLDP interval {v}s",
+                           lambda: self.sw.set_lldp_global(
+                               {"updateInterval": v}))
+
+    def act_lldp_port(self):
+        r = self.cur()
+        if not r:
+            return
+        n = r.get("interfaceName", "")
+        v = self.ask_pick(f"{n} LLDP", {
+            "b": (LLDP_TXRX, "tx+rx"), "t": (LLDP_TX, "tx only"),
+            "r": (LLDP_RX, "rx only"), "o": (LLDP_OFF, "off")})
+        if v:
+            self.write(f"{n} LLDP {LLDP_STATE[v]}",
+                       lambda: self.sw.set_lldp_port(n, v))
+
+    def act_cdp_toggle(self):
+        r = self.cur()
+        if not r:
+            return
+        n = r.get("interfaceName", "")
+        on = (r.get("enbl") or "") != "1"
+        self.write(f"{n} CDP {'on' if on else 'off'}",
+                   lambda: self.sw.set_cdp_port(n, on))
+
+    # ============================================================ LACP
+    def act_lacp_global(self):
+        what = self.ask_pick("LACP global", {
+            "p": ("prio", "system priority"),
+            "b": ("balance", "load balance")})
+        if what is None:
+            return
+        if what == "prio":
+            v = self.ask_int("LACP system priority", 1, 65535)
+            if v:
+                self.write(f"LACP system priority {v}",
+                           lambda: self.sw.set_lacp_global(
+                               {"LACPSystemPriority": v}))
+        else:
+            v = self.ask_pick("hash on", {
+                "m": ("1", "MAC"), "i": ("2", "MAC+IP")})
+            if v:
+                self.write("LAG load balance",
+                           lambda: self.sw.set_lacp_global(
+                               {"LAGLoadBalance": v}))
+
+    def act_lacp_port(self):
+        r = self.cur()
+        if not r:
+            return
+        n = r.get("interfaceName", "")
+        what = self.ask_pick(f"{n} LACP", {
+            "p": ("prio", "port priority"), "t": ("timeout", "timeout")})
+        if what is None:
+            return
+        if what == "prio":
+            v = self.ask_int("port priority", 1, 65535)
+            if v:
+                self.write(f"{n} LACP priority {v}",
+                           lambda: self.sw.set_lacp_port(
+                               n, {"actorPortPriority": v}))
+        else:
+            v = self.ask_pick("timeout", {
+                "l": ("1", "long (90s)"), "s": ("2", "short (3s)")})
+            if v:
+                self.write(f"{n} LACP timeout",
+                           lambda: self.sw.set_lacp_port(
+                               n, {"actorPortAdminTimeout": v}))
+
+    # =================================================== private VLANs
+    def act_pvlan_new(self):
+        vid = self.ask_vlan()
+        if vid is None:
+            return
+        t = self.ask_pick("type", {
+            "p": (PVLAN_PRIMARY, "primary"),
+            "i": (PVLAN_ISOLATED, "isolated"),
+            "c": (PVLAN_COMMUNITY, "community")})
+        if t is None:
+            return
+        self.write(f"VLAN {vid} -> private {PVLAN_TYPE[t]}",
+                   lambda: self.sw.set_private_vlan(vid, t))
+
+    def act_pvlan_delete(self):
+        r = self.cur()
+        if not r:
+            return
+        vid = r.get("VLANID", "")
+        if self.confirm(f"remove private-VLAN role from {vid}?"):
+            # None, not "": fields() keeps an empty element but drops a
+            # None one, and a delete keyed on VLANID should not carry an
+            # empty privateVLANType the switch has to interpret.
+            self.write(f"VLAN {vid} no longer private",
+                       lambda: self.sw.set_private_vlan(vid, None,
+                                                        create=False))
+
+    def act_pvlan_edit(self):
+        what = self.ask_pick("private VLAN", {
+            "a": ("assoc", "associate secondaries"),
+            "h": ("host", "host port"), "p": ("promisc", "promiscuous port")})
+        if what is None:
+            return
+        if what == "assoc":
+            pri = self.ask_vlan("primary VLAN")
+            if pri is None:
+                return
+            sec = self.ask_text("secondary VLANs (e.g. 101,102)")
+            if sec is None:
+                return
+            self.write(f"VLAN {pri} associates {sec}",
+                       lambda: self.sw.set_private_vlan_assoc(pri, sec))
+        elif what == "host":
+            n = self.ask_port()
+            if n is None:
+                return
+            pri = self.ask_vlan("primary VLAN")
+            if pri is None:
+                return
+            sec = self.ask_vlan("secondary VLAN")
+            if sec is None:
+                return
+            self.write(f"{n} host in {pri}/{sec}",
+                       lambda: self.sw.set_private_vlan_host(n, pri, sec))
+        else:
+            n = self.ask_port()
+            if n is None:
+                return
+            pri = self.ask_vlan("primary VLAN")
+            if pri is None:
+                return
+            sec = self.ask_text("secondary VLANs (e.g. 101,102)")
+            if sec is None:
+                return
+            self.write(f"{n} promiscuous in {pri}",
+                       lambda: self.sw.set_private_vlan_promisc(n, pri, sec))
+
+    # ============================================================ ACLs
+    def act_acl_new(self):
+        name = self.ask_text("ACL name")
+        if name is None:
+            return
+        # MAC only, deliberately. switch-confd built IPv4 ACLs through a
+        # different code path that is not in the extracted source, so the
+        # element names inside <IPv4Parameters> are unknown - and an ACE the
+        # switch rejects is worse than one this tool declines to write.
+        self.write(f"ACL {name} created", lambda: self.sw.acl(name, ACL_MAC))
+
+    def act_acl_delete(self):
+        r = self.cur()
+        if not r:
+            return
+        name = r.get("ACLName", "")
+        if self.confirm(f"delete ACL {name}?"):
+            self.write(f"ACL {name} deleted",
+                       lambda: self.sw.acl(name, r.get("ACLType", ACL_MAC),
+                                           create=False))
+
+    def act_acl_rule(self):
+        r = self.cur()
+        if not r:
+            return
+        name = r.get("ACLName", "")
+        atype = r.get("ACLType", ACL_MAC)
+        if atype != ACL_MAC:
+            self.set_msg(f"{name} is a {ACL_TYPE.get(atype, atype)} ACL - only "
+                         f"MAC rules can be written from here", bad=True)
+            return
+        act = self.ask_pick("action", {"p": (ACL_PERMIT, "permit"),
+                                       "d": (ACL_DENY, "deny")})
+        if act is None:
+            return
+        prio = self.ask_int("rule priority, lower matches first", 1, 65535)
+        if prio is None:
+            return
+        src = self.ask_text("source MAC, or 'any'", maxlen=17)
+        if src is None:
+            return
+        dst = self.ask_text("destination MAC, or 'any'", maxlen=17)
+        if dst is None:
+            return
+        params = el("MACParameters",
+                    mac_ace_param("source", src) + "\n"
+                    + mac_ace_param("dest", dst), 12)
+        self.write(f"{name} rule {prio} {ACL_ACTION[act]}",
+                   lambda: self.sw.set_ace(name, prio, act, params, atype))
+
+    def act_acl_bind(self):
+        r = self.cur()
+        if not r:
+            return
+        name = r.get("ACLName", "")
+        n = self.ask_port("bind to port")
+        if n is None:
+            return
+        d = self.ask_pick("direction", {"i": ("in", "inbound"),
+                                        "o": ("out", "outbound")})
+        if d is None:
+            return
+        act = self.ask_pick("default action for unmatched traffic", {
+            "d": (ACL_DENY, "deny"), "p": (ACL_PERMIT, "permit")})
+        if act is None:
+            return
+        self.write(f"{name} bound to {n} {d}",
+                   lambda: self.sw.bind_acl(n, name, act, outbound=d == "out"))
+
+    # ============================================================= QoS
+    def act_qos_global(self):
+        what = self.ask_pick("QoS", {"m": ("mode", "mode"),
+                                     "t": ("trust", "trust")})
+        if what is None:
+            return
+        if what == "mode":
+            v = self.ask_pick("QoS mode", {
+                "d": (QOS_DISABLED, "disabled"), "b": (QOS_BASIC, "basic"),
+                "a": (QOS_ADVANCED, "advanced")})
+            if v:
+                self.write(f"QoS {QOS_MODE[v]}",
+                           lambda: self.sw.set_qos_mode(v))
+        else:
+            v = self.ask_pick("trust", {"c": ("1", "CoS"), "d": ("2", "DSCP"),
+                                        "b": ("3", "CoS-DSCP")})
+            if v:
+                self.write(f"QoS trust {QOS_TRUST[v]}",
+                           lambda: self.sw.set_qos_trust(v))
+
+    def act_qos_port(self):
+        r = self.cur()
+        if not r:
+            return
+        n = r.get("interfaceName", "")
+        v = self.ask_int(f"{n} default CoS", 0, 7)
+        if v is None:
+            return
+        self.write(f"{n} CoS {v}", lambda: self.sw.set_port_cos(n, v))
+
+    def act_qos_queue(self):
+        cos = self.ask_int("CoS value", 0, 7)
+        if cos is None:
+            return
+        q = self.ask_int("queue", 1, 8)
+        if q is None:
+            return
+        self.write(f"CoS {cos} -> queue {q}",
+                   lambda: self.sw.set_cos_queue(cos, q))
+
+    def act_qos_policer(self):
+        what = self.ask_pick("policer", {"n": ("new", "create"),
+                                         "d": ("del", "delete")})
+        if what is None:
+            return
+        name = self.ask_text("policer name")
+        if name is None:
+            return
+        if what == "del":
+            self.write(f"policer {name} deleted",
+                       lambda: self.sw.set_policer(name, 0, 0, create=False))
+            return
+        cir = self.ask_int("committed rate (kbps)", 3, 10000000)
+        if cir is None:
+            return
+        cbs = self.ask_int("committed burst (bytes)", 3000, 19173960)
+        if cbs is None:
+            return
+        act = self.ask_pick("past the rate", {
+            "d": (POLICE_DROP, "drop"), "r": (POLICE_REMARK, "remark DSCP")})
+        if act is None:
+            return
+        self.write(f"policer {name} {cir}kbps",
+                   lambda: self.sw.set_policer(name, cir, cbs, act))
+
+    # ========================================================== 802.1X
+    def act_dot1x_global(self):
+        v = self.ask_onoff("802.1X system authentication")
+        if v is None:
+            return
+        on = v == "1"
+        # Enabling with no RADIUS server locks out every port that is not
+        # force-authorized. Refuse rather than warn: there is no console on
+        # this chassis to recover from, and a cold power cycle to clear it
+        # wipes the entire config. Disabling is always allowed - that is
+        # the direction that gets you back out of trouble.
+        if on and not self.extra().get("servers"):
+            self.set_msg("REFUSED: no RADIUS server configured - enabling "
+                         "802.1X would fail every port closed. Add a server "
+                         "in the radius view first.", bad=True)
+            return
+        self.write(f"802.1X {'enabled' if on else 'disabled'}",
+                   lambda: self.sw.set_dot1x_global({"enabled": v}))
+
+    def act_dot1x_port(self):
+        r = self.cur()
+        if not r:
+            return
+        n = r.get("interfaceName", "")
+        what = self.ask_pick(f"{n} 802.1X", {
+            "c": ("ctrl", "port control"), "h": ("host", "host mode")})
+        if what is None:
+            return
+        if what == "ctrl":
+            v = self.ask_pick("port control", {
+                "a": ("3", "auto"), "f": ("1", "force-authorized"),
+                "u": ("2", "force-unauthorized")})
+            if v:
+                self.write(f"{n} {DOT1X_PORT_CTRL[v]}",
+                           lambda: self.sw.set_dot1x_port(
+                               n, {"portControl": v}))
+        else:
+            v = self.ask_pick("host mode", {
+                "s": ("2", "single-host"), "m": ("1", "multi-host"),
+                "x": ("3", "multi-session")})
+            if v:
+                self.write(f"{n} {DOT1X_HOST_MODE[v]}",
+                           lambda: self.sw.set_dot1x_port(n, {"hostMode": v}))
+
+    # ========================================================== RADIUS
+    def act_radius_new(self):
+        host = self.ask_text("RADIUS server IP", maxlen=15)
+        if host is None:
+            return
+        key = self.ask_text("shared secret", maxlen=64)
+        if key is None:
+            return
+        self.write(f"RADIUS {host} added", lambda: self.sw.set_radius_server(
+            host, {"keyString": key, "authPortNo": "1812",
+                   "accountPortNo": "1813", "serverPriority": "1",
+                   "globalDefaultKeyEnable": "2"}))
+
+    def act_radius_delete(self):
+        r = self.cur()
+        if not r:
+            return
+        host = r.get("IPAddress", "")
+        if self.confirm(f"delete RADIUS server {host}?"):
+            self.write(f"RADIUS {host} deleted",
+                       lambda: self.sw.set_radius_server(host, create=False))
+
+    def act_radius_edit(self):
+        r = self.cur()
+        if not r:
+            return
+        host = r.get("IPAddress", "")
+        what = self.ask_pick(f"{host}", {
+            "k": ("key", "shared secret"), "t": ("timeout", "timeout"),
+            "r": ("retry", "retransmit"), "p": ("prio", "priority")})
+        if what is None:
+            return
+        if what == "key":
+            v = self.ask_text("shared secret", maxlen=64)
+            field = "keyString"
+        elif what == "timeout":
+            v = self.ask_int("timeout (s)", 1, 30)
+            field = "timeoutForReply"
+        elif what == "retry":
+            v = self.ask_int("retransmits", 1, 10)
+            field = "numberOfRetries"
+        else:
+            v = self.ask_int("priority, lower is tried first", 0, 65535)
+            field = "serverPriority"
+        if v is None:
+            return
+        self.write(f"{host} {field}",
+                   lambda: self.sw.set_radius_server(host, {field: v}))
+
+    # ============================================================ IGMP
+    def act_igmp_global(self):
+        what = self.ask_pick("multicast", {
+            "s": ("snoop", "snooping on/off"),
+            "f": ("filter", "unregistered filtering"),
+            "q": ("querier", "querier on/off")})
+        if what is None:
+            return
+        field = {"snoop": "IGMPSnoopEnbl", "filter": "multicastFilterEnbl",
+                 "querier": "querierEnbl"}[what]
+        v = self.ask_onoff(what)
+        if v:
+            self.write(f"multicast {what} {ENABLED[v]}",
+                       lambda: self.sw.set_multicast_global({field: v}))
+
+    def act_igmp_vlan(self):
+        r = self.cur()
+        vid = r.get("VLANID") if r else None
+        if not vid:
+            vid = self.ask_vlan()
+            if vid is None:
+                return
+        what = self.ask_pick(f"VLAN {vid} snooping", {
+            "e": ("enable", "snooping"), "q": ("querier", "querier"),
+            "i": ("leave", "immediate leave"), "v": ("version", "version")})
+        if what is None:
+            return
+        if what == "version":
+            v = self.ask_pick("IGMP version", {"2": ("2", "v2"),
+                                               "3": ("3", "v3")})
+            field = "querierVersion"
+        else:
+            v = self.ask_onoff(what)
+            field = {"enable": "snoopEnbl", "querier": "querierEnbl",
+                     "leave": "immediateLeave"}[what]
+        if v is None:
+            return
+        self.write(f"VLAN {vid} {what}",
+                   lambda: self.sw.set_igmp_vlan(vid, {field: v}))
+
+    def act_igmp_router_ports(self):
+        vid = self.ask_vlan()
+        if vid is None:
+            return
+        ports = self.ask_text("static router ports (e.g. gi0,gi1)")
+        if ports is None:
+            return
+        self.write(f"VLAN {vid} router ports {ports}",
+                   lambda: self.sw.set_igmp_router_ports(vid, ports))
+
+    # ============================================================== L3
+    def act_l3_global(self):
+        what = self.ask_pick("L3", {
+            "r": ("routing", "unicast routing"), "g": ("gw", "default gateway"),
+            "a": ("arp", "ARP timeout")})
+        if what is None:
+            return
+        if what == "routing":
+            v = self.ask_onoff("unicast routing")
+            if v:
+                self.write(f"routing {ENABLED[v]}",
+                           lambda: self.sw.set_ip_routing(v == "1"))
+        elif what == "gw":
+            ip = self.ask_text("default gateway IP", maxlen=15)
+            if ip is None:
+                return
+            self.write(f"gateway {ip}", lambda: self.sw.set_gateway(ip))
+        else:
+            v = self.ask_int("ARP timeout (s)", 1, 40000000)
+            if v:
+                self.write(f"ARP timeout {v}s",
+                           lambda: self.sw.set_arp_timeout(v))
+
+    def act_l3_route_new(self):
+        pfx = self.ask_text("destination prefix (e.g. 10.0.0.0)", maxlen=15)
+        if pfx is None:
+            return
+        plen = self.ask_int("prefix length", 0, 32)
+        if plen is None:
+            return
+        nh = self.ask_text("next hop IP", maxlen=15)
+        if nh is None:
+            return
+        metric = self.ask_int("metric", 1, 255)
+        if metric is None:
+            return
+        self.write(f"route {pfx}/{plen} via {nh}",
+                   lambda: self.sw.set_route(pfx, plen, nh, metric))
+
+    def act_l3_route_delete(self):
+        r = self.cur()
+        if not r:
+            return
+        pfx = r.get("destinationIPv4Address", "")
+        plen = r.get("destinationPrefixLength", "")
+        nh = r.get("nextHopIPv4Address", "")
+        if self.confirm(f"delete route {pfx}/{plen}?"):
+            self.write(f"route {pfx}/{plen} deleted",
+                       lambda: self.sw.set_route(pfx, plen, nh, create=False))
+
+    def act_l3_arp(self):
+        what = self.ask_pick("static ARP", {"n": ("new", "add"),
+                                            "d": ("del", "delete")})
+        if what is None:
+            return
+        n = self.ask_port("interface", allow_te=True)
+        if n is None:
+            return
+        ip = self.ask_text("IP address", maxlen=15)
+        if ip is None:
+            return
+        if what == "del":
+            self.write(f"ARP {ip} deleted",
+                       lambda: self.sw.set_arp(n, ip, None, create=False))
+            return
+        mac = self.ask_text("MAC address", maxlen=17)
+        if mac is None:
+            return
+        self.write(f"ARP {ip} -> {mac}",
+                   lambda: self.sw.set_arp(n, ip, mac))
+
+    # ============================================ VLAN membership editor
+    def act_vlan_ports(self):
+        """Put a port in a VLAN - the thing this tool could not do before.
+
+        Config/w already saved and replayed per-port VLAN membership and the
+        setter already existed; there was simply no way to reach it, so a
+        VLAN created here stayed empty until someone posted XML by hand.
+        """
+        r = self.cur()
+        vid = r.get("VLANID") if r else None
+        if not vid:
+            return
+        if vid == MGMT_VLAN:
+            self.set_msg(f"VLAN {vid} carries THIS session - not editable "
+                         f"from here", bad=True)
+            return
+        add = self.ask_pick(f"VLAN {vid}", {
+            "a": (True, "add a port"), "r": (False, "remove a port")})
+        if add is None:
+            return
+        n = self.ask_port("port")
+        if n is None:
+            return
+
+        # The port's CURRENT membership, because every one of these writes
+        # is action="set" on the whole VLAN list. Sending just this VLAN id
+        # would replace the list and quietly drop the port out of every
+        # other VLAN it was in.
+        cur = {}
+        try:
+            for row in self.sw.vlan_interfaces():
+                if row.get("interfaceName") == n:
+                    cur = row
+                    break
+        except SwitchError as e:
+            self.set_msg(f"cannot read {n}'s current VLANs: {e}", bad=True)
+            return
+
+        if not add:
+            # Removal only touches the list the VLAN is actually in, so a
+            # port in VLAN 100 tagged and VLAN 1 untagged keeps VLAN 1.
+            #
+            # A list that still has members is re-set; one that has just
+            # become EMPTY has to be cleared through the restore path
+            # instead. Setting it to an empty value is what hangs the
+            # switch - see clear_vlan_interface.
+            keep, clear = {}, []
+            for field, kwarg in (("generalTaggedVLANs", "tagged"),
+                                 ("generalUntaggedVLANs", "untagged"),
+                                 ("trunkMemberVLANs", "trunk_members")):
+                before = cur.get(field) or ""
+                if str(vid) not in [str(v) for v in vlan_list_parse(before)]:
+                    continue          # this VLAN was not in this list
+                after = vlan_list_remove(before, vid)
+                if after:
+                    keep[kwarg] = after
+                else:
+                    clear.append(field)
+            if not keep and not clear:
+                self.set_msg(f"{n} is not in VLAN {vid}", bad=True)
+                return
+
+            def do_remove():
+                body = ""
+                if keep:
+                    body = self.sw.set_vlan_interface(n, **keep)
+                if clear:
+                    body = self.sw.clear_vlan_interface(n, *clear)
+                return body
+            self.write(f"{n} removed from VLAN {vid}", do_remove)
+            return
+
+        mode = self.ask_pick(f"{n} switchport mode", {
+            "a": ("11", "access"), "t": ("12", "trunk"),
+            "g": ("10", "general")})
+        if mode is None:
+            return
+        if mode == "11":
+            # Access is genuinely exclusive - one untagged VLAN and no
+            # list to merge into - so this one does replace, correctly.
+            self.write(f"{n} access VLAN {vid}",
+                       lambda: self.sw.set_vlan_interface(
+                           n, mode=mode, access_pvid=vid))
+        elif mode == "12":
+            native = self.ask_pick(f"is VLAN {vid} the native (untagged) VLAN "
+                                   f"on {n}", {"y": ("y", "yes"),
+                                               "n": ("n", "no")})
+            if native is None:
+                return
+            members = vlan_list_add(cur.get("trunkMemberVLANs"), vid)
+            self.write(f"{n} trunk, {'native' if native == 'y' else 'tagged'}"
+                       f" {vid}  (members {members})",
+                       lambda: self.sw.set_vlan_interface(
+                           n, mode=mode, trunk_members=members,
+                           trunk_native=vid if native == "y" else None))
+        else:
+            tag = self.ask_pick(f"tag VLAN {vid} on {n}", {
+                "t": ("tagged", "tagged"), "u": ("untagged", "untagged")})
+            if tag is None:
+                return
+            if tag == "tagged":
+                lst = vlan_list_add(cur.get("generalTaggedVLANs"), vid)
+                kw = {"tagged": lst}
+            else:
+                lst = vlan_list_add(cur.get("generalUntaggedVLANs"), vid)
+                kw = {"untagged": lst, "pvid": vid}
+            self.write(f"{n} general, {tag} {vid}  (now {lst})",
+                       lambda: self.sw.set_vlan_interface(n, mode=mode, **kw))
+
+    def act_vlan_rename(self):
+        r = self.cur()
+        if not r:
+            return
+        vid = r.get("VLANID", "")
+        name = self.ask_text(f"name for VLAN {vid}")
+        if name is None:
+            return
+        self.write(f"VLAN {vid} named {name}",
+                   lambda: self.sw.vlan(vid, True, name))
+
+    def act_flush_macs(self):
+        r = self.cur()
+        n = r.get("interfaceName", "") if r else ""
+        what = self.ask_pick("forget learned MACs", {
+            "p": ("port", f"just {n or 'this port'}"),
+            "a": ("all", "the whole table")})
+        if what is None:
+            return
+        if what == "all":
+            if self.confirm("flush the ENTIRE forwarding table?"):
+                self.write("forwarding table flushed",
+                           lambda: self.sw.flush_macs())
+        elif n:
+            self.write(f"{n} MACs flushed", lambda: self.sw.flush_macs(n))
+
+    def act_port_settings(self):
+        """Description, speed, duplex and flow control on the selected port.
+
+        Duplex was withheld until 2026-08-12, when a link partner settled
+        it: duplexAdminMode and duplexOperMode are two different enums,
+        inverted relative to each other. Forcing admin 3 brought the link
+        up reporting oper 2 (full), so "full" is proven. "half" is Cisco's
+        value, consistent with what was measured but not confirmed - the
+        prompt says so rather than pretending otherwise.
+        """
+        r = self.cur()
+        if not r:
+            return
+        n = r["interfaceName"]
+        what = self.ask_pick(f"{n} settings", {
+            "d": ("desc", "description"), "s": ("speed", "speed"),
+            "x": ("duplex", "duplex"), "f": ("flow", "flow control")})
+        if what is None:
+            return
+        if what == "duplex":
+            v = self.ask_pick("duplex ('half' is unverified on this "
+                              "firmware)", {
+                                  "a": ("auto", "autonegotiate"),
+                                  "f": (DUPLEX_ADMIN_FULL, "full"),
+                                  "h": (DUPLEX_ADMIN_HALF, "half")})
+            if v is None:
+                return
+            if n.startswith("te"):
+                self.set_msg(f"{n} is a backplane serdes - forcing its "
+                             f"duplex is not meaningful", bad=True)
+                return
+            if v == "auto":
+                self.write(f"{n} autonegotiate",
+                           lambda: self.sw.set_port(
+                               n, {"autoNegotiationAdminEnabled": "1"}))
+            else:
+                # Forcing duplex means autonegotiation off, same as speed -
+                # otherwise the switch keeps negotiating and ignores it.
+                self.write(f"{n} forced {DUPLEX_ADMIN[v]} duplex",
+                           lambda: self.sw.set_port(
+                               n, {"autoNegotiationAdminEnabled": "2",
+                                   "duplexAdminMode": v}))
+            return
+        if what == "desc":
+            v = self.ask_text(f"description for {n}", maxlen=64)
+            if v is None:
+                return
+            self.write(f"{n} described",
+                       lambda: self.sw.set_port(n, {"interfaceDescription": v}))
+        elif what == "speed":
+            v = self.ask_pick("speed", {
+                "a": ("auto", "autonegotiate"), "1": ("1000", "1000 Mb/s"),
+                "0": ("100", "100 Mb/s"), "t": ("10", "10 Mb/s")})
+            if v is None:
+                return
+            if n.startswith("te") and v != "auto":
+                self.set_msg(f"{n} is a 10GBASE-KR backplane serdes - "
+                             f"forcing its speed is not meaningful", bad=True)
+                return
+            if v == "auto":
+                # Auto is not a speed value; it is autonegotiation back on.
+                self.write(f"{n} autonegotiate",
+                           lambda: self.sw.set_port(
+                               n, {"autoNegotiationAdminEnabled": "1"}))
+            else:
+                # Forcing a speed means turning autoneg off in the same
+                # write, or the switch keeps negotiating and ignores it.
+                self.write(f"{n} forced to {v} Mb/s",
+                           lambda: self.sw.set_port(
+                               n, {"autoNegotiationAdminEnabled": "2",
+                                   "speedAdmin": v}))
+        else:
+            v = self.ask_pick("flow control", {"y": ("1", "on"),
+                                               "n": ("2", "off")})
+            if v:
+                self.write(f"{n} flow control {'on' if v == '1' else 'off'}",
+                           lambda: self.sw.set_port(
+                               n, {"flowControlAdminType": v}))
+
+    def act_poe_limit(self):
+        """Set the per-port power budget.
+
+        Verified on hardware 2026-08-12: this gates delivery at
+        CLASSIFICATION only. Lowering it below what a device is already
+        drawing does nothing until that device re-detects - at which point
+        it is refused power and reports a fault. The message says so,
+        because "I set the limit and nothing happened" is otherwise a very
+        reasonable thing to conclude.
+        """
+        r = self.cur()
+        if not r:
+            return
+        n = r.get("interfaceName", "")
+        try:
+            draw = int(r.get("outputPower") or 0) / 1000
+        except ValueError:
+            draw = 0
+        v = self.ask_int(f"{n} power limit in watts (drawing {draw:.1f} W now)",
+                         1, 90)
+        if v is None:
+            return
+        mw = str(int(v) * 1000)
+        self.write(f"{n} power limit {v} W", lambda: self.sw.set_poe_port(
+            n, {"powerLimit": mw}))
+        if not self.msg_bad and draw and int(v) < draw:
+            self.set_msg(f"{n} limit set to {v} W, below its current "
+                         f"{draw:.1f} W draw - this only takes effect when "
+                         f"the device re-detects (SPACE twice to force it)")
+
+    def act_clear_counters(self):
+        r = self.cur()
+        if not r:
+            return
+        n = r.get("interfaceName", "")
+        if self.confirm(f"zero the counters on {n}?"):
+            self.write(f"{n} counters cleared",
+                       lambda: self.sw.clear_counters(n))
+
+    def goto(self, view):
+        self.view = view
+        self.sel = self.top = 0
+        self.set_msg("")
+        self.refresh_data()
+
+    def _menu_step(self, mrows, delta, start=None):
+        """Move the menu selection, skipping group headings."""
+        i = self.sel if start is None else start
+        for _ in range(len(mrows)):
+            i += delta
+            if i < 0 or i >= len(mrows):
+                break                     # ran off the end; stay put
+            if mrows[i][0] == "V":
+                return i
+        return self.sel
+
+    def _spec_key(self, c):
+        """Run a spec view's action for this key. True if it handled it."""
+        actions = self.spec().get("actions", {})
+        key = "\n" if c in (curses.KEY_ENTER, 10, 13) else \
+            (chr(c) if 32 <= c < 127 else None)
+        if key is None or key not in actions:
+            return False
+        getattr(self, actions[key])()
+        return True
+
     def run(self):
         self.refresh_data()
         while True:
@@ -1594,8 +4359,41 @@ class UI:
                     self.refresh_data()
                 continue
 
+            if self.view == "menu":
+                mrows = self.menu_rows()
+                if c in (curses.KEY_DOWN, ord("j")):
+                    self.sel = self._menu_step(mrows, 1)
+                elif c in (curses.KEY_UP, ord("k")):
+                    self.sel = self._menu_step(mrows, -1)
+                elif c in (curses.KEY_ENTER, 10, 13):
+                    if 0 <= self.sel < len(mrows) and mrows[self.sel][0] == "V":
+                        self.goto(mrows[self.sel][1])
+                elif c in (ord("q"), 27, 9):
+                    self.goto("ports")
+                continue
+
+            if c == 27 and self.view in SPECS:
+                # ESC goes back where you came from, rather than quitting
+                # the whole tool. In the tabbed views ESC has always meant
+                # quit and still does; but a view reached THROUGH the menu
+                # reads as one level down, and losing the session because
+                # you backed out of the ACL screen is a bad surprise.
+                self.view = "menu"
+                self.top = 0
+                self.sel = self._menu_step(self.menu_rows(), 1, start=-1)
+                self.set_msg("")
+                continue
             if c in (ord("q"), 27):
                 break
+            elif c == 9:                                      # TAB
+                self.view = "menu"
+                self.set_msg("")
+                # top is shared with the list views, so reset it or the
+                # menu opens scrolled to wherever the last view was.
+                self.top = 0
+                # Land on the first real entry, not the group heading.
+                self.sel = self._menu_step(self.menu_rows(), 1, start=-1)
+                continue
             elif c in (curses.KEY_DOWN, ord("j")):
                 self.sel = min(self.sel + 1, max(0, len(rows) - 1))
             elif c in (curses.KEY_UP, ord("k")):
@@ -1607,6 +4405,8 @@ class UI:
             elif c == ord("r"):
                 self.set_msg("")
                 self.refresh_data(force=True)
+            elif self.view in SPECS and self._spec_key(c):
+                pass
             elif c in [ord(k) for _, k in VIEWS if k != "?"]:
                 self.view = [n for n, k in VIEWS if k == chr(c)][0]
                 self.sel = self.top = 0
@@ -1622,6 +4422,20 @@ class UI:
                                    p["interfaceName"], up))
             elif c == ord("g") and self.view == "ports" and rows:
                 self.bind_lag(rows[self.sel])
+            elif c in (curses.KEY_ENTER, 10, 13) and self.view == "ports" \
+                    and rows:
+                self.act_port_settings()
+            elif c == ord("z") and self.view in ("ports", "stats") and rows:
+                self.act_clear_counters()
+            elif c == ord("f") and self.view == "mac":
+                self.act_flush_macs()
+            elif c in (curses.KEY_ENTER, 10, 13) and self.view == "poe" \
+                    and rows:
+                self.act_poe_limit()
+            elif c in (curses.KEY_ENTER, 10, 13) and self.view == "vlans":
+                self.act_vlan_ports()
+            elif c == ord("N") and self.view == "vlans" and rows:
+                self.act_vlan_rename()
             elif c == ord(" ") and self.view == "poe" and rows:
                 p = rows[self.sel]
                 on = p["adminEnable"] != "1"
@@ -1632,8 +4446,16 @@ class UI:
                 if vid is None:
                     self.set_msg("cancelled")
                 elif vid.isdigit() and 1 <= int(vid) <= 4094:
-                    self.write(f"create VLAN {vid}",
-                               lambda: self.sw.vlan(vid, True))
+                    # The name is optional: ENTER on an empty prompt creates
+                    # the VLAN unnamed, which is what this did before.
+                    name = self.prompt("name (optional), ESC cancels:",
+                                       maxlen=32)
+                    if name is None:
+                        self.set_msg("cancelled")
+                    else:
+                        self.write(f"create VLAN {vid}",
+                                   lambda: self.sw.vlan(vid, True,
+                                                        name or None))
                 elif vid:
                     self.set_msg(f"'{vid}' is not a valid VLAN id", bad=True)
             elif c == ord("d") and self.view == "vlans" and rows:
@@ -1645,9 +4467,16 @@ class UI:
                     self.write(f"delete VLAN {vid}",
                                lambda: self.sw.vlan(vid, False))
             elif c == ord("w") and self.view == "config":
+                # A full save is ~30 sequential GETs over a link-local
+                # HTTPS session and blocks the UI for a noticeable moment.
+                # Say so first, or it reads as a hang.
+                self.set_msg("saving - reading every table, this takes a "
+                             "few seconds ...")
+                self.draw()
                 try:
                     fs = save_config(self.sw)
-                    self.set_msg("wrote " + ", ".join(os.path.basename(f) for f in fs))
+                    self.set_msg(f"wrote {len(fs)} files: " + ", ".join(
+                        os.path.basename(f) for f in fs))
                 except Exception as e:
                     self.set_msg(str(e), bad=True)
             elif c == ord("u") and self.view == "config":
@@ -1672,9 +4501,439 @@ class UI:
                     except Exception as e:
                         self.set_msg(str(e), bad=True)
 
+            # STP joins the auto-refreshing views: port role and state change
+            # on their own during convergence, and a static screen through
+            # 30s of listening/learning looks like a hang.
             if (time.time() - self.last_refresh > 10
-                    and self.view in ("ports", "poe", "stats")):
+                    and self.view in ("ports", "poe", "stats", "stp")):
                 self.refresh_data()
+
+
+# ============================================================== view specs
+# Each entry describes a view completely: where its rows come from, how they
+# render, what the keys do. Adding a table is an entry here plus a client
+# method, not another pair of draw/dispatch branches.
+def raw(key, default="-"):
+    return lambda r: (r.get(key) or default)
+
+
+def enum_col(table, key, default="-"):
+    """Render an enum field through its lookup, falling back to the raw
+    value - a firmware that reports a code we have never seen should show
+    the code, not a blank."""
+    def fn(r):
+        v = (r.get(key) or "").strip()
+        return table.get(v, v or default)
+    return fn
+
+
+def yesno(key):
+    return enum_col(ENABLED, key)
+
+
+def merge_by_port(*tables):
+    """Join per-port tables into one row per interface.
+
+    Order is taken from the first table that has the port, so the result
+    lists ports in the switch's own order rather than a dict's.
+    """
+    out, order = {}, []
+    for t in tables:
+        for r in t:
+            n = r.get("interfaceName")
+            if not n:
+                continue
+            if n not in out:
+                out[n], _ = {}, order.append(n)
+            out[n].update({k: v for k, v in r.items() if v != ""})
+            out[n]["interfaceName"] = n
+    return [out[n] for n in order]
+
+
+def rate_col(kind):
+    """A storm-control rate as value+unit, or "off" when the value is 0."""
+    def fn(r):
+        v = (r.get(f"{kind}RateValue") or "").strip()
+        if v in ("", "0"):
+            return "off"
+        return f"{v}{STORM_UNIT.get((r.get(f'{kind}UnitType') or '').strip(), '')}"
+    return fn
+
+
+# ---- fetches ------------------------------------------------------------
+def fetch_stp(sw):
+    d = sw.stp()
+    g = dict(_try(sw.stp_global, {}))
+    g.update(d["global"])
+    return {"rows": d["ports"], "extra": g}
+
+
+def fetch_storm(sw):
+    return {"rows": sw.storm(), "extra": {}}
+
+
+def fetch_mirror(sw):
+    return {"rows": sw.span_destinations(),
+            "extra": {"sources": _try(sw.span_sources)}}
+
+
+def fetch_staticmac(sw):
+    return {"rows": sw.static_macs(),
+            "extra": _try(sw.forwarding_global, {})}
+
+
+def fetch_lldp(sw):
+    return {"rows": merge_by_port(sw.lldp_ports(), _try(sw.cdp_ports)),
+            "extra": _try(sw.lldp_global, {})}
+
+
+def fetch_lacp(sw):
+    return {"rows": sw.lacp_ports(), "extra": _try(sw.lacp_global, {})}
+
+
+def fetch_pvlan(sw):
+    return {"rows": sw.private_vlans(),
+            "extra": {"assoc": _try(sw.private_vlan_assoc),
+                      "hosts": _try(sw.private_vlan_hosts),
+                      "promisc": _try(sw.private_vlan_promisc)}}
+
+
+def fetch_acl(sw):
+    return {"rows": sw.acls(),
+            "extra": {"aces": _try(sw.aces),
+                      "bindings": _try(sw.acl_bindings)}}
+
+
+def fetch_qos(sw):
+    return {"rows": sw.cos_settings(),
+            "extra": {"global": _try(sw.qos_global, {}),
+                      "queues": _try(sw.cos_queue_map),
+                      "policers": _try(sw.policers)}}
+
+
+def fetch_dot1x(sw):
+    return {"rows": sw.dot1x_ports(),
+            "extra": {"global": _try(sw.dot1x_global, {}),
+                      "servers": _try(sw.radius_servers)}}
+
+
+def fetch_radius(sw):
+    return {"rows": sw.radius_servers(),
+            "extra": _try(sw.radius_defaults, {})}
+
+
+def fetch_igmp(sw):
+    return {"rows": sw.igmp_vlans(),
+            "extra": {"global": _try(sw.multicast_global, {}),
+                      "routers": _try(sw.igmp_router_ports)}}
+
+
+def fetch_l3(sw):
+    return {"rows": sw.routes(),
+            "extra": {"gateways": _try(sw.gateways),
+                      "arp": _try(sw.arp_entries),
+                      "arpglobal": _try(sw.arp_global, {}),
+                      "interfaces": _try(sw.ipv4_interfaces)}}
+
+
+# ---- summaries ----------------------------------------------------------
+def stp_summary(x):
+    on = (x.get("enabled") or "") == "1"
+    mode = STP_MODE.get((x.get("STPOperationMode") or "").strip(), "?")
+    head = (f"spanning tree: {'ENABLED' if on else 'DISABLED'}   mode {mode}"
+            f"   bridge priority {x.get('bridgePriority', '?')}")
+    if not on:
+        # The whole reason this view exists. Cabling two front ports to the
+        # same upstream switch with STP off builds a broadcast storm that
+        # takes the management VLAN with it. On its own line: appended to
+        # the header it ran past 80 columns and got truncated mid-warning.
+        return [head,
+                "NOTHING WILL BREAK A CABLING LOOP - press g to enable"]
+    return [head,
+            f"hello {x.get('helloTime', '?')}s  forward-delay "
+            f"{x.get('forwardDelay', '?')}s  max-age {x.get('maxAge', '?')}s"
+            f"   BPDU "
+            f"{BPDU_MODE.get((x.get('BPDUHandlingMode') or '').strip(), '?')}"
+            f"   loopback-guard "
+            f"{ENABLED.get((x.get('loopbackGuardEnable') or '').strip(), '?')}"]
+
+
+def mirror_summary(x):
+    n = len(x.get("sources", []))
+    return [f"{n} source{'' if n == 1 else 's'} configured."
+            f"  A destination port stops forwarding normally."]
+
+
+def qos_summary(x):
+    g = x.get("global", {})
+    return [f"QoS {QOS_MODE.get((g.get('QoSMode') or '').strip(), '?')}"
+            f"   trust "
+            f"{QOS_TRUST.get((g.get('basicTrustMode') or '').strip(), '?')}"
+            f"   {len(x.get('policers', []))} policer(s)"]
+
+
+def dot1x_summary(x):
+    g = x.get("global", {})
+    on = (g.get("enabled") or "") == "1"
+    line = f"802.1X {'ENABLED' if on else 'disabled'}"
+    if on and not x.get("servers"):
+        line += "   <- NO RADIUS SERVER: authenticating ports will fail closed"
+    return [line]
+
+
+def igmp_summary(x):
+    g = x.get("global", {})
+    return [f"snooping "
+            f"{ENABLED.get((g.get('IGMPSnoopEnbl') or '').strip(), '?')}"
+            f"   unregistered-filtering "
+            f"{ENABLED.get((g.get('multicastFilterEnbl') or '').strip(), '?')}"]
+
+
+def l3_summary(x):
+    gw = ", ".join(g.get("IPAddr", "") for g in x.get("gateways", [])) or "none"
+    arp = x.get("arpglobal", {}).get("timeout", "?")
+    return [f"default gateway: {gw}   ARP timeout {arp}s"
+            f"   {len(x.get('arp', []))} ARP entries"]
+
+
+def lldp_summary(x):
+    return [f"LLDP {ENABLED.get((x.get('LLDPEnabled') or '').strip(), '?')}"
+            f"   advertise every {x.get('updateInterval', '?')}s"
+            f"   (this firmware exposes no neighbour table - "
+            f"nothing to list here)"]
+
+
+def lacp_summary(x):
+    return [f"system priority {x.get('LACPSystemPriority', '?')}"
+            f"   load balance {x.get('LAGLoadBalance', '?')}"]
+
+
+def staticmac_summary(x):
+    v = x.get("agingInterval", "?")
+    return [f"MAC aging: {v}s" + ("  (never ages out)" if v == "0" else "")]
+
+
+# ---- detail panels ------------------------------------------------------
+def acl_detail_for(ui):
+    def fn(r):
+        name = r.get("ACLName", "")
+        x = ui.extra()
+        rules = [a for a in x.get("aces", []) if a.get("ACLName") == name]
+        binds = [b for b in x.get("bindings", [])
+                 if name in (b.get("ACLIPv4MACName"),
+                             b.get("ACLIPv4MACNameOut"))]
+        out = [f"{name}  ({ACL_TYPE.get(r.get('ACLType', ''), '?')} ACL)"]
+        if rules:
+            for a in sorted(rules, key=lambda a: a.get("rulePriority", "")):
+                out.append(f"  {a.get('rulePriority', '?'):>5}  "
+                           f"{ACL_ACTION.get(a.get('ruleAction', ''), '?'):7}"
+                           f"src {a.get('sourceMACAddress', 'any')}  "
+                           f"dst {a.get('destMACAddress', 'any')}")
+        else:
+            out.append("  no rules - an empty ACL matches nothing. ENTER adds one.")
+        out.append("  bound to: " + (", ".join(
+            b.get("interfaceName", "?") for b in binds) or "nothing (b binds it)"))
+        return out
+    return fn
+
+
+def mirror_detail_for(ui):
+    def fn(r):
+        s = r.get("sessionId", "")
+        src = [x for x in ui.extra().get("sources", [])
+               if x.get("sessionId") == s]
+        out = [f"session {s} -> {span_ifname(r.get('ifIndex', ''))}"
+               f"  ({SPAN_PORT_TYPE.get(r.get('portType', ''), '?')})"]
+        for x in src:
+            out.append(f"  mirroring {span_ifname(x.get('sourceIdx', ''))}"
+                       f"  {SPAN_DIR.get(x.get('sourceDirection', ''), '?')}")
+        if not src:
+            out.append("  no sources yet - a destination with nothing "
+                       "mirrored into it copies nothing. Press a.")
+        return out
+    return fn
+
+
+def pvlan_detail_for(ui):
+    def fn(r):
+        vid = r.get("VLANID", "")
+        x = ui.extra()
+        out = [f"VLAN {vid}  "
+               f"{PVLAN_TYPE.get(r.get('privateVLANType', ''), '?')}"]
+        for a in x.get("assoc", []):
+            if a.get("primaryVLANID") == vid:
+                out.append(f"  secondaries: {a.get('communityVLANsList', '-')}")
+        hosts = [h.get("interfaceName", "?") for h in x.get("hosts", [])
+                 if vid in (h.get("primaryVLAN"), h.get("secondaryVLAN"))]
+        promisc = [p.get("interfaceName", "?") for p in x.get("promisc", [])
+                   if p.get("primaryVLAN") == vid]
+        out.append(f"  host ports: {', '.join(hosts) or 'none'}")
+        out.append(f"  promiscuous ports: {', '.join(promisc) or 'none'}")
+        return out
+    return fn
+
+
+def l3_detail_for(ui):
+    def fn(r):
+        return [f"{r.get('destinationIPv4Address', '?')}/"
+                f"{r.get('destinationPrefixLength', '?')} via "
+                f"{r.get('nextHopIPv4Address', '?')}",
+                f"  metric {r.get('metric', '-')}   "
+                f"{ROUTE_TYPE.get(r.get('routeType', ''), '?')}",
+                "  routing must be enabled globally (g) for static routes "
+                "to be used."]
+    return fn
+
+
+SPECS = {
+    "stp": {
+        "fetch": fetch_stp, "summary": stp_summary,
+        "cols": [("port", 8, raw("interfaceName")),
+                 ("stp", 6, yesno("STPEnabled")),
+                 ("state", 12, enum_col(STP_PORT_STATE, "portState")),
+                 ("role", 12, enum_col(STP_PORT_ROLE, "portRole")),
+                 ("cost", 10, raw("pathCost")),
+                 ("prio", 6, raw("portPriority")),
+                 ("fast", 6, yesno("portFastEnabled")),
+                 ("bpduG", 0, yesno("BPDUGuardEnabled"))],
+        "actions": {" ": "act_stp_toggle", "\n": "act_stp_port",
+                    "g": "act_stp_global"},
+        "keys": "SPACE stp on/off   ENTER port settings   g global settings",
+        "empty": "the switch reported no STP ports",
+    },
+    "storm": {
+        "fetch": fetch_storm,
+        "cols": [("port", 10, raw("interfaceName")),
+                 ("broadcast", 14, rate_col("broadcast")),
+                 ("unknown unicast", 18, rate_col("unicast")),
+                 ("multicast", 0, rate_col("multicast"))],
+        "actions": {"\n": "act_storm"},
+        "keys": "ENTER set a rate limit on the selected port",
+        "empty": "no storm control table on this firmware",
+    },
+    "mirror": {
+        "fetch": fetch_mirror, "summary": mirror_summary,
+        "detail": None,  # filled in per-instance, needs ui.extra()
+        "cols": [("session", 10, raw("sessionId")),
+                 ("destination", 14,
+                  lambda r: span_ifname(r.get("ifIndex", ""))),
+                 ("type", 12, enum_col(SPAN_PORT_TYPE, "portType")),
+                 ("remote vlan", 0, raw("remoteVlanId"))],
+        "actions": {"n": "act_mirror_dest", "a": "act_mirror_source",
+                    "d": "act_mirror_delete"},
+        "keys": "n destination port   a add a source   d delete session",
+        "empty": "no mirror session - n sets a destination port first",
+    },
+    "staticmac": {
+        "fetch": fetch_staticmac, "summary": staticmac_summary,
+        "cols": [("vlan", 8, raw("VLANID")),
+                 ("mac", 20, raw("MACAddress")),
+                 ("port", 10, raw("interfaceName")),
+                 ("status", 0, enum_col(MAC_STATUS, "addressStatus"))],
+        "actions": {"n": "act_staticmac_new", "d": "act_staticmac_delete",
+                    "g": "act_mac_aging"},
+        "keys": "n new entry   d delete   g aging timer",
+        "empty": "no static entries - everything here is learned "
+                 "(see the MAC view)",
+    },
+    "lldp": {
+        "fetch": fetch_lldp, "summary": lldp_summary,
+        "cols": [("port", 10, raw("interfaceName")),
+                 ("lldp", 14, enum_col(LLDP_STATE, "portState")),
+                 ("cdp", 0, yesno("enbl"))],
+        "actions": {"\n": "act_lldp_port", "g": "act_lldp_global",
+                    " ": "act_cdp_toggle"},
+        "keys": "ENTER lldp mode   SPACE cdp on/off   g global settings",
+        "empty": "no LLDP interface table on this firmware",
+    },
+    "lacp": {
+        "fetch": fetch_lacp, "summary": lacp_summary,
+        "cols": [("port", 10, raw("interfaceName")),
+                 ("port prio", 12, raw("actorPortPriority")),
+                 ("timeout", 12, raw("actorPortAdminTimeout")),
+                 ("admin key", 0, raw("actorAdminKey"))],
+        "actions": {"\n": "act_lacp_port", "g": "act_lacp_global"},
+        "keys": "ENTER port priority/timeout   g system priority",
+        "empty": "no LACP port table on this firmware",
+    },
+    "pvlan": {
+        "fetch": fetch_pvlan,
+        "cols": [("vlan", 10, raw("VLANID")),
+                 ("role", 0, enum_col(PVLAN_TYPE, "privateVLANType"))],
+        "actions": {"n": "act_pvlan_new", "d": "act_pvlan_delete",
+                    "\n": "act_pvlan_edit"},
+        "keys": "n make a VLAN private   d undo   ENTER associate/assign ports",
+        "empty": "no private VLANs configured",
+    },
+    "acl": {
+        "fetch": fetch_acl,
+        "cols": [("name", 24, raw("ACLName")),
+                 ("type", 0, enum_col(ACL_TYPE, "ACLType"))],
+        "actions": {"n": "act_acl_new", "d": "act_acl_delete",
+                    "\n": "act_acl_rule", "b": "act_acl_bind"},
+        "keys": "n new ACL   d delete   ENTER add a rule   b bind to a port",
+        "empty": "no ACLs - n creates one",
+    },
+    "qos": {
+        "fetch": fetch_qos, "summary": qos_summary,
+        "cols": [("port", 10, raw("interfaceName")),
+                 ("default CoS", 0, raw("CoS"))],
+        "actions": {"\n": "act_qos_port", "g": "act_qos_global",
+                    "y": "act_qos_queue", "o": "act_qos_policer"},
+        "keys": "ENTER port CoS   g mode/trust   y CoS->queue   o policer",
+        "empty": "no CoS table on this firmware",
+    },
+    "dot1x": {
+        "fetch": fetch_dot1x, "summary": dot1x_summary,
+        "cols": [("port", 10, raw("interfaceName")),
+                 ("control", 20, enum_col(DOT1X_PORT_CTRL, "portControl")),
+                 ("host mode", 0, enum_col(DOT1X_HOST_MODE, "hostMode"))],
+        "actions": {"\n": "act_dot1x_port", "g": "act_dot1x_global"},
+        "keys": "ENTER port control/host mode   g system on/off",
+        "empty": "no 802.1X interface table on this firmware",
+    },
+    "radius": {
+        "fetch": fetch_radius,
+        "cols": [("server", 18, raw("IPAddress")),
+                 ("auth", 8, raw("authPortNo")),
+                 ("acct", 8, raw("accountPortNo")),
+                 ("prio", 6, raw("serverPriority")),
+                 ("timeout", 0, raw("timeoutForReply"))],
+        "actions": {"n": "act_radius_new", "d": "act_radius_delete",
+                    "\n": "act_radius_edit"},
+        "keys": "n add server   d delete   ENTER edit",
+        "empty": "no RADIUS servers - 802.1X cannot authenticate without one",
+    },
+    "igmp": {
+        "fetch": fetch_igmp, "summary": igmp_summary,
+        "cols": [("vlan", 10, raw("VLANID")),
+                 ("snooping", 12, yesno("snoopEnbl")),
+                 ("querier", 12, yesno("querierEnbl")),
+                 ("imm. leave", 0, yesno("immediateLeave"))],
+        "actions": {"\n": "act_igmp_vlan", "g": "act_igmp_global",
+                    "t": "act_igmp_router_ports"},
+        "keys": "ENTER per-VLAN settings   g global   t static router ports",
+        "empty": "no snooping VLANs reported",
+    },
+    "l3": {
+        "fetch": fetch_l3, "summary": l3_summary,
+        "cols": [("destination", 20,
+                  lambda r: f"{r.get('destinationIPv4Address', '?')}/"
+                            f"{r.get('destinationPrefixLength', '?')}"),
+                 ("next hop", 18, raw("nextHopIPv4Address")),
+                 ("metric", 8, raw("metric")),
+                 ("type", 0, enum_col(ROUTE_TYPE, "routeType"))],
+        "actions": {"n": "act_l3_route_new", "d": "act_l3_route_delete",
+                    "g": "act_l3_global", "a": "act_l3_arp"},
+        "keys": "n new route   d delete   g gateway/routing/ARP   a static ARP",
+        "empty": "no routes - this is an L2 switch unless you enable routing",
+    },
+}
+
+# Detail panels that need to reach the view's side tables are wired at
+# startup, because they close over the UI instance rather than a row.
+DETAIL_FACTORIES = {"acl": acl_detail_for, "mirror": mirror_detail_for,
+                    "pvlan": pvlan_detail_for, "l3": l3_detail_for}
 
 
 # =================================================================== main

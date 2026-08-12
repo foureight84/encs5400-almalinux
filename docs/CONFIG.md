@@ -37,15 +37,69 @@ ordering is the whole reason for the numeric prefixes.
 | File | Holds | Why it sorts there |
 |---|---|---|
 | `10-ports.xml` | admin UP/DOWN per `gi` port | ports must exist and be enabled first |
+| `11-port-settings.xml` | description, speed, duplex, flow control | separate from `10-ports.xml` on purpose — see below |
 | `15-lag.xml` | LAG membership and mode | groups must be formed before VLANs reference them |
 | `20-vlans.xml` | which VLANs exist | |
 | `25-vlan-ports.xml` | which ports are in them, and how they tag | needs the VLANs to already exist |
-| `30-poe.xml` | PoE on/off per port | last; depends on nothing |
+| `30-poe.xml` | PoE on/off per port | depends on nothing |
+| `35-stp-global.xml` | STP on/off and mode | only written when STP is running |
+| `36-stp-bridge.xml` | bridge priority and timers | |
+| `37-stp-ports.xml` | per-port cost, priority, portfast, guards | needs the ports |
+| `40-storm.xml` | storm-control rates | only if a rate is non-zero |
+| `41-span-dest.xml` | mirror session destination | the destination creates the session |
+| `42-span-src.xml` | what each session mirrors | a source naming a missing session is rejected |
+| `45-lldp-global.xml` | LLDP on/off, advertise interval | only if not at defaults |
+| `46-lldp-ports.xml` | per-port LLDP tx/rx state | |
+| `47-cdp-ports.xml` | per-port CDP enable | |
+| `50-lacp-global.xml` | LACP system priority, load balance | only if not at defaults |
+| `51-lacp-ports.xml` | per-port LACP priority and timeout | |
+| `55-mac-aging.xml` | aging interval | only if not the default 300s |
+| `56-static-mac.xml` | static forwarding entries | needs the VLANs |
+| `60-acls.xml` | ACL names and types | **before** the rules that name them |
+| `61-aces.xml` | ACL rules | an ACE naming a missing ACL is rejected |
+| `62-acl-bindings.xml` | which ports an ACL is bound to | needs the ACL |
+| `65-qos-global.xml` | QoS mode and trust | only when QoS is not disabled |
+| `66-qos-cos.xml` | per-port default CoS | |
+| `67-cos-queue.xml` | CoS → egress queue map | |
+| `68-policers.xml` | aggregate policers | |
+| `70-radius.xml` | RADIUS servers | **before** 802.1X — see the warning below |
+| `71-dot1x-global.xml` | 802.1X system auth control | only when enabled |
+| `72-dot1x-ports.xml` | per-port control and host mode | |
+| `75-multicast.xml` | snooping and filtering globals | only when enabled |
+| `76-igmp-vlans.xml` | per-VLAN snooping settings | needs the VLANs |
+| `77-igmp-routers.xml` | static and forbidden router ports | needs the snooping VLAN |
+| `80-pvlan.xml` | which VLANs are private, and their role | |
+| `81-pvlan-assoc.xml` | primary → secondary associations | needs the primary |
+| `82-pvlan-hosts.xml` | host ports | needs the association |
+| `83-pvlan-promisc.xml` | promiscuous ports | needs the association |
+| `84-ip-routing.xml` | unicast routing on/off | **before** the routes it governs |
+| `85-gateway.xml` | default gateway | |
+| `86-routes.xml` | static routes | statics only; connected routes are skipped |
+| `87-arp.xml` | static ARP entries | |
+| `88-arp-timeout.xml` | ARP aging | only if not the default |
 
-Only files that have something to say are written — no LAGs configured means
-no `15-lag.xml`.
+**One file is one table.** `--apply` posts each file as a single request body,
+and a request body is one `DeviceConfiguration` around one table. That is why
+an area spanning three tables is three files rather than one.
 
-You can add your own files. `40-mystuff.xml` is applied after everything
+`11-port-settings.xml` is deliberately not folded into `10-ports.xml`, even
+though both write `Standard802_3List`. `10-ports.xml` is the one file standing
+between a cold power cycle and a switch that forwards nothing, and it has been
+replayed against hardware in exactly its current shape. A firmware that
+rejects an unfamiliar `speedAdmin` should not be able to take the port enables
+down with it.
+
+Only files that have something to say are written. No LAGs configured means no
+`15-lag.xml`; STP left off means no `35`–`37` at all. A plain L2 switch still
+saves five files, which is the point — replaying firmware defaults would be
+harmless but would bury the handful that matter.
+
+> ⚠ **`70-radius.xml` holds the RADIUS shared secret in clear text.** The
+> switch reports `keyString` back in the clear and a server cannot be replayed
+> without it. `--save` creates that file `0600` and sets `/etc/encs-switch` to
+> `0700`. Think before committing the directory to version control.
+
+You can add your own files. `90-mystuff.xml` is applied after everything
 above; `05-first.xml` before all of it.
 
 ---
@@ -226,42 +280,59 @@ on real hardware.
 `wcd` tables. This project implements a deliberate subset — the things needed
 to get a switch forwarding and keep it that way across a power cycle.
 
-**Implemented** (read *and* write):
+**Implemented** (read *and* write, saved and replayed):
 
-| Area | NFVIS path | Here |
-|---|---|---|
-| Port admin state | `/switch/interface/gigabitEthernet` | Ports view, `space` |
-| VLANs | `/switch/vlan` | VLANs view, `n` / `d` |
-| VLAN port membership | `/switch/switchports` | saved + replayed (no UI editor yet) |
-| Link aggregation | `/switch/port-channel`, `channel-group` | Ports view, `g` |
-| PoE | `/switch/power` | PoE view, `space` |
-| MAC table, counters | `/switch/mac`, statistics | read-only views |
+| Area | NFVIS path | wcd tables | Here |
+|---|---|---|---|
+| Port admin state | `/switch/interface/gigabitEthernet` | `Standard802_3List` | Ports view, `space` |
+| Port description, speed, flow control | `/switch/interface/gigabitEthernet` | `Standard802_3List` | Ports view, `ENTER` |
+| VLANs, including names | `/switch/vlan` | `VLANList` | VLANs view, `n` / `d` / `N` |
+| VLAN port membership | `/switch/switchports` | `VLANInterfaceISList` | VLANs view, `ENTER` |
+| Link aggregation | `/switch/port-channel`, `channel-group` | `Standard802_3List`, `LAGList` | Ports view, `g` |
+| LACP tuning | `/switch/lacp` | `LACPGlobalSetting`, `LACPPortList` | `TAB` → lacp |
+| PoE | `/switch/power` | `PoEPSEInterfaceList` | PoE view, `space` |
+| MAC table, flush, counters, counter clear | `/switch/mac`, statistics | `ForwardingTable`, `StatisticsList`, `PortStatisticsClear` | MAC `f`, Stats `z` |
+| Static MAC entries, aging | `/switch/mac` | `ForwardingStaticTable`, `ForwardingGlobalSetting` | `TAB` → staticmac |
+| Spanning tree (STP/RSTP) | `/switch/spanning-tree` | `SpanningTreeGlobalParam`, `STP`, `RSTP` | `TAB` → stp |
+| Storm control | `/switch/interface/*/storm-control` | `StormControlTable` | `TAB` → storm |
+| Port mirroring, local SPAN | `/switch/monitor` | `SpanSourceTable`, `SpanDestinationTable` | `TAB` → mirror |
+| LLDP / CDP advertisement | `/switch/lldp` | `LLDPGlobalSetting`, `LLDPInterfaceList`, `CDPInterfaceList` | `TAB` → lldp |
+| Private VLANs | — | `PrivateVLAN*` | `TAB` → pvlan |
+| MAC ACLs, rules, port bindings | `/switch/interface/*/service-acl` | `ACLList`, `ACEList`, `ACLBindingList` | `TAB` → acl |
+| QoS: mode, trust, port CoS, CoS→queue, policers | `/switch/qos`, `/switch/class-map` | `QoSSettingGlobalParam`, `CoSSetting`, `CoSToQueueMappingList`, `AggregatePolicerList` | `TAB` → qos |
+| 802.1X + RADIUS | `/switch/dot1x`, `/switch/radius-server` | `Standard_802_1x*`, `RadiusServerList` | `TAB` → dot1x, radius |
+| IGMP/MLD snooping | `/switch/ip/igmp`, `/switch/bridge` | `IGMPMLD*`, `MulticastGlobalSetting` | `TAB` → igmp |
+| L3: static routes, gateway, static ARP, routing | `/switch/arp`, `/switch/ip/route`, `/switch/ip/routing` | `ARPList`, `IPv4RouteList`, `IPv4GatewayList`, `IPv4GlobalSetting` | `TAB` → l3 |
 
-**Not implemented.** All of these have working `wcd` tables and Cisco XML
-templates in `switch-confd`, so any of them is a tractable addition — nothing
-here is blocked, just unwritten:
+**Writable by the client, no view.** `encs-switch-tui` can post these but
+nothing in the UI reaches them; drive them from `encs-switch-api` or a hand-
+written replay file:
 
-| Area | NFVIS path | wcd tables |
-|---|---|---|
-| Spanning tree (STP/RSTP/MSTP) | `/switch/spanning-tree` | `STP`, `RSTP`, `MSTP*`, `SpanningTreeGlobalParam` |
-| QoS: class maps, policy maps, policers, queueing | `/switch/qos`, `/switch/class-map`, `/switch/policy-map`, `/switch/priority-queue`, `/switch/wrr-queue` | `ClassMapList`, `PolicyMapList`, `AggregatePolicerList`, `CoS*`, `DSCP*`, `QoSBandwidthList` |
-| ACLs | `/switch/interface/*/service-acl` | `ACLList`, `ACEList`, `ACLBindingList`, `IPStandardACLList` |
-| 802.1X + RADIUS | `/switch/dot1x`, `/switch/radius-server` | `Standard_802_1x*`, `RadiusServerList`, `EAPStatisticsList` |
-| IGMP/MLD snooping, multicast filtering | `/switch/ip/igmp`, `/switch/bridge` | `IGMPMLD*`, `MulticastGlobalSetting`, `UnregedMulticastList` |
-| Storm control | `/switch/interface/*/storm-control` | `StormControlTable` |
-| LLDP / CDP | `/switch/lldp` | `LLDP*`, `CDPInterfaceList` |
-| L3: ARP, static routes, default gateway | `/switch/arp`, `/switch/ip/route`, `/switch/ip/routing` | `ARPList`, `IPv4RouteList`, `IPv4GatewayList`, `IPv4InterfaceList` |
-| Port mirroring (SPAN) | `/switch/monitor` | `SpanDestinationTable` |
-| Private VLANs | — | `PrivateVLAN*` |
-| Static MAC entries, aging | `/switch/mac` | `ForwardingStaticTable`, `ForwardingGlobalSetting` |
-| LACP system priority, port priority/timeout | `/switch/lacp` | `LACPGlobalSetting`, `LACPPortList` |
+| Area | wcd tables |
+|---|---|
+| MSTP regions, revisions, instances, instance→VLAN maps | `MSTP`, `MSTPGlobalSetting`, `MSTPInstanceList`, `MSTPVLANList`, `MSTPInterfaceList` |
+| Class maps and policy maps (the policers *are* in the UI) | `ClassMapList`, `PolicyMapList` |
+| DSCP mutation, remarking, DSCP→queue map | `DSCPMutationTable`, `DSCPRemark`, `DSCPMapping` |
+| Per-port egress shaping | `QoSBandwidthList` (indexed by interface, not queue, despite the name) |
+| ~~Per-port PoE power limit~~ **(now in the UI: PoE view, `ENTER`)** | `PoEPSEInterfaceList`. Priority and 4-pair are *not* on this firmware — measured 2026-08-12, the table returns only `adminEnable`, `detectionStatus`, `interfaceName`, `outputPower`, `powerClassification`, `powerLimit`. Cisco's templates write more fields than this build reports. |
+| IGMP **forbidden** router ports | `IGMPMLDSnoopRouterPortList` — static router ports *are* in the UI (`TAB` → igmp, `t`) |
+
+**Not implemented, and not simply unwritten.** These are blocked on
+information that is not in the extracted source:
+
+| Area | What is missing |
+|---|---|
+| IPv4 ACL rules | `switch-confd` only ever built MAC ACLs — the `<IPv4Parameters>` element names appear nowhere in it. MAC ACLs are complete. A guessed IPv4 rule would be accepted by the switch and never match, which is the worst possible failure. |
+| LLDP neighbour discovery | There is no neighbour table. confd touches only `LLDPGlobalSetting` and `LLDPInterfaceList`. Nothing on this firmware answers "what is plugged into GE1/3". |
+| Remote SPAN | Needs a reflector port and a remote VLAN (`sourceType` 4, `isReflector` 2). Local SPAN works. |
+| Port security | `InterfaceSecurityTable` templates exist but the mode/violation enums were not pinned down. |
 
 Two practical notes. Everything above is **volatile** like the rest of the
 config, so anything you add by hand via `encs-switch-api` also needs a file in
-`/etc/encs-switch/` to survive a power cycle. And the switch defaults are
-sane for a flat L2 deployment — no STP is running, which is fine until you
-create a loop, so be careful cabling two front ports to the same upstream
-switch.
+`/etc/encs-switch/` to survive a power cycle — and one file must hold exactly
+one table. And **spanning tree is off until you turn it on**: fine until you
+cable two front ports to the same upstream switch, so either enable it
+(`TAB` → stp → `g`) or be careful.
 
 ## Enum reference
 
