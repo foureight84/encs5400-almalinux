@@ -225,6 +225,11 @@ reset on device release). This cannot be checked without disrupting the live uni
 
 ## 4d. Physical port map (verified on hardware)
 
+> MAC addresses throughout this document are **masked** as `c4:f7:d5:xx:xx:NN` — the OUI and the
+> final octet are real, the chassis-unique middle is not. Everything the port map argues rests on
+> the final octet (the ASIC allocates them sequentially, `…9d` → `…a4` for `gi0` → `gi7`), so the
+> masking costs the reader nothing. Serial numbers are masked the same way.
+
 **The X710 has no front-panel ports.** It is purely internal. The ENCS 5412 front panel exposes
 11 network ports driven by three different chips:
 
