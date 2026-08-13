@@ -585,6 +585,43 @@ The bootstrap VM stays on `vmbr0`. It carries no traffic, and putting the
 machine that boots the switch behind the switch is exactly the dependency loop
 to avoid.
 
+### Boot ordering
+
+A guest on `swbr0` that autostarts comes up with a working vNIC and a bridge
+that forwards nothing, for the ~60–90 s the ASIC takes to boot. DHCP fails, the
+guest shrugs, and the cause is two layers from where it shows. `swbr0` itself
+needs no help — it is an ordinary bridge over a host NIC, built by ifupdown2 in
+the first seconds of boot whether the switch exists or not — but the *guests*
+on it do:
+
+**This is automatic.** `encs-switch-startup.service` runs `--fix` on every
+boot, ordered `After=pve-cluster` and `Before=pve-guests`, so attaching a guest
+to `swbr0` in the GUI is all anyone has to do — the ordering is right on the
+next boot without being asked for. It says nothing in the journal on the boots
+where nothing changed. To inspect or drive it by hand:
+
+```sh
+encs-switch-vnet startup         # what needs changing, and why
+encs-switch-vnet startup --fix   # apply it now
+systemctl disable encs-switch-startup   # opt out entirely
+```
+
+It finds the bootstrap VM by which guest has the Marvell device passed through,
+never by a hardcoded VMID, and covers every bridge the tool owns — `swbr0` plus
+any `--named-bridge`. `status` and the TUI's vnet view warn when it becomes
+relevant.
+
+**The delay goes on the bootstrap VM, not on the guest waiting.** `qm`'s `up=`
+delays *the next* guest in the sequence, so `--startup order=2,up=90` on the
+dependent VM does nothing for that VM at all — the intuitive placement is the
+wrong one. The right pair is `order=1,up=90` on the bootstrap VM and `order=2`
+on everything that needs the switch. And the delay is only proposed once
+something actually depends on it: with no guests on these bridges it would just
+postpone every other VM at boot. That is symmetric — when the last guest leaves
+these bridges, the delay is taken back off, so an unused bridge stops costing
+every other guest 90 s. A delay you set yourself, to a different value, is
+never touched.
+
 ### Updating the host tools
 
 The switch tools on the hypervisor are **completely independent of the disk

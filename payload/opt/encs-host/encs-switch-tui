@@ -59,7 +59,7 @@ CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
 
 # Single source of truth for the version. scripts/release.sh reads this line
 # to name the tag and the tarball, so keep the literal on one line.
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # Where --update looks. Override for a fork or a test repo.
 GITHUB_REPO = os.environ.get("ENCS_REPO", "foureight84/encs5400-almalinux")
@@ -4815,6 +4815,9 @@ def fetch_vnet(sw):
                          "vms": ", ".join(who)})
     host["te2"] = ifv.get("te2", {})
     host["missing"] = vn is None
+    if vn is not None:
+        host["startup_plan"] = vn.startup_plan(
+            vn.vm_inventory(), vn.our_bridges(), vn.bootstrap_vmid(), 90)
     return {"rows": rows, "extra": host}
 
 
@@ -4834,7 +4837,14 @@ def vnet_summary(x):
                                            f"  <- expected {bp}")
     mgmt = f"{x.get('mgmt_if')}: " + ("up" if x.get("mgmt_up") else "MISSING")
     named = ", ".join(f"{n} (vlan {v})" for n, v in x.get("vnets") or [])
-    return [line, f"{mgmt}   {'named bridges: ' + named if named else ''}"]
+    out = [line, f"{mgmt}   {'named bridges: ' + named if named else ''}"]
+    # A guest that starts before the ASIC finds a bridge that forwards
+    # nothing for the first minute or so, and nothing on screen would
+    # otherwise connect that to its failed DHCP.
+    if x.get("startup_plan"):
+        out.append(f"{len(x['startup_plan'])} VM(s) start before the switch "
+                   f"is up - run: encs-switch-vnet startup")
+    return out
 
 
 def fetch_stp(sw):

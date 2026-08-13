@@ -330,6 +330,89 @@ def test_prune_backplane_replay():
               "1 and the management VLAN alone are not worth replaying")
 
 
+def test_startup_plan():
+    print("\n== boot ordering")
+    check(v.parse_startup("order=2,up=90") == {"order": "2", "up": "90"},
+          "startup string parses")
+    check(v.parse_startup("1") == {"order": "1"}, "a bare order parses")
+    check(v.parse_startup("") == {}, "unset parses to nothing")
+    check(v.format_startup({"up": "90", "order": "1"}) == "order=1,up=90",
+          "order is written first, the way Proxmox writes it")
+
+    boot = {"onboot": True, "startup": "order=1", "bridges": {"vmbr0"}}
+    # Nothing on our bridges yet: the delay would postpone every other guest
+    # at boot and buy nobody anything.
+    vms = {"900": dict(boot), "5412": {"onboot": True, "startup": "",
+                                       "bridges": {"vmbr0"}}}
+    check(v.startup_plan(vms, ["swbr0"], "900") == [],
+          "no dependents -> no delay is proposed")
+
+    # One guest on swbr0: now both ends need setting.
+    vms["901"] = {"onboot": True, "startup": "", "bridges": {"swbr0"}}
+    plan = {p[0]: p[2] for p in v.startup_plan(vms, ["swbr0"], "900")}
+    # The delay belongs on the BOOTSTRAP VM: qm(1) says up= waits before
+    # starting the NEXT guest, so on the dependent VM it would do nothing
+    # for that VM at all. This is the whole reason this function exists.
+    check(plan.get("900") == "order=1,up=90",
+          "the wait goes on the bootstrap VM, not the dependent one")
+    check(plan.get("901") == "order=2",
+          "the dependent VM only gets an order, no delay")
+
+    # A guest on a named per-VLAN bridge counts exactly the same.
+    vms["902"] = {"onboot": True, "startup": "", "bridges": {"dmz"}}
+    plan2 = {p[0]: p[2] for p in v.startup_plan(vms, ["swbr0", "dmz"], "900")}
+    check(plan2.get("902") == "order=2", "named bridges are covered too")
+
+    # Already correct, and a manual guest, are both left alone.
+    vms["903"] = {"onboot": True, "startup": "order=5", "bridges": {"swbr0"}}
+    vms["904"] = {"onboot": False, "startup": "", "bridges": {"swbr0"}}
+    got = {p[0] for p in v.startup_plan(vms, ["swbr0", "dmz"], "900")}
+    check("903" not in got, "a guest already ordered after the bootstrap VM")
+    check("904" not in got, "a guest that does not start at boot")
+
+    # Symmetry: the last dependent leaving takes the delay with it, or
+    # every other guest pays 90s at every boot for a bridge nothing uses.
+    gone = {"900": {"onboot": True, "startup": "order=1,up=90",
+                    "bridges": {"vmbr0"}},
+            "5412": {"onboot": True, "startup": "", "bridges": {"vmbr0"}}}
+    plan4 = {p[0]: p[2] for p in v.startup_plan(gone, ["swbr0"], "900")}
+    check(plan4.get("900") == "order=1",
+          "no dependents left -> the delay comes back off")
+    # But only when it is exactly ours. Someone else's number is theirs.
+    gone["900"]["startup"] = "order=1,up=45"
+    check(v.startup_plan(gone, ["swbr0"], "900") == [],
+          "a delay we did not set is left alone")
+
+    # An existing longer delay is not shortened.
+    vms["900"]["startup"] = "order=1,up=120"
+    plan3 = {p[0]: p[2] for p in v.startup_plan(vms, ["swbr0"], "900")}
+    check("900" not in plan3, "a longer delay already set is left alone")
+    check(v.startup_plan(vms, ["swbr0"], None) == [],
+          "no bootstrap VM found -> no plan, rather than a guess")
+
+
+def test_boot_unit_ships_and_is_ordered():
+    print("\n== encs-switch-startup.service")
+    unit = open(os.path.join(BUNDLE, "encs-switch-startup.service")).read()
+    # The entire value of this unit is landing before the guests start. Get
+    # the ordering wrong and it fixes the boot AFTER the one that broke.
+    check("Before=pve-guests.service" in unit,
+          "runs before Proxmox starts the guests")
+    check("After=pve-cluster.service" in unit,
+          "runs after pmxcfs, or /etc/pve/qemu-server is not there to read")
+    check("--fix" in unit and "--quiet" in unit,
+          "applies the plan, and only speaks when it changed something")
+    # A failure here must never stop guests from booting: bad ordering is a
+    # slow network for a minute, a failed dependency is no VMs at all.
+    check("SuccessExitStatus=0 1" in unit, "a failure cannot block the guests")
+
+    sh = open(os.path.join(BUNDLE, "install.sh")).read()
+    check("encs-switch-startup" in sh, "install.sh enables it")
+    rel = open(os.path.join(HERE, "release.sh")).read()
+    check(rel.count("encs-switch-startup.service") >= 2,
+          "release.sh stages it and lists it in the MANIFEST")
+
+
 def test_staged_gui_changes():
     print("\n== the Proxmox staging file")
     # The GUI never writes /etc/network/interfaces directly: it stages
@@ -527,6 +610,7 @@ def main():
                test_comment_out_legacy,
                test_teardown_restores_the_original, test_mgmt_comment,
                test_every_stanza_is_labelled, test_prune_backplane_replay,
+               test_startup_plan, test_boot_unit_ships_and_is_ordered,
                test_staged_gui_changes,
                test_vm_parsing,
                test_norm_port, test_parse_ports, test_check_vlan,

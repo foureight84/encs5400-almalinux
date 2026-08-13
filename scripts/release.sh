@@ -62,6 +62,7 @@ install -m 0755 "$BUNDLE/encs-switch-api"           "$STAGE/"
 install -m 0755 "$BUNDLE/encs-switch-vnet"          "$STAGE/"
 install -m 0755 "$BUNDLE/install.sh"                "$STAGE/"
 install -m 0644 "$BUNDLE/encs-switch-replay.service" "$STAGE/"
+install -m 0644 "$BUNDLE/encs-switch-startup.service" "$STAGE/"
 install -m 0644 "$BUNDLE/README"                    "$STAGE/"
 
 # The MANIFEST is what --update obeys: mode, path in tarball, destination.
@@ -73,6 +74,7 @@ cat > "$STAGE/MANIFEST" <<'EOF'
 0755    encs-switch-api             /usr/local/sbin/encs-switch-api
 0755    encs-switch-vnet            /usr/local/sbin/encs-switch-vnet
 0644    encs-switch-replay.service  /etc/systemd/system/encs-switch-replay.service
+0644    encs-switch-startup.service /etc/systemd/system/encs-switch-startup.service
 0755    install.sh                  /opt/encs-host/install.sh
 0644    README                      /opt/encs-host/README
 EOF

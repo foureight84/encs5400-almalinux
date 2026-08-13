@@ -116,13 +116,14 @@ for t in encs-switch-api encs-switch-tui encs-switch-vnet; do
         echo "  /usr/local/sbin/$t"
     fi
 done
-if [ -f "$HERE/encs-switch-replay.service" ]; then
-    install -m 0644 "$HERE/encs-switch-replay.service" /etc/systemd/system/
+for unit in encs-switch-replay encs-switch-startup; do
+    [ -f "$HERE/$unit.service" ] || continue
+    install -m 0644 "$HERE/$unit.service" /etc/systemd/system/
     mkdir -p /etc/encs-switch
     systemctl daemon-reload
-    systemctl enable encs-switch-replay.service >/dev/null 2>&1 || true
-    echo "  encs-switch-replay.service enabled"
-fi
+    systemctl enable "$unit.service" >/dev/null 2>&1 || true
+    echo "  $unit.service enabled"
+done
 
 # --- optional: a bridge for VM traffic -------------------------------------
 # Offered rather than done. Creating swbr0 re-parents the management VLAN,

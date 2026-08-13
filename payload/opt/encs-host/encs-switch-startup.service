@@ -1,0 +1,43 @@
+[Unit]
+# Fix guest boot ordering BEFORE Proxmox starts the guests.
+#
+# A guest on swbr0 depends on the Marvell ASIC, and the ASIC takes ~60-90s to
+# bootstrap. Start that guest first and it comes up with a working vNIC and a
+# bridge that forwards nothing: DHCP fails, the guest shrugs, and the cause is
+# two layers from where it shows.
+#
+# The ordering that avoids it (order=1,up=90 on the bootstrap VM, order=2 on
+# each dependent) is computed by encs-switch-vnet, not guessed - it finds the
+# bootstrap VM by which guest has the switch passed through. Running it here,
+# before pve-guests, means attaching a guest to swbr0 in the GUI is all anyone
+# has to do; the ordering is right on the next boot without being asked for.
+#
+# It changes nothing until a guest actually depends on one of these bridges:
+# the delay postpones every later guest, so an unused bridge costs no one 90s.
+#
+# To opt out:  systemctl disable encs-switch-startup
+# To see what it would do:  encs-switch-vnet startup
+Description=Fix guest boot order for the ENCS switch bridges
+Documentation=man:qm(1)
+# pmxcfs has to be mounted before /etc/pve/qemu-server is readable, and the
+# whole point is to land before the guests are started.
+After=pve-cluster.service
+Wants=pve-cluster.service
+Before=pve-guests.service
+ConditionPathExists=/usr/local/sbin/encs-switch-vnet
+ConditionPathIsDirectory=/etc/pve/qemu-server
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# --quiet says nothing when there is nothing to change, so the journal only
+# ever carries the boots where it actually reordered something.
+ExecStart=/usr/local/sbin/encs-switch-vnet startup --fix --quiet
+# Never let a failure here block the guests from starting. Wrong boot order
+# is a slow network for a minute; a failed dependency is no VMs at all.
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

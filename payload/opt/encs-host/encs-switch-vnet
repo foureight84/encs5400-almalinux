@@ -36,6 +36,8 @@ the cold-boot replay puts it back.
     encs-switch-vnet add 100             pick jacks from a list, VLAN 100
     encs-switch-vnet add 100 --ports gi0 the same, without the prompt
     encs-switch-vnet remove 100          put those ports back in VLAN 1
+    encs-switch-vnet startup             boot ordering, so guests wait for
+                                         the ASIC instead of racing it
     encs-switch-vnet teardown            undo init - VMs go back to vmbr0
 
 WHAT IT DELIBERATELY DOES NOT DO
@@ -609,6 +611,128 @@ def parse_vm_nets(text):
     return out
 
 
+def bootstrap_vmid():
+    """The VM that boots the ASIC, found by its PCI passthrough.
+
+    Never a hardcoded 900: the README's example uses that id, people use
+    others, and the whole point is not to guess. The Marvell switch is the
+    one device passed through on this platform, so the VM whose hostpci
+    line names its BDF is the bootstrap VM by definition.
+    """
+    rc, out = run(["lspci", "-d", "11ab:be00"])
+    if rc != 0 or not out.strip():
+        return None
+    bdf = out.split()[0]
+    short = bdf.split(":", 1)[1] if bdf.count(":") > 1 else bdf
+    for conf in sorted(glob.glob(os.path.join(VMCONF, "*.conf"))):
+        text = read(conf)
+        if re.search(rf"^hostpci\d+:\s*(0000:)?{re.escape(short)}",
+                     text, re.M):
+            return os.path.basename(conf)[:-5]
+    return None
+
+
+def parse_startup(s):
+    """'order=2,up=90' -> {'order': '2', 'up': '90'}. Order may be bare."""
+    out = {}
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+        elif part.isdigit():
+            out["order"] = part
+    return out
+
+
+def format_startup(d):
+    """Back to the config string, order first the way Proxmox writes it."""
+    return ",".join(f"{k}={d[k]}" for k in ("order", "up", "down") if k in d)
+
+
+def startup_plan(vms, ours, boot_vmid, delay=90):
+    """What each VM's `startup` should be. [(vmid, current, wanted, why)].
+
+    Two rules, and only one of them is about the guest:
+
+      * every VM on one of OUR bridges must start after the bootstrap VM,
+        because until the ASIC is up its frames go nowhere;
+      * the bootstrap VM carries the wait itself - `up=` delays the NEXT
+        guest in the sequence, not the one it is set on (qm(1): "delays ...
+        before starting the next VM"). Putting the delay on the dependent
+        VM is the intuitive mistake and does nothing for it.
+
+    The delay is only worth having when something actually depends on it:
+    it postpones every later guest, including ones on vmbr0 that do not
+    care. No dependents, no delay.
+
+    vms is {vmid: {"onboot": bool, "startup": str, "bridges": set}}.
+    """
+    if not boot_vmid or boot_vmid not in vms:
+        return []
+    boot = parse_startup(vms[boot_vmid].get("startup", ""))
+    boot_order = int(boot.get("order") or 1)
+    dependents = [v for v, d in sorted(vms.items())
+                  if v != boot_vmid and d.get("onboot")
+                  and d.get("bridges", set()) & set(ours)]
+    plan = []
+
+    want_boot = dict(boot)
+    want_boot["order"] = str(boot_order)
+    if dependents:
+        # Only meaningful once something is waiting on it.
+        if int(boot.get("up") or 0) < delay:
+            want_boot["up"] = str(delay)
+    elif boot.get("up") == str(delay):
+        # The last dependent went away. Take the delay back off, or every
+        # other guest on this host pays 90s at every boot for a bridge
+        # nothing uses - and nobody would ever connect the two.
+        #
+        # Only when it is EXACTLY the value we set: a delay someone chose
+        # deliberately, for their own reasons, is not ours to remove.
+        want_boot.pop("up")
+    if format_startup(want_boot) != format_startup(boot):
+        why = (f"boots the ASIC - the next guest waits {delay}s for it"
+               if dependents else
+               "nothing depends on the switch now - dropping the delay")
+        plan.append((boot_vmid, format_startup(boot) or "(unset)",
+                     format_startup(want_boot), why))
+
+    for v in dependents:
+        cur = parse_startup(vms[v].get("startup", ""))
+        if cur.get("order") and int(cur["order"]) > boot_order:
+            continue
+        want = dict(cur)
+        want["order"] = str(boot_order + 1)
+        plan.append((v, format_startup(cur) or "(unset)", format_startup(want),
+                     f"on {', '.join(sorted(vms[v]['bridges'] & set(ours)))}"
+                     f" - must start after the bootstrap VM"))
+    return plan
+
+
+def vm_inventory():
+    """{vmid: {onboot, startup, bridges}} for every VM on this host."""
+    out = {}
+    for conf in sorted(glob.glob(os.path.join(VMCONF, "*.conf"))):
+        text = read(conf)
+        head = text.split("\n[", 1)[0]
+        m_on = re.search(r"^onboot:\s*(\d)", head, re.M)
+        m_su = re.search(r"^startup:\s*(.+)$", head, re.M)
+        out[os.path.basename(conf)[:-5]] = {
+            "onboot": bool(m_on and m_on.group(1) == "1"),
+            "startup": (m_su.group(1).strip() if m_su else ""),
+            "bridges": {br for _, br, _ in parse_vm_nets(text)},
+        }
+    return out
+
+
+def our_bridges():
+    """Every bridge this tool owns: swbr0 plus any named per-VLAN bridge."""
+    return [BRIDGE] + [n for n, _ in parse_vnets(read(IFACES))]
+
+
 def vm_users(bridge=BRIDGE):
     """{vlan-or-None: ["901 net1", ...]} for every VM on our bridge."""
     users = {}
@@ -932,6 +1056,12 @@ def cmd_status(args):
         print(f"  {RED}{tag:<6}{'NO SUCH VLAN':<13} {'-':<32}"
               f"{'bridge=' + BRIDGE + ',tag=' + tag:<30}{', '.join(who)}{OFF}")
     print(f"  {DIM}front ports: 1/0 = GE1/0 · * link up · x disabled{OFF}")
+    plan = startup_plan(vm_inventory(), our_bridges(), bootstrap_vmid(),
+                        90)
+    if plan:
+        warn(f"{len(plan)} VM(s) need their boot order adjusted - a guest "
+             f"that starts before the ASIC finds a dead network")
+        print(f"    {DIM}encs-switch-vnet startup{OFF} shows what and why")
     if stray:
         warn("those VMs are tagged into a VLAN the switch does not have - "
              "their traffic goes nowhere. Create it: encs-switch-vnet add "
@@ -1022,6 +1152,8 @@ def cmd_init(args):
                  else RED + "NOT reachable" + OFF))
     else:
         print("\n  next:  ifreload -a")
+        print(f"         {DIM}then, once a guest is attached: "
+              f"encs-switch-vnet startup{OFF}")
         # install.sh brings sw2363 up on the bare NIC before this runs, and
         # ifupdown2 will not always re-parent a VLAN device that is already
         # there. If it does not, the switch stops answering and everything
@@ -1126,6 +1258,63 @@ def cmd_teardown(args):
           f"ip link del {MGMT_IF} ; ifreload -a{OFF}")
     print(f"  {DIM}the switch keeps its VLANs and front-port assignments - "
           f"only this host's bridge is gone{OFF}")
+    return 0
+
+
+def cmd_startup(args):
+    """Show - and optionally apply - the boot ordering these bridges need.
+
+    Exists because the dependency is real but invisible: a guest on swbr0
+    comes up with a working vNIC and a bridge that forwards nothing, for the
+    ~60-90s the ASIC takes to boot. DHCP fails, the guest shrugs, and the
+    cause is two layers away from where it shows.
+    """
+    boot = bootstrap_vmid()
+    ours = our_bridges()
+    vms = vm_inventory()
+    quiet = getattr(args, "quiet", False)
+    if quiet:
+        # Runs on every boot from encs-switch-startup.service. A journal
+        # entry per boot saying "nothing to do" is noise that trains people
+        # to ignore the one boot where it did something.
+        plan = startup_plan(vms, ours, boot, args.delay) if boot else []
+        if not plan:
+            return 0
+        for vmid, cur, want, why in plan:
+            rc, out = run(["qm", "set", vmid, "--startup", want])
+            print(f"VM {vmid}: {cur} -> {want} ({why})" if rc == 0
+                  else f"VM {vmid}: FAILED {out.strip()}")
+        return 0
+    say("Boot ordering")
+    if not boot:
+        warn("cannot find the bootstrap VM (no guest has the Marvell switch "
+             "passed through) - is it configured on this host?")
+        return 1
+    print(f"  bootstrap VM   : {boot}  {DIM}(has the ASIC passed through){OFF}")
+    print(f"  bridges checked: {', '.join(ours)}")
+    on_ours = [v for v, d in sorted(vms.items())
+               if d["bridges"] & set(ours)]
+    print(f"  guests on them : {', '.join(on_ours) or 'none yet'}")
+
+    plan = startup_plan(vms, ours, boot, args.delay)
+    if not plan:
+        print(f"\n  {GREEN}nothing to change{OFF} - "
+              + ("no guest depends on the switch yet, so no boot delay is "
+                 "worth paying" if not on_ours else "ordering already correct"))
+        return 0
+    print()
+    for vmid, cur, want, why in plan:
+        print(f"  VM {vmid:<6} {cur:<18} -> {want:<18} {DIM}{why}{OFF}")
+    if not args.fix:
+        print(f"\n  Nothing changed. Re-run with --fix, or by hand:")
+        for vmid, _, want, _ in plan:
+            print(f"      qm set {vmid} --startup {want}")
+        return 0
+    print()
+    for vmid, _, want, _ in plan:
+        rc, out = run(["qm", "set", vmid, "--startup", want])
+        print(f"  VM {vmid}: " + (f"{GREEN}set to {want}{OFF}" if rc == 0
+                                  else f"{RED}failed{OFF} {out.strip()}"))
     return 0
 
 
@@ -1339,6 +1528,17 @@ def main():
     s.add_argument("--force", action="store_true",
                    help="proceed even if VMs are still attached")
     s.set_defaults(fn=cmd_teardown)
+
+    s = sub.add_parser("startup",
+                       help="boot ordering for guests on these bridges")
+    s.add_argument("--fix", action="store_true", help="apply it with qm set")
+    s.add_argument("--delay", type=int, default=90, metavar="SECONDS",
+                   help="how long the next guest waits for the ASIC "
+                        "(default: 90)")
+    s.add_argument("--quiet", action="store_true",
+                   help="say nothing unless something changed (used by "
+                        "encs-switch-startup.service at boot)")
+    s.set_defaults(fn=cmd_startup)
 
     s = sub.add_parser("add", help="put front ports in a VLAN for VMs")
     s.add_argument("vlan")

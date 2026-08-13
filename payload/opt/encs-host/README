@@ -130,13 +130,35 @@ boot does not lose it.
 Unlike NFVIS, Proxmox cannot hide a bridge: anyone editing a VM's hardware sees
 vmbr0 and swbr0 both. A VM on the wrong one just gets the wrong network.
 
+BOOT ORDERING
+-------------
+swbr0 itself needs no help after a reboot - it is an ordinary bridge over a
+host NIC, built in the first seconds of boot whether the ASIC is up or not.
+The GUESTS on it do: for the ~60-90s the switch takes to boot, that bridge
+forwards nothing.
+
+    encs-switch-vnet startup         what needs changing, and why
+    encs-switch-vnet startup --fix   apply it now
+
+encs-switch-startup.service does that for you on every boot, before Proxmox
+starts the guests, so attaching a VM to swbr0 in the GUI is all you have to
+do. It is silent on the boots where nothing changed.
+'systemctl disable encs-switch-startup' opts out.
+
+The delay goes on the BOOTSTRAP VM, not on the guest that is waiting: qm's
+up= delays the NEXT guest in the sequence, so putting it on the dependent VM
+does nothing for that VM. Bootstrap gets order=1,up=90; guests on these
+bridges get order=2. Nothing is proposed until a guest actually depends on
+it, since the delay postpones every other VM at boot.
+
 CONTENTS
 --------
   install.sh                   host installer (run on Proxmox)
   encs-switch-tui              the management UI; also --save/--apply/--status
   encs-switch-api              low-level XML API client for scripting
   encs-switch-vnet             VM <-> front-port networks (bridge + VLAN)
-  encs-switch-replay.service   reapplies config after a cold boot
+  encs-switch-replay.service   reapplies switch config after a cold boot
+  encs-switch-startup.service  fixes guest boot order before the guests start
 
 THE TWO THINGS TO REMEMBER
 --------------------------
