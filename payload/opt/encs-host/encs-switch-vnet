@@ -1,0 +1,1378 @@
+#!/usr/bin/env python3
+"""encs-switch-vnet - put VMs on the front LAN ports, the way NFVIS does.
+
+RUN THIS ON THE HYPERVISOR. It configures both halves of one thing: the
+Linux bridge on the host's backplane NIC, and the VLAN on the Marvell ASIC
+that decides which front jack that bridge comes out of.
+
+WHY IT EXISTS
+-------------
+In NFVIS you attach a VM to a "network" and its traffic appears on GE1/x.
+There is no magic in that. On an ENCS, NFVIS's lan-br is an OVS bridge whose
+only physical port is int-LAN - the second X710 backplane function, te2 on
+the ASIC:
+
+    nfvis_encs_bridge_init.xml:   lan-br  <- port int-LAN
+    ENCS_70-persistent-net.rules: 0000:08:00.1 -> int-LAN
+
+The 8 front ports are NOT bridge members and are not host NICs at all. They
+are switch ports (gi0-gi7, silkscreened GE1/0-GE1/7), left in access VLAN 1
+by nfvis_encs_bridge_init_1.xml. A VM reaches a jack because its frames leave
+te2 in a VLAN that jack is also in - nothing else. NFVIS tags the vNIC's OVS
+port (`ovs-vsctl set port <vnic> tag=N`, networking_util.py) and configures
+the front port from the `switch` YANG model. Two independent halves.
+
+So the Proxmox equivalent is exactly:
+
+    host:    one VLAN-aware bridge on the backplane NIC   (= lan-br)
+             qm set <vm> --netN virtio,bridge=swbr0,tag=100
+    switch:  VLAN 100 exists, gi0 is an access port in it (= the GE1/0 jack)
+
+This tool does both, checks that they agree, and saves the switch side so
+the cold-boot replay puts it back.
+
+    encs-switch-vnet status              what exists now, and which VM is where
+    encs-switch-vnet init                create the bridge (prints a plan first)
+    encs-switch-vnet add 100             pick jacks from a list, VLAN 100
+    encs-switch-vnet add 100 --ports gi0 the same, without the prompt
+    encs-switch-vnet remove 100          put those ports back in VLAN 1
+    encs-switch-vnet teardown            undo init - VMs go back to vmbr0
+
+WHAT IT DELIBERATELY DOES NOT DO
+--------------------------------
+It changes no setting on your Proxmox management interface. vmbr0 on the
+MGMT CPU jack is the one link that does not depend on the ASIC, the
+bootstrap VM or a VLAN, and it is how you get back in when the switch side
+goes wrong. The whole point of this tool is to get VM traffic OFF that
+port, not to move management onto the switch - and certainly not to rename
+or reconfigure it.
+
+The one mark it does leave there is a comment line, added by `init` and
+removed by `teardown`: Proxmox shows it as that interface's comment, so
+the next person picking a bridge in the GUI is told which one is which.
+"""
+import argparse
+import difflib
+import glob
+import importlib.util
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from importlib.machinery import SourceFileLoader
+
+# The bridge that stands in for NFVIS's lan-br. Not vmbr-anything on purpose:
+# a name that sorts away from the Proxmox-managed bridges makes it obvious in
+# `ip -br link` which one is the switch backplane.
+BRIDGE = os.environ.get("ENCS_BRIDGE", "swbr0")
+MGMT_IF = os.environ.get("VLAN_IF", "sw2363")
+MGMT_ADDR = os.environ.get("HOST_IP", "169.254.1.1")
+MTU = os.environ.get("MTU", "9216")
+
+IFACES = "/etc/network/interfaces"
+# Proxmox stages GUI network edits here and copies the file over IFACES when
+# you press Apply Configuration. Writing to IFACES while that is pending
+# means the apply throws our block away - or worse, keeps half of it.
+IFACES_NEW = "/etc/network/interfaces.new"
+# Everything goes in the main file, because Proxmox reads NOTHING else. Its
+# own generated header says so - "PVE will preserve these directives, but
+# will NOT read its network configuration from sourced files" - and a bridge
+# it cannot see is one you cannot pick when creating a VM, which is the whole
+# point of this. install.sh has always written sw2363 there too.
+#
+# BEGIN/END bracket our stanzas so they can be replaced or removed exactly.
+# They are top-level comments, and PVE's parser skips those
+# (INotify.pm: `next if $line =~ m/^\s*#/`), so a GUI network change that
+# rewrites the file drops them. Nothing depends on them surviving: removal
+# falls back to matching interfaces by name.
+BEGIN = "# >>> encs-switch-vnet begin - do not edit between the markers"
+END = "# <<< encs-switch-vnet end"
+MARKER = "# --- managed by encs-switch-vnet"
+
+VMCONF = "/etc/pve/qemu-server"
+BACKUP_ROOT = "/var/backups/encs-switch"
+
+ACCESS, GENERAL, TRUNK = "11", "10", "12"
+
+GREEN, RED, YELLOW, CYAN, DIM, OFF = (
+    "\033[32m", "\033[31m", "\033[33m", "\033[36m", "\033[2m", "\033[0m")
+if not sys.stdout.isatty():
+    GREEN = RED = YELLOW = CYAN = DIM = OFF = ""
+
+
+def load_tui():
+    """Import encs-switch-tui as a library.
+
+    The switch API, the XML builders and save_config already live there and
+    are the tested ones; duplicating them here would mean two implementations
+    of the write that hangs the ASIC when it is wrong. Installed path first so
+    an --update'd TUI is what gets used, then alongside this file for the
+    run-from-a-checkout case.
+    """
+    # If the TUI is the one importing US - it offers create/teardown from its
+    # vnet view - it hands its own module in, and that is what we use. A
+    # second copy would define a second SwitchError, and the except clauses
+    # here would stop catching the exceptions its Switch raises.
+    pre = globals().get("_TUI_MODULE")
+    if pre is not None:
+        return pre
+    already = sys.modules.get("encs_switch_tui")
+    if already is not None:
+        return already
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in ("/usr/local/sbin/encs-switch-tui",
+                 os.path.join(here, "encs-switch-tui")):
+        if os.path.exists(cand):
+            loader = SourceFileLoader("encs_switch_tui", cand)
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    sys.exit("ERROR: encs-switch-tui not found - install the bundle first "
+             "(bash install.sh)")
+
+
+t = load_tui()
+
+
+def say(msg):
+    print(f"\n{CYAN}==> {msg}{OFF}")
+
+
+def warn(msg):
+    print(f"{YELLOW}    WARNING: {msg}{OFF}")
+
+
+def run(cmd):
+    """(rc, stdout). Never raises - every caller has a fallback."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+
+
+# ===================================================== host-side discovery
+def i40e_ports():
+    """Both X710 functions, ordered by PCI address. [1] is te2.
+
+    Identical rule to install.sh, and for the same reason: BOTH functions
+    reach the ASIC (verified by MAC learning - .0 is te1, .1 is te2), only
+    te2 carries data and the management VLAN, and interface names are not
+    stable across Debian releases. 0000:08:00.0 < 0000:08:00.1 is a property
+    of the hardware, so sort on that and never on the name.
+    """
+    out = []
+    for path in sorted(glob.glob("/sys/class/net/*")):
+        name = os.path.basename(path)
+        drv = os.path.realpath(os.path.join(path, "device", "driver"))
+        if os.path.basename(drv) != "i40e":
+            continue
+        pci = os.path.basename(os.path.realpath(os.path.join(path, "device")))
+        out.append((pci, name))
+    return [n for _, n in sorted(out)]
+
+
+def backplane_nic(strict=True):
+    """The X710 function that lands on te2, or None when strict=False.
+
+    strict=False exists for the TUI: a curses app must not be killed by a
+    sys.exit from a status read that happens to run on the wrong machine.
+    """
+    env = os.environ.get("BACKPLANE")
+    if env:
+        return env
+    ports = i40e_ports()
+    if len(ports) < 2:
+        if not strict:
+            return None
+        sys.exit(f"ERROR: expected 2 i40e ports, found {len(ports)}: "
+                 f"{', '.join(ports) or 'none'}\n"
+                 f"       Is this the ENCS host? Are the X710 drivers loaded?\n"
+                 f"       Override with BACKPLANE=<ifname>.")
+    return ports[1]
+
+
+def mgmt_bridge():
+    """The bridge the host's default route leaves by, or None.
+
+    Discovered, never hardcoded. It is vmbr0 on a stock Proxmox install, but
+    people bond, VLAN and rename - and a comment written into the wrong
+    stanza is worse than no comment, because it tells the next person to
+    keep guests off the interface they should be using.
+    """
+    rc, out = run(["ip", "-o", "route", "show", "default"])
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        m = re.search(r"\bdev\s+(\S+)", line)
+        if m and os.path.isdir(f"/sys/class/net/{m.group(1)}/bridge"):
+            return m.group(1)
+    return None
+
+
+# Proxmox shows a stanza's '#' lines as that interface's comment - in the
+# network panel, in the Edit dialog, and in the bridge dropdown when someone
+# adds a NIC to a VM. Every interface this tool writes gets one, because six
+# months later "sw2363" and "enp8s0f1np1" mean nothing to anybody, and the
+# cost of explaining them is one line each.
+COMMENT_BACKPLANE = ("#X710 backplane link to the Marvell switch ASIC (te2). "
+                     "Not a front port - the GE1/x jacks are behind the "
+                     "switch, not on this NIC.")
+COMMENT_MGMT_VLAN = (f"#Marvell switch management VLAN {t.MGMT_VLAN}, "
+                     f"link-local. encs-switch-tui reaches the ASIC at "
+                     f"169.254.1.0 over this. Not for VMs; do not delete.")
+
+
+def comment_bridge(bridge=BRIDGE):
+    return (f"#VM traffic to the GE1/x front ports - the NFVIS lan-net "
+            f"equivalent. No VLAN tag = switch VLAN 1 = all 8 jacks; "
+            f"tag N = whichever jacks are in VLAN N.")
+
+
+def comment_vnet_bridge(vid):
+    return (f"#ENCS front ports in switch VLAN {vid}. Attach a VM here "
+            f"instead of tagging {BRIDGE} by hand.")
+
+
+def mgmt_comment(bridge=BRIDGE):
+    """The line added to the management bridge's stanza while BRIDGE exists.
+
+    ifupdown2 keeps '#' lines inside a stanza and Proxmox carries them as
+    that interface's comment, so this is a label in the place people
+    actually look - no rename, nothing to migrate, nothing that can cost
+    the management interface if it goes wrong.
+    """
+    return (f"#Proxmox management and the bootstrap VM. Attach guests to "
+            f"{bridge} instead - it reaches the GE1/x front ports.")
+
+
+def add_mgmt_comment(text, bridge, comment):
+    """Put `comment` inside `bridge`'s iface stanza. (new_text, changed).
+
+    Only ever adds a comment line: the stanza's actual settings are the ones
+    carrying this host's address, and this feature is not worth touching
+    them for.
+    """
+    if not bridge or comment in text:
+        return text, False
+    lines = text.splitlines()
+    out, done, i = [], False, 0
+    while i < len(lines):
+        out.append(lines[i])
+        if not done and re.match(rf"\s*iface\s+{re.escape(bridge)}\s",
+                                 lines[i]):
+            # After any comment the stanza already has, so someone else's
+            # note stays first and ours reads as an addition to it.
+            i += 1
+            while i < len(lines) and lines[i].lstrip().startswith("#"):
+                out.append(lines[i])
+                i += 1
+            out.append(comment)
+            done = True
+            continue
+        i += 1
+    if not done:
+        return text, False
+    return "\n".join(out) + ("\n" if text.endswith("\n") else ""), True
+
+
+def remove_mgmt_comment(text, comment):
+    """Take it back out again. (new_text, changed)."""
+    if comment not in text:
+        return text, False
+    kept = [ln for ln in text.splitlines() if ln.strip() != comment.strip()]
+    return "\n".join(kept) + ("\n" if text.endswith("\n") else ""), True
+
+
+def host_status():
+    """What the host side looks like right now. Never raises, never exits.
+
+    The TUI's vnet view renders from this, so every lookup here has to
+    survive a machine that is not the ENCS at all.
+    """
+    bp = backplane_nic(strict=False)
+    return {"backplane": bp,
+            "bridge": BRIDGE,
+            "bridge_up": iface_exists(BRIDGE),
+            "members": bridge_members(BRIDGE),
+            "managed": BEGIN in read(IFACES),
+            "mgmt_if": MGMT_IF,
+            "mgmt_up": iface_exists(MGMT_IF),
+            "vnets": parse_vnets(read(IFACES)),
+            "users": vm_users()}
+
+
+def iface_exists(name):
+    return os.path.exists(f"/sys/class/net/{name}")
+
+
+def bridge_members(name):
+    try:
+        return sorted(os.listdir(f"/sys/class/net/{name}/brif"))
+    except OSError:
+        return []
+
+
+# =============================================== /etc/network/interfaces.d
+def render_managed(backplane, vnets, bridge=BRIDGE, mgmt_if=MGMT_IF,
+                   mgmt_addr=MGMT_ADDR, mtu=MTU):
+    """Our block of /etc/network/interfaces, from scratch, every time.
+
+    vnets is [(name, vid)] - optional per-VLAN bridges for people who would
+    rather pick a name out of the Proxmox GUI dropdown than remember to type
+    a VLAN tag. They are ordinary bridges over swbr0.<vid>, which is the same
+    shape Proxmox's own SDN VLAN zones produce.
+
+    Pure function: everything it needs is an argument, so the tests can check
+    the file without a backplane NIC to look at.
+    """
+    L = [BEGIN,
+         "# The Proxmox equivalent of NFVIS's lan-br: one bridge whose only",
+         "# physical port is the X710 backplane function that lands on te2.",
+         f"# A VM on {bridge} with no tag is in switch VLAN 1 (every front",
+         "# port, out of the box); a VM tagged N reaches whichever front",
+         "# ports are in VLAN N on the ASIC.",
+         "# Rewritten by 'encs-switch-vnet init'; removed by 'teardown'.",
+         "",
+         f"auto {backplane}",
+         f"iface {backplane} inet manual",
+         COMMENT_BACKPLANE,
+         f"    mtu {mtu}",
+         "",
+         f"auto {bridge}",
+         f"iface {bridge} inet manual",
+         comment_bridge(bridge),
+         f"    bridge-ports {backplane}",
+         # The ASIC runs its own spanning tree (off by default) and both X710
+         # functions land on it. A host bridge that also ran STP would be a
+         # second, unrelated tree on the same L2 - so leave it to the switch.
+         "    bridge-stp off",
+         "    bridge-fd 0",
+         "    bridge-vlan-aware yes",
+         "    bridge-vids 2-4094",
+         f"    mtu {mtu}",
+         ""]
+
+    # The management VLAN has to move onto the bridge. A VLAN subinterface of
+    # an enslaved NIC receives nothing: once the NIC is a bridge port the
+    # bridge consumes its frames. This is the one stanza install.sh wrote that
+    # must change, and getting it wrong costs the switch session (not the
+    # host - Proxmox management is on another NIC entirely).
+    L += [f"auto {mgmt_if}",
+          f"iface {mgmt_if} inet static",
+          COMMENT_MGMT_VLAN,
+          f"    address {mgmt_addr}/16",
+          f"    vlan-raw-device {bridge}",
+          "    vlan-id " + t.MGMT_VLAN,
+          f"    mtu {mtu}",
+          # A VLAN-aware bridge filters traffic destined for the host itself
+          # on the bridge device's own vlan list, which is separate from the
+          # ports' list. ifupdown2 normally adds this; doing it explicitly
+          # means a version that does not is not a silent loss of management.
+          f"    post-up bridge vlan add dev {bridge} vid {t.MGMT_VLAN} self || true",
+          ""]
+
+    for name, vid in vnets:
+        L += [f"auto {name}",
+              f"iface {name} inet manual",
+              comment_vnet_bridge(vid),
+              f"    bridge-ports {bridge}.{vid}",
+              "    bridge-stp off",
+              "    bridge-fd 0",
+              f"    mtu {mtu}",
+              # Same reason as the management VLAN above: a VLAN device on a
+              # VLAN-aware bridge only gets frames the BRIDGE is willing to
+              # deliver locally, which is a separate list from the ports'.
+              f"    post-up bridge vlan add dev {bridge} vid {vid} self || true",
+              ""]
+    L.append(END)
+    return "\n".join(L)
+
+
+def upsert_block(text, block):
+    """Put `block` in the file: replacing an existing one, or appended.
+
+    Returns (new_text, replaced).
+    """
+    if BEGIN in text and END in text:
+        head = text.split(BEGIN)[0]
+        tail = text.split(END, 1)[1]
+        return head + block + tail, True
+    sep = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n")
+                                            else "\n\n")
+    return text + sep + block + "\n", False
+
+
+def remove_block(text):
+    """Take our block back out. (new_text, found)."""
+    if BEGIN not in text or END not in text:
+        return text, False
+    head = text.split(BEGIN)[0]
+    tail = text.split(END, 1)[1]
+    return head.rstrip("\n") + "\n" + tail.lstrip("\n"), True
+
+
+def strip_ifaces(text, names):
+    """Delete whole stanzas by interface name. (new_text, [names removed]).
+
+    The fallback for when the markers are gone - which happens the first
+    time someone applies a network change from the Proxmox GUI, because its
+    parser skips top-level comments and its writer regenerates the file from
+    what it parsed. The stanzas themselves survive that (PVE re-emits every
+    interface it read, unknown options and all), so removing by name still
+    works when removing by marker cannot.
+    """
+    lines, out, removed = text.splitlines(), [], []
+    starters = ("auto ", "allow-", "iface ", "source ", "source-directory ",
+                "mapping ")
+    i = 0
+    while i < len(lines):
+        m = re.match(r"\s*(auto|iface)\s+(\S+)", lines[i])
+        if not m or m.group(2) not in names:
+            out.append(lines[i])
+            i += 1
+            continue
+        if m.group(2) not in removed:
+            removed.append(m.group(2))
+        i += 1
+        while i < len(lines) and not lines[i].lstrip().startswith(starters):
+            i += 1
+        # Do not leave a run of blank lines where the stanza was.
+        while out and not out[-1].strip():
+            out.pop()
+        out.append("")
+    return "\n".join(out) + ("\n" if text.endswith("\n") else ""), removed
+
+
+def parse_vnets(text, bridge=BRIDGE):
+    """Named per-VLAN bridges already in the managed file: [(name, vid)].
+
+    Recovered from the file rather than kept in a state file of its own -
+    one source of truth, and `init` can regenerate without forgetting them.
+    """
+    out, cur = [], None
+    for line in text.splitlines():
+        m = re.match(r"\s*iface\s+(\S+)", line)
+        if m:
+            cur = m.group(1)
+            continue
+        m = re.match(rf"\s*bridge-ports\s+{re.escape(bridge)}\.(\d+)\s*$", line)
+        if m and cur:
+            out.append((cur, m.group(1)))
+    return out
+
+
+def comment_out_legacy(text, names):
+    """Comment out install.sh's stanzas for the interfaces we now own.
+
+    ifupdown2 refuses a file with two `iface sw2363` definitions, so the old
+    ones cannot simply be left behind. They are commented, not deleted: the
+    address and MTU that were working stay visible right there for whoever
+    has to put things back by hand at 2am.
+
+    Returns (new_text, [names actually commented]).
+    """
+    lines = text.splitlines()
+    out, touched = [], []
+    i, n = 0, len(lines)
+    starters = ("auto ", "allow-", "iface ", "source ", "source-directory ")
+    while i < n:
+        line = lines[i]
+        m = re.match(r"\s*(auto|iface)\s+(\S+)", line)
+        if not m or m.group(2) not in names:
+            out.append(line)
+            i += 1
+            continue
+        name = m.group(2)
+        if name not in touched:
+            touched.append(name)
+            out.append(f"# {MARKER} moved this onto {BRIDGE}")
+        out.append("# " + line)
+        i += 1
+        # Everything up to the next stanza header belongs to this stanza.
+        while i < n and not lines[i].lstrip().startswith(starters):
+            out.append(("# " + lines[i]) if lines[i].strip() else lines[i])
+            i += 1
+    return "\n".join(out) + ("\n" if text.endswith("\n") else ""), touched
+
+
+def staged_gui_changes():
+    """True if Proxmox has unapplied network edits waiting.
+
+    The GUI never edits /etc/network/interfaces directly: it writes
+    interfaces.new and copies it over on Apply Configuration (or at the next
+    boot, via pvenetcommit). Anything we write to the real file in between is
+    thrown away by that copy - and losing our edit is the good outcome. The
+    bad one is losing only *half* of it: the old sw2363 stanza comes back
+    uncommented while the bridge in interfaces.d stays, leaving two
+    definitions of the same interface and no working management VLAN.
+    """
+    return os.path.exists(IFACES_NEW)
+
+
+def uncomment_legacy(text):
+    """Undo comment_out_legacy: give install.sh's stanzas back.
+
+    Teardown has to restore a working management VLAN, and the one that was
+    working is sitting right there commented out. Reinstating it beats
+    regenerating a guess, because it carries whatever address and MTU this
+    host actually used.
+
+    Returns (new_text, [names restored]).
+    """
+    out, restored = [], []
+    lines = text.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        if not lines[i].startswith(f"# {MARKER}"):
+            out.append(lines[i])
+            i += 1
+            continue
+        i += 1                      # drop the marker line itself
+        while i < n and lines[i].startswith("#"):
+            body = re.sub(r"^#\s?", "", lines[i])
+            m = re.match(r"\s*(auto|iface)\s+(\S+)", body)
+            if m and m.group(2) not in restored:
+                restored.append(m.group(2))
+            out.append(body)
+            i += 1
+    return "\n".join(out) + ("\n" if text.endswith("\n") else ""), restored
+
+
+def plain_mgmt_stanzas(backplane, mgmt_if=MGMT_IF, mgmt_addr=MGMT_ADDR,
+                       mtu=MTU):
+    """What install.sh writes - the fallback when there is nothing to restore.
+
+    Someone who tidied the commented block out of /etc/network/interfaces
+    would otherwise be left with no management VLAN at all after a teardown,
+    which is a worse outcome than a duplicated stanza.
+    """
+    return (f"\nauto {backplane}\n"
+            f"iface {backplane} inet manual\n"
+            f"{COMMENT_BACKPLANE}\n"
+            f"    mtu {mtu}\n"
+            f"\nauto {mgmt_if}\n"
+            f"iface {mgmt_if} inet static\n"
+            f"{COMMENT_MGMT_VLAN}\n"
+            f"    address {mgmt_addr}/16\n"
+            f"    vlan-raw-device {backplane}\n"
+            f"    vlan-id {t.MGMT_VLAN}\n"
+            f"    mtu {mtu}\n")
+
+
+def diff(old, new, path):
+    return "".join(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=path, tofile=path + " (new)"))
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def backup(paths):
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(BACKUP_ROOT, stamp)
+    os.makedirs(dest, exist_ok=True)
+    for p in paths:
+        if os.path.exists(p):
+            shutil.copy2(p, os.path.join(dest, os.path.basename(p)))
+    return dest
+
+
+# ============================================================ VM inventory
+def parse_vm_nets(text):
+    """[(netN, bridge, tag)] from one Proxmox VM config.
+
+    Snapshots are appended to the same file under [name] headers and hold
+    stale copies of everything, so stop at the first section header.
+    """
+    out = []
+    for line in text.splitlines():
+        if line.startswith("["):
+            break
+        m = re.match(r"(net\d+):\s*(.+)$", line.strip())
+        if not m:
+            continue
+        opts = dict(kv.split("=", 1) for kv in m.group(2).split(",")
+                    if "=" in kv)
+        if "bridge" in opts:
+            out.append((m.group(1), opts["bridge"], opts.get("tag")))
+    return out
+
+
+def vm_users(bridge=BRIDGE):
+    """{vlan-or-None: ["901 net1", ...]} for every VM on our bridge."""
+    users = {}
+    for conf in sorted(glob.glob(os.path.join(VMCONF, "*.conf"))):
+        vmid = os.path.basename(conf)[:-5]
+        for nic, br, tag in parse_vm_nets(read(conf)):
+            if br == bridge:
+                users.setdefault(tag, []).append(f"{vmid} {nic}")
+    return users
+
+
+# ================================================================== switch
+def norm_port(p):
+    """gi0, GE1/0, ge1/0, 0 -> gi0. Anything else is an error, not a guess."""
+    p = p.strip()
+    m = re.fullmatch(r"(?:gi|ge1[/-]|GE1[/-])?(\d)", p, re.I)
+    if not m or not 0 <= int(m.group(1)) <= 7:
+        return None
+    return f"gi{m.group(1)}"
+
+
+def parse_ports(text):
+    """"gi0,GE1/3" or "0 3" -> (["gi0", "gi3"], None), else (None, why).
+
+    Accepts commas or spaces because both are what people type, and the same
+    parser serves --ports and the interactive picker - a port list that is
+    valid on the command line has to stay valid at the prompt.
+    """
+    words = [w for w in re.split(r"[,\s]+", (text or "").strip()) if w]
+    if not words:
+        return None, "no ports given"
+    out = []
+    for w in words:
+        n = norm_port(w)
+        if not n:
+            return None, (f"'{w}' is not a front port - use gi0-gi7 or the "
+                          f"panel names GE1/0-GE1/7")
+        if n not in out:
+            out.append(n)
+    return out, None
+
+
+def pick_ports(st, users):
+    """Choose front jacks from a list. None if the operator backs out.
+
+    Interactive because the decision needs the state next to it: a jack that
+    is shut, or already carrying another VLAN with a VM on it, is exactly the
+    one someone picks by accident from memory. Callers must have checked for
+    a terminal - the flag form is the answer for scripts.
+    """
+    print(f"\n  {'port':<6}{'panel':<8}{'link':<7}{'admin':<7}{'VLAN':<7}"
+          f"VMs on that VLAN")
+    for i in range(8):
+        name = f"gi{i}"
+        p = st["ports"].get(name, {})
+        vid = access_vlan_of(st["ifvlans"].get(name, {}))
+        link = "up" if p.get("linkState") == "1" else "down"
+        admin = "SHUT" if p.get("adminState") == "2" else "up"
+        who = ", ".join(users.get(None if vid == "1" else vid, [])) or "-"
+        print(f"  {name:<6}{t.panel_label(name):<8}{link:<7}{admin:<7}"
+              f"{vid:<7}{who}")
+    print(f"  {DIM}'admin SHUT' is the cold-boot default - a port picked here "
+          f"is enabled for you.{OFF}")
+    while True:
+        try:
+            ans = input("\n  ports (e.g. 0, or gi0,GE1/3; ENTER cancels): ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not ans.strip():
+            return None
+        ports, err = parse_ports(ans)
+        if ports:
+            return ports
+        print(f"  {RED}{err}{OFF}")
+
+
+def check_vlan(vid):
+    """Refuse the VLAN ids that cannot mean what the caller intends."""
+    if not str(vid).isdigit() or not 1 <= int(vid) <= 4094:
+        return f"{vid} is not a VLAN id (1-4094)"
+    v = int(vid)
+    if v == 1:
+        return ("VLAN 1 is the default flat network - every front port is "
+                "already in it. Attach the VM untagged instead:\n"
+                f"    qm set <vmid> --netN virtio,bridge={BRIDGE}")
+    if str(v) == t.MGMT_VLAN:
+        return (f"VLAN {v} is the switch management VLAN this tool talks "
+                f"over. Using it for VM traffic puts guests on the ASIC's "
+                f"management interface.")
+    if 2350 <= v <= 2449:
+        return (f"VLAN {v} is inside the reserved band 2350-2449 (the "
+                f"expansion-module fabric; switch_util.py:290 refuses these)")
+    return None
+
+
+def carried_on_backplane(row, vid):
+    """Does te2 pass VLAN vid to the host?
+
+    The one thing that is genuinely unknown until you read it. Under NFVIS,
+    switch-confd sets te2 to trunk 2-2349,2363,2450-4093 at every startup
+    (switch_interfaces.py:2449). We do not run switch-confd, so te2 sits at
+    whatever the firmware defaults to after a cold boot - which does carry
+    2363, because that is how this session works, but whether it carries an
+    arbitrary user VLAN is a fact about the firmware and not something to
+    assume. Hence: read it, say what was found, and only write when asked.
+
+    Returns (True/False/None, human explanation). None means the mode is one
+    this cannot reason about.
+    """
+    vid = str(vid)
+    mode = (row.get("switchportModeAdmin") or "").strip()
+    name = t.SWPORT_MODE.get(mode, f"mode {mode or '?'}")
+    if mode == TRUNK:
+        members = row.get("trunkMemberVLANs") or ""
+        native = (row.get("trunkNativeVID") or "").strip()
+        ok = int(vid) in t.vlan_list_parse(members) or native == vid
+        return ok, f"trunk, members {members or '-'}, native {native or '-'}"
+    if mode == GENERAL:
+        tagged = row.get("generalTaggedVLANs") or ""
+        ok = int(vid) in t.vlan_list_parse(tagged)
+        return ok, f"general, tagged {tagged or '-'}"
+    if mode == ACCESS:
+        pvid = (row.get("accessPVID") or "").strip()
+        return pvid == vid, f"access VLAN {pvid or '-'}"
+    return None, name
+
+
+def fix_backplane(sw, row, vid):
+    """Add vid to te2's VLAN list, preserving everything already there.
+
+    Every one of these writes is action="set" on the WHOLE list, so sending
+    just the new id would drop te2 out of every VLAN it was in - including
+    2363, which is this session. Merge, never replace. The mode is left
+    alone for the same reason: te2 is the one port whose misconfiguration
+    can only be undone by pulling the power cord.
+    """
+    mode = (row.get("switchportModeAdmin") or "").strip()
+    if mode == TRUNK:
+        merged = t.vlan_list_add(row.get("trunkMemberVLANs"), vid)
+        return sw.set_vlan_interface("te2", trunk_members=merged), \
+            ("trunkMemberVLANs", merged)
+    if mode == GENERAL:
+        merged = t.vlan_list_add(row.get("generalTaggedVLANs"), vid)
+        return sw.set_vlan_interface("te2", tagged=merged), \
+            ("generalTaggedVLANs", merged)
+    raise t.SwitchError(
+        f"te2 is in {t.SWPORT_MODE.get(mode, mode)} mode - refusing to guess "
+        f"how to add a VLAN to it. Set it to trunk or general first, from a "
+        f"console session you can afford to lose.")
+
+
+def write_backplane_replay(field, value, path=None):
+    """Persist te2's membership so a cold boot gets it back.
+
+    encs-switch-tui --save deliberately skips te1-te4 (a replayed per-port
+    setting on a backplane port broke management on EVERY boot once - see
+    FINDINGS "Two ways to hang the switch"). That exclusion is right for
+    speed/duplex/LLDP and wrong for the one field VM traffic depends on, so
+    this file is written separately, holds nothing but VLAN membership on
+    te2, and sorts straight after 25-vlan-ports.xml. Delete it and the only
+    thing lost is VM connectivity after a power cut.
+    """
+    path = path or t.CFG_DIR
+    os.makedirs(path, exist_ok=True)
+    f = os.path.join(path, "26-backplane-vlans.xml")
+    with open(f, "w") as fh:
+        fh.write("<?xml version='1.0' encoding='utf-8'?>\n"
+                 "<DeviceConfiguration>\n    <version>1.0</version>\n"
+                 '    <VLANInterfaceISList action="set">\n'
+                 "        <Entry><interfaceName>te2</interfaceName>"
+                 f"<{field}>{value}</{field}></Entry>\n"
+                 "    </VLANInterfaceISList>\n</DeviceConfiguration>\n")
+    return f
+
+
+def prune_backplane_replay(vid, path=None):
+    """Take a deleted VLAN out of 26-backplane-vlans.xml.
+
+    Deleting a VLAN and leaving its id in the file that replays te2's trunk
+    means the next cold boot puts it back - a member VLAN that no longer
+    exists, replayed onto the port carrying the management session. Harmless
+    in practice, but it is exactly the kind of stale config that makes the
+    next person distrust the whole directory.
+
+    Only the FILE is pruned. te2 keeps the VLAN in RAM until the next power
+    cycle, deliberately: removing it means another write to the port this
+    session depends on, to gain nothing - a trunked VLAN no port is in
+    forwards nothing.
+
+    Returns (action, remaining) - action is "deleted", "rewritten" or None.
+    """
+    path = path or t.CFG_DIR
+    f = os.path.join(path, "26-backplane-vlans.xml")
+    if not os.path.exists(f):
+        return None, None
+    try:
+        root = ET.parse(f).getroot()
+        entry = root.find(".//Entry")
+        field = next((e.tag for e in entry
+                      if e.tag != "interfaceName"), None)
+        current = entry.findtext(field) or ""
+    except (ET.ParseError, OSError, StopIteration, TypeError, AttributeError):
+        return None, None
+
+    remaining = t.vlan_list_remove(current, vid)
+    # Nothing but VLAN 1 and the management VLAN left? Then the file is
+    # replaying the firmware default and has no reason to exist.
+    if not (t.vlan_list_parse(remaining) - {1, int(t.MGMT_VLAN)}):
+        os.remove(f)
+        return "deleted", remaining
+    write_backplane_replay(field, remaining, path)
+    return "rewritten", remaining
+
+
+def switch_state(sw):
+    """Everything the switch side needs, read once."""
+    snap = sw.port_snapshot()
+    return {"ports": {p["interfaceName"]: p for p in snap["ports"]},
+            "vlans": t._try(sw.vlans, []) or [],
+            "ifvlans": {r["interfaceName"]: r
+                        for r in (t._try(sw.vlan_interfaces, []) or [])}}
+
+
+def access_vlan_of(row):
+    mode = (row.get("switchportModeAdmin") or "").strip()
+    if mode == ACCESS:
+        return (row.get("accessPVID") or "").strip() or "1"
+    if mode == GENERAL:
+        return (row.get("generalPVID") or "").strip() or "1"
+    if mode == TRUNK:
+        return (row.get("trunkNativeVID") or "").strip() or "1"
+    return "?"
+
+
+# ================================================================ commands
+def fit(items, width):
+    """Join what fits, then say how many are left.
+
+    All eight jacks in one VLAN is the DEFAULT state of this switch, so the
+    common case is the one that overflows the column and shunts every row
+    after it out of alignment.
+    """
+    if not items:
+        return "-"
+    out = []
+    for i, x in enumerate(items):
+        rest = len(items) - i
+        tail = f" +{rest}" if rest else ""
+        cand = " ".join(out + [x])
+        if len(cand) + (len(tail) - (4 if rest == 1 else 0)) > width:
+            return " ".join(out) + f" +{rest}" if out else x[:width]
+        out.append(x)
+    return " ".join(out)
+
+
+def cmd_status(args):
+    say("Host")
+    bp = backplane_nic()
+    print(f"  backplane NIC : {bp}   {DIM}(X710 function .1 = te2){OFF}")
+    if iface_exists(BRIDGE):
+        members = bridge_members(BRIDGE)
+        ok = bp in members
+        print(f"  {BRIDGE:<14}: up, ports {', '.join(members) or 'none'} "
+              f"{GREEN + 'OK' + OFF if ok else RED + 'backplane NOT a member' + OFF}")
+    else:
+        print(f"  {BRIDGE:<14}: {YELLOW}does not exist{OFF} - run "
+              f"'encs-switch-vnet init'")
+    rc, out = run(["ip", "-br", "addr", "show", MGMT_IF])
+    print(f"  {MGMT_IF:<14}: {out.strip() if rc == 0 else RED + 'missing' + OFF}")
+
+    users = vm_users()
+    say("Switch")
+    sw = t.Switch()
+    try:
+        sw.login()
+        st = switch_state(sw)
+    except t.SwitchError as e:
+        print(f"  {RED}unreachable: {e}{OFF}")
+        print("  the switch side cannot be shown; the host side above is real")
+        return 1
+
+    te2 = st["ifvlans"].get("te2", {})
+    _, how = carried_on_backplane(te2, "1")
+    print(f"  te2 (backplane): {how}")
+    print()
+    print(f"  {'VLAN':<6}{'name':<13} {'front ports':<32}"
+          f"{'attach with':<30}VMs")
+    vlan_names = {v["VLANID"]: v.get("VLANName") or "" for v in st["vlans"]}
+    seen = set()
+    rows = []
+    for vid in sorted(vlan_names, key=lambda v: int(v)):
+        # Panel numbers, not gi names: this is the column you read with a
+        # cable in your hand. '*' is link, 'x' is administratively shut -
+        # the two states that explain "the VLAN is right and nothing works".
+        ports = []
+        for name, row in sorted(st["ifvlans"].items()):
+            if name.startswith("gi") and access_vlan_of(row) == vid:
+                p = st["ports"].get(name, {})
+                mark = "*" if p.get("linkState") == "1" else (
+                    "x" if p.get("adminState") == "2" else " ")
+                ports.append((t.panel_label(name).replace("GE", "")
+                              + mark).rstrip())
+        seen.add(vid)
+        rows.append((vid, vlan_names[vid], ports))
+    for vid, name, ports in rows:
+        if vid == t.MGMT_VLAN:
+            attach = "management - do not use"
+            who = ""
+        elif vid == "1":
+            attach = f"bridge={BRIDGE}"
+            who = ", ".join(users.get(None, [])) or "-"
+        else:
+            attach = f"bridge={BRIDGE},tag={vid}"
+            who = ", ".join(users.get(vid, [])) or "-"
+        print(f"  {vid:<6}{name[:12]:<13} {fit(ports, 31):<32}"
+              f"{attach:<30}{who}")
+    stray = {k: v for k, v in users.items()
+             if k is not None and k not in seen}
+    for tag, who in sorted(stray.items()):
+        print(f"  {RED}{tag:<6}{'NO SUCH VLAN':<13} {'-':<32}"
+              f"{'bridge=' + BRIDGE + ',tag=' + tag:<30}{', '.join(who)}{OFF}")
+    print(f"  {DIM}front ports: 1/0 = GE1/0 · * link up · x disabled{OFF}")
+    if stray:
+        warn("those VMs are tagged into a VLAN the switch does not have - "
+             "their traffic goes nowhere. Create it: encs-switch-vnet add "
+             f"{sorted(stray)[0]} --ports gi0")
+    sw.logout()
+    return 0
+
+
+def cmd_init(args):
+    bp = backplane_nic()
+    say(f"Planning {BRIDGE} on {bp}")
+
+    if not os.path.exists(IFACES):
+        sys.exit(f"ERROR: {IFACES} does not exist - this does not look like "
+                 f"a Debian/Proxmox host.")
+
+    old_main = read(IFACES)
+    vnets = parse_vnets(old_main)
+    # install.sh's own stanzas for these are superseded by the block below.
+    # Commented rather than deleted so the addresses that were working stay
+    # readable, and so teardown can put them back verbatim.
+    new_main, touched = comment_out_legacy(old_main, {bp, MGMT_IF, BRIDGE})
+    new_main, replaced = upsert_block(new_main, render_managed(bp, vnets))
+
+    # Label the management bridge, but only as part of creating this one:
+    # the note tells people to use BRIDGE instead, which is only true once
+    # BRIDGE exists. Removed again by teardown.
+    mgmt_br = mgmt_bridge()
+    new_main, labelled = add_mgmt_comment(new_main, mgmt_br,
+                                          mgmt_comment(BRIDGE))
+
+    d = diff(old_main, new_main, IFACES)
+    if not d:
+        print(f"  nothing to do - {IFACES} already has {BRIDGE}")
+        return 0
+    print()
+    for line in d.splitlines():
+        col = GREEN if line.startswith("+") else (
+            RED if line.startswith("-") else DIM)
+        print(f"  {col}{line}{OFF}")
+    if touched:
+        print(f"\n  {', '.join(touched)} moved from {IFACES} onto {BRIDGE}")
+    if labelled:
+        print(f"  {mgmt_br} gets a comment saying guests belong on {BRIDGE}"
+              f"  {DIM}(Proxmox shows it as that interface's comment){OFF}")
+    elif mgmt_br is None:
+        print(f"  {DIM}no bridge carries the default route - skipping the "
+              f"management-interface comment{OFF}")
+
+    if not args.yes:
+        print(f"\n  Nothing written. Re-run with --yes to apply, then:\n"
+              f"      ifreload -a\n"
+              f"  {YELLOW}That drops the switch management session for a "
+              f"moment{OFF} (not your Proxmox session - that is on the MGMT "
+              f"CPU jack and does not go near the ASIC).")
+        return 0
+
+    if staged_gui_changes() and not getattr(args, "force", False):
+        sys.exit(
+            f"ERROR: {IFACES_NEW} exists - the Proxmox GUI has network "
+            f"changes staged.\n"
+            f"       Pressing 'Apply Configuration' there would copy that "
+            f"file over\n"
+            f"       {IFACES} and undo half of what this writes, which is "
+            f"worse than\n"
+            f"       undoing all of it. Apply or discard them first (Node -> "
+            f"System ->\n"
+            f"       Network -> Apply Configuration / Revert), then re-run. "
+            f"--force overrides.")
+
+    dest = backup([IFACES])
+    with open(IFACES, "w") as f:
+        f.write(new_main)
+    print(f"\n  {'replaced' if replaced else 'added'} the {BRIDGE} block "
+          f"in {IFACES}")
+    print(f"  backup in {dest}")
+    if args.reload:
+        say("ifreload -a")
+        rc, out = run(["ifreload", "-a"])
+        print(out or "  (no output)")
+        if rc != 0:
+            warn("ifreload failed - fix the config before rebooting, or the "
+                 "switch management VLAN will not come back")
+            return 1
+        rc, out = run(["ping", "-c2", "-W2", t.SW_IP])
+        print(f"  switch {t.SW_IP}: "
+              + (GREEN + "reachable" + OFF if rc == 0
+                 else RED + "NOT reachable" + OFF))
+    else:
+        print("\n  next:  ifreload -a")
+        # install.sh brings sw2363 up on the bare NIC before this runs, and
+        # ifupdown2 will not always re-parent a VLAN device that is already
+        # there. If it does not, the switch stops answering and everything
+        # looks broken for a reason that takes an hour to find.
+        if iface_exists(MGMT_IF):
+            print(f"         {DIM}{MGMT_IF} is already up on the bare NIC. If "
+                  f"the switch stops answering\n"
+                  f"         after ifreload, re-parent it by hand:  "
+                  f"ip link del {MGMT_IF} ; ifreload -a{OFF}")
+    return 0
+
+
+def cmd_teardown(args):
+    """Give the backplane NIC back and put the management VLAN on it.
+
+    The switch side is left exactly as it is: front ports keep their VLANs,
+    and /etc/encs-switch keeps replaying them. Tearing down the bridge is a
+    statement about where VM traffic goes on THIS host, not about how the
+    switch is configured - and a teardown that silently reset eight ports to
+    VLAN 1 would be a nasty surprise for anyone with cables in them.
+    """
+    old_main = read(IFACES)
+    named = parse_vnets(old_main)
+    if BEGIN not in old_main and not named and not iface_exists(BRIDGE):
+        print(f"  nothing to tear down - {IFACES} has no {BRIDGE}")
+        return 0
+    # Every bridge this file owns, not just swbr0: a VM on a named per-VLAN
+    # bridge loses its network just as thoroughly.
+    attached = set()
+    for br in [BRIDGE] + [n for n, _ in named]:
+        for lst in vm_users(br).values():
+            attached.update(lst)
+    attached = sorted(attached)
+    if attached and not args.force:
+        sys.exit(f"ERROR: these VMs are on {BRIDGE}: {', '.join(attached)}\n"
+                 f"       They lose their network when the bridge goes. Move "
+                 f"them first, or pass --force.")
+
+    say(f"Removing {BRIDGE}, putting {MGMT_IF} back on the backplane NIC")
+    new_main, found = remove_block(old_main)
+    if not found:
+        # The markers are gone, so the Proxmox GUI has rewritten this file
+        # since init ran. The stanzas themselves survive that, so take them
+        # out by name instead.
+        new_main, gone = strip_ifaces(
+            new_main, {BRIDGE, MGMT_IF} | {n for n, _ in named})
+        if gone:
+            print(f"  markers gone (the GUI rewrote {IFACES}) - removed "
+                  f"{', '.join(gone)} by name")
+    new_main, restored = uncomment_legacy(new_main)
+    # The comment on the management bridge says "use BRIDGE instead", which
+    # stops being true the moment BRIDGE goes.
+    new_main, unlabelled = remove_mgmt_comment(new_main, mgmt_comment(BRIDGE))
+    if unlabelled:
+        print(f"  removing the management-interface comment about {BRIDGE}")
+    if not restored:
+        bp = backplane_nic()
+        warn(f"no commented stanza to restore in {IFACES} - writing a fresh "
+             f"one for {MGMT_IF} on {bp}")
+        new_main = old_main + plain_mgmt_stanzas(bp)
+    else:
+        print(f"  restoring {', '.join(restored)}")
+
+    d = diff(old_main, new_main, IFACES)
+    if d:
+        print()
+        for line in d.splitlines():
+            col = GREEN if line.startswith("+") else (
+                RED if line.startswith("-") else DIM)
+            print(f"  {col}{line}{OFF}")
+    if named:
+        print(f"  the named bridges go too: "
+              f"{', '.join(n for n, _ in named)}")
+
+    if not args.yes:
+        print(f"\n  Nothing written. Re-run with --yes to apply, then:\n"
+              f"      ifreload -a")
+        return 0
+
+    if staged_gui_changes() and not getattr(args, "force", False):
+        sys.exit(
+            f"ERROR: {IFACES_NEW} exists - the Proxmox GUI has network "
+            f"changes staged.\n"
+            f"       Pressing 'Apply Configuration' there would copy that "
+            f"file over\n"
+            f"       {IFACES} and undo half of what this writes, which is "
+            f"worse than\n"
+            f"       undoing all of it. Apply or discard them first (Node -> "
+            f"System ->\n"
+            f"       Network -> Apply Configuration / Revert), then re-run. "
+            f"--force overrides.")
+
+    dest = backup([IFACES])
+    with open(IFACES, "w") as f:
+        f.write(new_main)
+    print(f"\n  {BRIDGE} removed from {IFACES}")
+    print(f"  backup in {dest}")
+    print("\n  next:  ifreload -a")
+    # Same trap as init, mirrored: the VLAN device is currently a child of
+    # the bridge, and ifupdown2 will not always re-parent it back.
+    print(f"         {DIM}if the switch stops answering after that: "
+          f"ip link del {MGMT_IF} ; ifreload -a{OFF}")
+    print(f"  {DIM}the switch keeps its VLANs and front-port assignments - "
+          f"only this host's bridge is gone{OFF}")
+    return 0
+
+
+def cmd_add(args):
+    err = check_vlan(args.vlan)
+    if err:
+        sys.exit(f"ERROR: {err}")
+    vid = str(int(args.vlan))
+    ports = None
+    if args.ports:
+        ports, err = parse_ports(args.ports)
+        if err:
+            sys.exit(f"ERROR: {err}")
+    elif not sys.stdin.isatty():
+        sys.exit("ERROR: --ports is required when there is no terminal to "
+                 "pick from, e.g. --ports gi0")
+
+    sw = t.Switch()
+    try:
+        sw.login()
+        st = switch_state(sw)
+    except t.SwitchError as e:
+        sys.exit(f"ERROR: {e}\n  Is the bootstrap VM running? "
+                 f"ip -br addr show {MGMT_IF}; ping {t.SW_IP}")
+
+    if ports is None:
+        say(f"Which front ports should VLAN {vid} reach?")
+        ports = pick_ports(st, vm_users())
+        if not ports:
+            print("  cancelled - nothing written")
+            sw.logout()
+            return 0
+
+    # Moving a jack out of a VLAN a VM is using breaks that VM, quietly and
+    # immediately. Say so before the write rather than after.
+    for p in ports:
+        was = access_vlan_of(st["ifvlans"].get(p, {}))
+        if was not in ("1", vid, "?"):
+            users_there = vm_users().get(was, [])
+            warn(f"{t.panel_label(p)} is leaving VLAN {was}"
+                 + (f", which {', '.join(users_there)} still use"
+                    if users_there else ""))
+
+    say(f"VLAN {vid} -> {', '.join(t.panel_label(p) for p in ports)}")
+    sw.vlan(vid, True, args.name)
+    print(f"  VLAN {vid} exists{' (' + args.name + ')' if args.name else ''}")
+
+    for p in ports:
+        # A cold-booted ASIC has every front port SHUT, so a port assigned to
+        # a VLAN and left disabled is the most likely "it does not work".
+        if (st["ports"].get(p, {}).get("adminState") or "") == "2":
+            sw.set_port_admin(p, True)
+            print(f"  {p} ({t.panel_label(p)}) enabled - it was shut")
+        sw.set_vlan_interface(p, mode=ACCESS, access_pvid=vid)
+        print(f"  {p} ({t.panel_label(p)}) access VLAN {vid}")
+
+    # The half that is easy to forget and impossible to guess from the host.
+    te2 = st["ifvlans"].get("te2", {})
+    ok, how = carried_on_backplane(te2, vid)
+    if ok:
+        print(f"  te2 already carries VLAN {vid}  {DIM}({how}){OFF}")
+    elif args.fix_backplane:
+        _, (field, merged) = fix_backplane(sw, te2, vid)
+        print(f"  te2 {field} -> {merged}")
+        f = write_backplane_replay(field, merged)
+        print(f"  wrote {f}  {DIM}(so a cold boot gets it back){OFF}")
+    else:
+        warn(f"te2 does not carry VLAN {vid} ({how}).")
+        print(f"    The front port is now in VLAN {vid} but nothing from the "
+              f"host reaches it.\n"
+              f"    Re-run with --fix-backplane to add it, or set it by hand "
+              f"in the TUI.\n"
+              f"    {DIM}te2 is the link this management session rides on; "
+              f"the write merges into\n    its existing VLAN list rather than "
+              f"replacing it, but read the warning\n    in FINDINGS before "
+              f"doing it blind.{OFF}")
+
+    if args.named_bridge:
+        # Regenerating the managed file without init having run would move
+        # sw2363 onto a bridge while install.sh's stanza still claims it in
+        # /etc/network/interfaces - two definitions, and ifupdown2 rejects
+        # the lot. The switch side above is already done; only the bridge is
+        # deferred.
+        if BEGIN not in read(IFACES):
+            warn(f"{args.named_bridge} not created: run 'encs-switch-vnet "
+                 f"init --yes' first, then re-run this with --named-bridge.")
+        elif len(args.named_bridge) > 15:
+            warn(f"'{args.named_bridge}' is longer than the 15-char kernel "
+                 f"interface name limit - not created.")
+        else:
+            main = read(IFACES)
+            vnets = parse_vnets(main)
+            # One bridge per VLAN and one VLAN per bridge: re-running with a
+            # new name replaces the old entry rather than stacking a second
+            # bridge on the same swbr0.<vid> device.
+            vnets = [(n, v) for n, v in vnets
+                     if v != vid and n != args.named_bridge]
+            vnets.append((args.named_bridge, vid))
+            block = render_managed(backplane_nic(),
+                                   sorted(vnets, key=lambda x: int(x[1])))
+            new_main, _ = upsert_block(main, block)
+            backup([IFACES])
+            with open(IFACES, "w") as f:
+                f.write(new_main)
+            print(f"  {args.named_bridge} added to {IFACES} - "
+                  f"run 'ifreload -a'")
+            args.attach_bridge = args.named_bridge
+
+    if not args.no_save:
+        say("Saving switch config (survives a cold boot)")
+        for f in t.save_config(sw):
+            print("  wrote", f)
+    sw.logout()
+
+    say("Attach a VM")
+    # Only offer the named bridge if it actually got written; otherwise the
+    # printed command would name an interface that does not exist.
+    attach = (f"bridge={getattr(args, 'attach_bridge', None)}"
+              if getattr(args, "attach_bridge", None)
+              else f"bridge={BRIDGE},tag={vid}")
+    print(f"  qm set <vmid> --net1 virtio,{attach}")
+    # The GUI's Create VM -> Network tab has exactly these two fields, and
+    # that is where most people will do this.
+    if getattr(args, "attach_bridge", None):
+        print(f"  {DIM}or in the GUI: Bridge = {args.attach_bridge}{OFF}")
+    else:
+        print(f"  {DIM}or in the GUI: Bridge = {BRIDGE}, "
+              f"VLAN Tag = {vid}{OFF}")
+    print(f"  {DIM}anything on that vNIC now arrives on "
+          f"{', '.join(t.panel_label(p) for p in ports)}{OFF}")
+    return 0
+
+
+def cmd_remove(args):
+    vid = str(args.vlan)
+    sw = t.Switch()
+    try:
+        sw.login()
+        st = switch_state(sw)
+    except t.SwitchError as e:
+        sys.exit(f"ERROR: {e}")
+
+    if args.ports:
+        ports = [norm_port(p) for p in args.ports.split(",")]
+        if None in ports:
+            sys.exit("ERROR: bad port name")
+    else:
+        ports = [n for n, row in sorted(st["ifvlans"].items())
+                 if n.startswith("gi") and access_vlan_of(row) == vid]
+    if not ports:
+        print(f"  no front port is in VLAN {vid}")
+    users = vm_users().get(vid if vid != "1" else None, [])
+    if users and not args.force:
+        sys.exit(f"ERROR: VM(s) {', '.join(users)} are still attached to "
+                 f"VLAN {vid}. Detach them first, or --force.")
+
+    say(f"VLAN {vid}")
+    for p in ports:
+        sw.set_vlan_interface(p, mode=ACCESS, access_pvid="1")
+        print(f"  {p} ({t.panel_label(p)}) back to access VLAN 1")
+    if args.delete:
+        # te2's membership is left alone on purpose: it is shared with every
+        # other VLAN and removing one id means rewriting the whole list on
+        # the port this session depends on. A trunked VLAN that no port uses
+        # forwards nothing anyway.
+        sw.vlan(vid, create=False)
+        print(f"  VLAN {vid} deleted")
+        # The replay file is a different matter - left alone it would put a
+        # VLAN that no longer exists back on te2 at the next cold boot.
+        action, remaining = prune_backplane_replay(vid)
+        if action == "deleted":
+            print(f"  removed 26-backplane-vlans.xml  {DIM}(nothing left in "
+                  f"it but the firmware defaults){OFF}")
+        elif action == "rewritten":
+            print(f"  26-backplane-vlans.xml -> {remaining}")
+    if not args.no_save:
+        for f in t.save_config(sw):
+            print("  wrote", f)
+    sw.logout()
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="encs-switch-vnet",
+        description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="See the header of this file, or docs/FINDINGS.md, for why "
+               "the front ports are not host NICs.")
+    # One version for the whole bundle - the TUI's, which is what
+    # release.sh reads and --update compares against.
+    p.add_argument("--version", action="version",
+                   version=f"encs-switch-vnet {t.VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status", help="bridge, VLANs, front ports, VMs")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("init", help=f"create {BRIDGE} on the backplane NIC")
+    s.add_argument("--yes", action="store_true", help="write the config")
+    s.add_argument("--reload", action="store_true",
+                   help="run ifreload -a afterwards")
+    s.add_argument("--force", action="store_true",
+                   help="write even if the Proxmox GUI has staged network "
+                        "changes (they would overwrite this)")
+    s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("teardown",
+                       help=f"remove {BRIDGE} and put {MGMT_IF} back")
+    s.add_argument("--yes", action="store_true", help="write the config")
+    s.add_argument("--force", action="store_true",
+                   help="proceed even if VMs are still attached")
+    s.set_defaults(fn=cmd_teardown)
+
+    s = sub.add_parser("add", help="put front ports in a VLAN for VMs")
+    s.add_argument("vlan")
+    s.add_argument("--ports",
+                   help="gi0,gi3 or GE1/0,GE1/3 (default: pick from a list "
+                        "of the 8 jacks, with their link state and VLAN)")
+    s.add_argument("--name", help="VLAN name on the switch")
+    s.add_argument("--named-bridge", metavar="BR",
+                   help="also create a per-VLAN bridge with this name, so it "
+                        "appears in the Proxmox GUI without typing a tag")
+    s.add_argument("--fix-backplane", action="store_true",
+                   help="add the VLAN to te2 if it is not carried (writes to "
+                        "the port this session rides on - read the warning)")
+    s.add_argument("--no-save", action="store_true",
+                   help="do not update /etc/encs-switch (cold boot loses it)")
+    s.set_defaults(fn=cmd_add)
+
+    s = sub.add_parser("remove", help="put front ports back in VLAN 1")
+    s.add_argument("vlan")
+    s.add_argument("--ports", help="default: every port in that VLAN")
+    s.add_argument("--delete", action="store_true", help="delete the VLAN too")
+    s.add_argument("--force", action="store_true",
+                   help="proceed even if a VM is attached")
+    s.add_argument("--no-save", action="store_true")
+    s.set_defaults(fn=cmd_remove)
+
+    args = p.parse_args()
+    try:
+        sys.exit(args.fn(args))
+    except t.SwitchError as e:
+        sys.exit(f"ERROR: {e}")
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

@@ -203,11 +203,20 @@ bash /root/encs-host/install.sh
 Either way, `install.sh` does the rest: finds the X710 backplane port **by
 driver rather than by name** (it is `enp8s0f1np1` on one box and something else
 on the next), creates the `sw2363` VLAN interface at `169.254.1.1/16` with MTU
-9216, persists it to `/etc/network/interfaces`, installs `encs-switch-tui` and
-`encs-switch-api` into `/usr/local/sbin`, enables the config-replay unit, and
-pings the switch to confirm.
+9216, persists it to `/etc/network/interfaces`, installs `encs-switch-tui`,
+`encs-switch-api` and `encs-switch-vnet` into `/usr/local/sbin`, enables the
+config-replay unit, and pings the switch to confirm.
 
-It is idempotent — safe to re-run, and it skips anything already in place.
+Then it **offers** to create `swbr0`, the bridge that puts VM traffic on the 8
+front LAN ports instead of on your management NIC — explaining what changes
+before you answer. Saying no costs nothing: `encs-switch-vnet init` does the
+same thing whenever you want it, and you can equally build the bridge by hand.
+The prompt is skipped entirely when stdin is not a terminal, or with
+`ENCS_NO_VNET=1`, so an unattended install never rearranges the network on its
+own. See [below](#putting-vms-on-the-front-lan-ports-the-nfvis-lan-net-model).
+
+It is idempotent — safe to re-run, and it skips anything already in place. Once
+`swbr0` exists, re-running it leaves the network config alone entirely.
 
 **5. Manage the switch**
 
@@ -264,6 +273,7 @@ and the table says which one applies.
 | Port description, speed, duplex, flow control | Ports view, `ENTER` | **data plane** (speed + duplex forced on a live link) |
 | VLAN create/delete/rename | VLANs view, `n` / `d` / `N` | **on hardware** |
 | VLAN port membership | VLANs view, `ENTER` — access, trunk or general | **data plane** (isolation measured) |
+| VM networks — bridge on the backplane, jack per VLAN | `TAB` → vnet, or `encs-switch-vnet` | **on hardware** (bridge built and `GE1/0` moved to a tagged VLAN on a live 5412; no VM traffic pushed through it yet) |
 | PoE on/off | PoE view, `space` | **data plane** (two PDs, 7.5 W) |
 | PoE per-port power limit | PoE view, `ENTER` | **data plane** (enforced at classification) |
 | Port mirroring (local SPAN) | `TAB` → mirror | **data plane** (copies counted) |
@@ -462,6 +472,118 @@ and `LAGID` on the port's own `Standard802_3List` entry, which is exactly what
 Cisco's `switch-confd` sent for `channel-group`. See
 [docs/CONFIG.md](docs/CONFIG.md) for the file format and
 [docs/FINDINGS.md](docs/FINDINGS.md) for how it was derived.
+
+### Putting VMs on the front LAN ports (the NFVIS `lan-net` model)
+
+Out of the box a Proxmox VM lands on `vmbr0`, which is the **MGMT CPU** jack —
+so guest traffic shares the one interface you manage the hypervisor over. That
+is not what NFVIS does, and it is not necessary here either.
+
+**How NFVIS actually does it.** Its `lan-br` — the bridge behind the `lan-net`
+network you pick when creating a VM — has exactly one physical port, `int-LAN`,
+which is the X710 backplane function that lands on `te2`. The `GE1/x` jacks are
+*not* bridge members and do not appear in NFVIS's network model at all; they are
+switch ports sitting in access VLAN 1. A VM reaches `GE1/0` purely because its
+frames leave `te2` in a VLAN that `gi0` is also in. Two independent halves, both
+of which this project can already drive. See
+[docs/FINDINGS.md §8n](docs/FINDINGS.md) for the extracted configs that prove it.
+
+So the equivalent on Proxmox is one VLAN-aware bridge on the backplane NIC.
+There are three ways in, all doing the same thing: `install.sh` offers it at
+the end, the TUI has it under `TAB` → **vnet** (`n` creates it, `D` removes it,
+`ENTER` assigns a jack), or from a shell:
+
+```sh
+encs-switch-vnet init          # shows the plan, writes nothing
+encs-switch-vnet init --yes    # write it, then: ifreload -a
+```
+
+Nothing about this is privileged — it is an ordinary `bridge-vlan-aware yes`
+stanza plus a VLAN on the ASIC. If you would rather hand-roll your own bridge
+over the backplane NIC and set the front-port VLANs in the TUI, that works
+exactly as well; the tool exists to keep the two halves consistent and to save
+the switch side for replay.
+
+That creates `swbr0` with the backplane NIC as its only port — Proxmox's
+`lan-br` — and **moves `sw2363` onto the bridge**, which is required: once the
+NIC is a bridge port, a VLAN subinterface of the NIC receives nothing.
+
+The stanzas go in `/etc/network/interfaces`, between markers, because **Proxmox
+reads nothing else** — its own generated header says it "will NOT read its
+network configuration from sourced files", so a bridge in `interfaces.d` would
+never appear in the GUI or in the VM Bridge dropdown ([docs/FINDINGS.md
+§8n](docs/FINDINGS.md)). `teardown` removes the block again, falling back to
+matching interfaces by name if a GUI network change has since rewritten the
+file and dropped the markers.
+
+Your Proxmox management interface keeps every setting it has. The only mark
+`init` leaves there is a **comment line** on the bridge carrying the default
+route — found by looking, not by assuming it is called `vmbr0` — which Proxmox
+shows as that interface's comment: *"Proxmox management and the bootstrap VM.
+Attach guests to `swbr0` instead."* `teardown` removes it again. That is the
+cheap version of renaming `vmbr0`, without rewriting every guest config or
+risking the one interface you manage the host over.
+
+Then give a jack to a VM:
+
+```sh
+encs-switch-vnet add 100 --ports gi0 --name dmz --fix-backplane
+qm set 901 --net1 virtio,bridge=swbr0,tag=100
+```
+
+`--fix-backplane` is not optional on this platform for a *tagged* VLAN — see
+the note below. Leave it off and `add` tells you what it would have done.
+
+or, in the GUI's **Create VM → Network** tab, the same two fields it already
+has: **Bridge** = `swbr0`, **VLAN Tag** = `100`. That dropdown shows each
+bridge's comment, which is where the label on `vmbr0` earns its keep — the
+distinction is in front of you at the moment you pick.
+
+`add` creates VLAN 100 on the ASIC, makes `GE1/0` an access port in it, enables
+the port if a cold boot left it shut, and saves `/etc/encs-switch/*.xml` so the
+replay service restores all of it after a power cut. `--ports gi0,gi3` puts
+several jacks in the same VLAN; `--named-bridge dmz` also creates a per-VLAN
+bridge so the network shows up by name in the Proxmox GUI instead of needing a
+tag typed in.
+
+Untagged is VLAN 1, which every front port is in by default — the direct
+equivalent of NFVIS's stock `lan-net`:
+
+```sh
+qm set 901 --net1 virtio,bridge=swbr0        # all 8 LAN ports, flat
+```
+
+`encs-switch-vnet status` — and the TUI's **vnet** view — shows both halves at
+once, including which VM is on which VLAN and which front ports that VLAN
+reaches, and flags a VM tagged into a VLAN the switch does not have, which
+otherwise looks like a broken NIC.
+
+**Changed your mind?** `encs-switch-vnet teardown` (or `D` in the vnet view)
+puts `sw2363` back on the bare NIC and deletes the bridge, restoring the exact
+stanzas `install.sh` wrote — it refuses while a VM is still attached, and
+leaves the *switch* untouched, so front-port VLANs and their replay files
+survive. VMs go back to `vmbr0`.
+
+One caveat on isolation, since Proxmox differs from NFVIS here: a plain Linux
+bridge is visible to anyone who can edit a VM's hardware, so nothing stops a VM
+being put on `vmbr0` alongside the hypervisor and the bootstrap VM. NFVIS could
+hide its internal networks; Proxmox has no per-bridge ACL for ordinary bridges
+(SDN VNets do sit under the permission system, but that is a heavier setup). On
+a single-admin box the practical answer is that `swbr0` is obviously named and
+a VM on the wrong bridge simply gets the wrong network.
+
+> **Tagged VLANs need one extra step, measured on hardware.** `te2` has to
+> carry the VLAN for any of this to work, and its firmware default is exactly
+> `trunk, members 1,2363` — VLAN 1 and the management VLAN, nothing else.
+> (Under NFVIS `switch-confd` widens that at every startup; we do not run it.)
+> So **untagged works out of the box** — that is switch VLAN 1, every front
+> jack, stock `lan-net`. Any *tagged* VLAN needs `--fix-backplane`, which merges
+> the new id into `te2`'s list rather than replacing it. That write lands on
+> the port your management session rides on, so read the warning it prints.
+
+The bootstrap VM stays on `vmbr0`. It carries no traffic, and putting the
+machine that boots the switch behind the switch is exactly the dependency loop
+to avoid.
 
 ### Updating the host tools
 
@@ -712,6 +834,8 @@ scripts/
   30-build-iso.sh             trim, regenerate repodata, remaster
   40-build-qcow2.sh           run the install under QEMU/KVM
   50-verify-qcow2.py          boot the result and assert its state
+  60-test-tui.py              offline tests for the TUI and the config files
+  64-test-vnet.py             offline tests for encs-switch-vnet
   release.sh                  package + publish the host tools to GitHub
 kickstart/ks-encs.cfg         the kickstart, heavily commented
 payload/                      our code, installed into the image
@@ -721,6 +845,7 @@ payload/                      our code, installed into the image
     install.sh                             host installer
     encs-switch-tui                        curses UI, built-in manual
     encs-switch-api                        low-level XML API client
+    encs-switch-vnet                       VM <-> front-port networks
     encs-switch-replay.service             cold-boot config replay
 docs/
   FINDINGS.md                 the full reverse-engineering writeup

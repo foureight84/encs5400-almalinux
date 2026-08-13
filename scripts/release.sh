@@ -35,6 +35,8 @@ say "Releasing $NAME"
 # --- sanity checks before anything is packaged ----------------------------
 command -v gh >/dev/null 2>&1 || warn "gh not installed - can build but not publish"
 python3 -m py_compile "$TUI" || die "encs-switch-tui does not compile"
+python3 -m py_compile "$BUNDLE/encs-switch-vnet" \
+    || die "encs-switch-vnet does not compile"
 bash -n "$BUNDLE/install.sh" || die "install.sh is not valid bash"
 bash -n "$BUNDLE/encs-switch-api" || die "encs-switch-api is not valid bash"
 
@@ -44,6 +46,7 @@ bash -n "$BUNDLE/encs-switch-api" || die "encs-switch-api is not valid bash"
 # Shipping a release that fails it is never right.
 say "Running the offline test suite"
 python3 "$HERE/60-test-tui.py" || die "offline tests failed - not releasing"
+python3 "$HERE/64-test-vnet.py" || die "vnet tests failed - not releasing"
 
 if git -C "$ROOT" rev-parse "$TAG" >/dev/null 2>&1; then
     die "tag $TAG already exists - bump VERSION in $TUI first"
@@ -56,6 +59,7 @@ fi
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 install -m 0755 "$BUNDLE/encs-switch-tui"           "$STAGE/"
 install -m 0755 "$BUNDLE/encs-switch-api"           "$STAGE/"
+install -m 0755 "$BUNDLE/encs-switch-vnet"          "$STAGE/"
 install -m 0755 "$BUNDLE/install.sh"                "$STAGE/"
 install -m 0644 "$BUNDLE/encs-switch-replay.service" "$STAGE/"
 install -m 0644 "$BUNDLE/README"                    "$STAGE/"
@@ -67,6 +71,7 @@ cat > "$STAGE/MANIFEST" <<'EOF'
 # mode  file                        destination
 0755    encs-switch-tui             /usr/local/sbin/encs-switch-tui
 0755    encs-switch-api             /usr/local/sbin/encs-switch-api
+0755    encs-switch-vnet            /usr/local/sbin/encs-switch-vnet
 0644    encs-switch-replay.service  /etc/systemd/system/encs-switch-replay.service
 0755    install.sh                  /opt/encs-host/install.sh
 0644    README                      /opt/encs-host/README

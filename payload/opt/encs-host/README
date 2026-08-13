@@ -31,9 +31,13 @@ install.sh will:
     (the VLAN iface CANNOT be called enp8s0f1np1.2363 — 16 chars exceeds the
     15-char IFNAMSIZ limit and ip link rejects it)
   * persist that to /etc/network/interfaces
-  * install encs-switch-tui and encs-switch-api to /usr/local/sbin
+  * install encs-switch-tui, encs-switch-api and encs-switch-vnet to
+    /usr/local/sbin
   * install and enable encs-switch-replay.service
   * verify the switch answers
+  * OFFER to create swbr0 (see below) - it explains what changes and does
+    nothing unless you answer yes. Skipped when stdin is not a terminal, or
+    with ENCS_NO_VNET=1.
 
 Then just run:
 
@@ -74,11 +78,64 @@ To update by hand instead, re-copy this directory from a newer checkout and
 re-run install.sh; it is idempotent. Or just scp encs-switch-tui over the
 installed one — it is a single stdlib-only Python script.
 
+VMs ON THE FRONT PORTS
+----------------------
+By default a Proxmox VM lands on vmbr0 - the MGMT CPU jack - so guest traffic
+shares the interface you manage the host over. NFVIS does not do that: its
+lan-br is a bridge on the 10G backplane (int-LAN = te2), and a VM reaches a
+GE1/x jack because its frames leave te2 in a VLAN that jack is in. Nothing
+attaches a VM to a switch port directly; the front ports are not host NICs.
+
+encs-switch-vnet builds the same thing here - one VLAN-aware bridge on the
+backplane NIC, plus the VLAN on the ASIC. install.sh offers to run the first
+step for you; these do it later, or again:
+
+    encs-switch-vnet init                  plan the bridge (writes nothing)
+    encs-switch-vnet init --yes            write it, then: ifreload -a
+    encs-switch-vnet add 100               pick jacks from a list
+    encs-switch-vnet add 100 --ports gi0   or name them: VLAN 100 -> GE1/0
+    qm set 901 --net1 virtio,bridge=swbr0,tag=100
+    encs-switch-vnet status                both halves, and which VM is where
+    encs-switch-vnet teardown              undo it - VMs go back to vmbr0
+
+The TUI has the same thing under TAB -> vnet: n creates the bridge, D removes
+it, ENTER assigns a front jack to the selected VLAN. Both print the diff of
+/etc/network/interfaces and write nothing until you confirm; neither runs
+'ifreload -a' for you.
+
+The stanzas live in /etc/network/interfaces itself, between markers. Proxmox
+does not read sourced files - its own header says so - so a bridge in
+interfaces.d would be invisible to the GUI and unpickable when creating a VM.
+Every stanza carries a '#' comment line, which is what the GUI shows in that
+interface's Comment column.
+
+Teardown leaves the SWITCH alone - front ports keep their VLANs and keep
+replaying from /etc/encs-switch. It only gives this host's backplane NIC back.
+
+init MOVES sw2363 onto the bridge. It has to: once the backplane NIC is a
+bridge port, a VLAN subinterface of that NIC receives nothing. Your Proxmox
+management interface keeps every setting it has (init only adds a comment line
+to its stanza, saying guests belong on swbr0; teardown removes it again), and
+neither is the bootstrap VM touched - it
+carries no traffic and belongs on vmbr0.
+
+Untagged (no tag= at all) is switch VLAN 1, which every front port is in by
+default - the equivalent of NFVIS's stock lan-net.
+
+None of this is privileged. Skipping the tool entirely and building your own
+bridge over the backplane NIC works exactly as well - the tool's job is to keep
+the host and switch halves consistent and to save the switch side so a cold
+boot does not lose it.
+
+Unlike NFVIS, Proxmox cannot hide a bridge: anyone editing a VM's hardware sees
+vmbr0 and swbr0 both. A VM on the wrong one just gets the wrong network.
+
 CONTENTS
 --------
   install.sh                   host installer (run on Proxmox)
   encs-switch-tui              the management UI; also --save/--apply/--status
   encs-switch-api              low-level XML API client for scripting
+  encs-switch-vnet             VM <-> front-port networks (bridge + VLAN)
   encs-switch-replay.service   reapplies config after a cold boot
 
 THE TWO THINGS TO REMEMBER

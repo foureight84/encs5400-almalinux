@@ -41,6 +41,7 @@ ordering is the whole reason for the numeric prefixes.
 | `15-lag.xml` | LAG membership and mode | groups must be formed before VLANs reference them |
 | `20-vlans.xml` | which VLANs exist | |
 | `25-vlan-ports.xml` | which ports are in them, and how they tag | needs the VLANs to already exist |
+| `26-backplane-vlans.xml` | `te2`'s VLAN membership — **only** written by `encs-switch-vnet` | the exception to the "no `te` ports" rule below |
 | `30-poe.xml` | PoE on/off per port | depends on nothing |
 | `35-stp-global.xml` | STP on/off and mode | only written when STP is running |
 | `36-stp-bridge.xml` | bridge priority and timers | |
@@ -252,6 +253,26 @@ encs-switch-api get '{VLANInterfaceMembershipTable}'
 > the firmware configures itself on VLANs 2350/2351. Replaying a stale copy of
 > those is a good way to cut your own session. `save`/`--save` writes `gi` and
 > `LAG` interfaces only.
+
+**The one exception: `26-backplane-vlans.xml`.** A VM on the backplane bridge
+only reaches a front port if `te2` carries that VLAN tagged, and the rule above
+would drop exactly that on the next cold boot. So `encs-switch-vnet add
+--fix-backplane` writes a separate file holding nothing but one field on `te2`:
+
+```xml
+<VLANInterfaceISList action="set">
+    <Entry>
+        <interfaceName>te2</interfaceName>
+        <trunkMemberVLANs>2-10,100,2363</trunkMemberVLANs>
+    </Entry>
+</VLANInterfaceISList>
+```
+
+No mode, no speed, no LLDP — the fields whose replay broke management on every
+boot. The list is always the *merged* one: `action="set"` replaces the whole
+list, so a file naming only the new VLAN would take `te2` out of 2363 and end
+the session applying it. Delete the file if you stop using VM networks; the
+only thing lost is VM connectivity after a power cut.
 
 Verified end to end on hardware: create a VLAN, tag a port into it, save,
 delete both, replay — VLAN and membership both come back identical.

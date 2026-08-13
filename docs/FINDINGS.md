@@ -1708,6 +1708,152 @@ IGMP snooping, private VLAN isolation, L3 routing. **Spanning tree has never bee
 — `te1` and `te2` are both X710 ports to the same host, so STP may block one; set `STPEnabled=2` on
 `te1`–`te4` first and do it with hands on the chassis.
 
+## 8n. How NFVIS gives a VM a front port — and the Proxmox equivalent (2026-08-12)
+
+NFVIS asks which *network* a VM should join, and the traffic comes out the `GE1/x` jacks. That
+reads like the switch ports are something you can attach a VM to. They are not, and the mechanism
+is worth stating precisely, because the Proxmox version is then obvious.
+
+Read from `platform-config-4.15.5-FC4` and `nfvos-confd-4.15.5-FC4` on the 4.15.5 ISO.
+
+### There are two independent halves, and neither one knows about the other
+
+**Half one — the bridge.** `opt/platform-config/confd/nfvis_encs_bridge_init.xml` is the ENCS
+factory default:
+
+```xml
+<bridge><name>wan-br</name>  <port><name>GE0-0</name></port></bridge>
+<bridge><name>wan2-br</name> <port><name>GE0-1</name></port></bridge>
+<bridge><name>lan-br</name>  <port><name>int-LAN</name></port></bridge>
+```
+
+`lan-br` — the bridge behind `lan-net`, the network you pick when creating a VM — has **exactly one
+physical port, `int-LAN`**. And `ENCS_70-persistent-net.rules` in the same package says what that
+is:
+
+```
+KERNELS=="0000:08:00.0", NAME="int-ngio"
+KERNELS=="0000:08:00.1", NAME="int-LAN"
+```
+
+`08:00.1` is the X710 function this project already proved is `te2` (§4d). So NFVIS's "LAN network"
+is an OVS bridge on the 10G backplane, nothing more. **`GE1-0` … `GE1-7` appear nowhere in NFVIS's
+network model** — grep the platform packages and there is not one occurrence. They are not pnics,
+not bridge ports, and not host NICs.
+
+**Half two — the switch.** `nfvis_encs_bridge_init_1.xml` configures the ASIC through the separate
+`http://www.cisco.com/switch` model: every `gigabitEthernet 1/0`–`1/7` is `switchport mode access`,
+`access vlan 1`, with all VLAN ids allowed on its trunk. That is the whole of it.
+
+A VM reaches `GE1/0` because its frames leave `te2` in a VLAN that `gi0` is also in. Nothing routes
+and nothing is mapped.
+
+The single place NFVIS does join the two halves is **not** the data path: `pnic_cdb_util.py` reads a
+`track-state` list under `/switch/interface/gigabitEthernet[n]` holding `(vm-name, vnic-id)` pairs,
+and marks those vNICs down when the front port's link drops. A convenience for VNFs that expect a
+link-down signal — worth knowing it exists, and nothing a VM needs in order to reach a jack.
+
+### The VLAN tag lives on the vNIC, not on the bridge
+
+`nfvos-confd/networking_util.py` does the VM side with plain OVS calls against the VM's own port:
+
+```python
+# access:  update_vnic_vlan_info()
+ovs-vsctl set port <vnic> tag=<vlan>
+# trunk:
+ovs-vsctl set port <vnic> trunks=<list> tag=<native> vlan_mode=native-(un)tagged
+```
+
+So an NFVIS "network" is a *name for a (bridge, VLAN) pair*, applied per vNIC. That maps one-to-one
+onto `qm set <vmid> --netN virtio,bridge=<br>,tag=<vlan>`, which is the same OVS/Linux-bridge
+primitive with different spelling.
+
+### Therefore, on Proxmox
+
+| NFVIS | Proxmox |
+|---|---|
+| `lan-br` (OVS bridge, port `int-LAN`) | one **VLAN-aware bridge on the backplane NIC** |
+| `lan-net` (network on `lan-br`, no VLAN) | attach untagged → switch VLAN 1 → all 8 front ports |
+| network with `vlan 100` | `--netN virtio,bridge=swbr0,tag=100` |
+| `switch interface gigabitEthernet 1/0 switchport access vlan 100` | the same write, via `encs-switch-tui` or `encs-switch-vnet add` |
+
+`encs-switch-vnet` (0.2.0) does both halves and checks they agree. What it emits is deliberately
+ordinary: a `bridge-vlan-aware yes` bridge whose only port is the backplane NIC.
+
+**The management VLAN has to move onto that bridge.** `install.sh` put `sw2363` directly on the
+backplane NIC; once that NIC is a bridge port, a VLAN subinterface *of the NIC* receives nothing —
+the bridge consumes the frames first. So `sw2363` gets re-parented onto the bridge, and the bridge
+device itself needs `vid 2363 self` in its own VLAN filter (that filter is separate from the ports'
+one, and forgetting it looks exactly like a dead switch).
+
+This is also the answer to "why is `vmbr0` sharing the management port": under NFVIS nothing except
+NFVIS's own management uses the `MGMT` jack, because VM traffic has the whole 10G backplane and 8
+front ports to itself. Doing the same on Proxmox leaves `vmbr0`/`enp15s0` carrying nothing but the
+hypervisor — which is what §4b's bootstrap-dependency warning wants anyway. The bootstrap VM stays
+on `vmbr0`: it carries no traffic, and putting the machine that boots the switch behind the switch
+is the loop that warning is about.
+
+### Proxmox does not read `/etc/network/interfaces.d` — verified on the box
+
+The obvious place for generated stanzas is a file under `interfaces.d`, sourced by the stock
+`source /etc/network/interfaces.d/*` line: it cannot corrupt the stanza holding the host's own
+address, and removing it is a complete undo. **That is the wrong place here**, and PVE says so in
+the header it generates:
+
+```
+# If you want to manage parts of the network configuration manually,
+# please utilize the 'source' or 'source-directory' directives to do so.
+# PVE will preserve these directives, but will NOT read its network
+# configuration from sourced files, so do not attempt to move any of
+# the PVE managed interfaces into external files!
+```
+
+Confirmed in `/usr/share/perl5/PVE/INotify.pm` on PVE 8.4.20. A bridge PVE cannot see is one that
+never appears in the network panel and — the part that matters — never appears in the **Bridge**
+dropdown when someone adds a NIC to a VM. Since the entire point is a GUI-pickable `lan-net`
+equivalent, the stanzas go in `/etc/network/interfaces`, which is where `install.sh` has always
+written `sw2363` anyway.
+
+Three parser facts that follow from the same file, and that the tooling is built around:
+
+| `INotify.pm` | Consequence |
+|---|---|
+| `if ($line =~ m/^\s*#(.*?)\s*$/)` **inside** a stanza body → `comments` | A `#` line in an iface block is that interface's **Comment** in the GUI — shown in the network panel, the Edit dialog, and the bridge picker. This is how every stanza we write labels itself, and it is the cheap alternative to renaming `vmbr0`. |
+| `next if $line =~ m/^\s*#/` at **top level** | Comments *outside* a stanza are dropped when PVE rewrites the file. Our `BEGIN`/`END` markers are top-level, so they do not survive a GUI-applied change — removal falls back to matching interfaces by name. |
+| unrecognised options → `push @{$pushto->{options}}`, re-emitted verbatim | PVE preserves foreign stanzas and unknown options, so `post-up bridge vlan add …` and the whole `swbr0` block survive its rewrites. Proven live: `pvesh get /nodes/<node>/network` returns `sw2363` fully modelled — `vlan-raw-device`, `vlan-id`, `mtu`, `cidr` — from a stanza `install.sh` appended by hand. |
+
+The GUI also stages edits in `/etc/network/interfaces.new` and copies that over the real file on
+*Apply Configuration*. Writing while one is pending would let that apply revert half of our change,
+so both writers refuse when it exists.
+
+### RESOLVED: `te2` carries VLAN 1 and 2363 and nothing else (measured 2026-08-12)
+
+Under NFVIS, `te2`'s trunk list is not a firmware default — `switch-confd` writes it at every
+startup (`switch_interfaces.py:2449`, `trunk allowed 2-2349,2363,2450-4093`, mode 12). We do not run
+`switch-confd`, so `te2` sits at whatever the *firmware* defaults to. Read off a running 5412:
+
+```
+te2 (backplane): trunk, members 1,2363, native 1
+```
+
+**So the default trunk is exactly two VLANs.** That has a clean consequence for each half of the
+feature:
+
+| Attachment | Works out of the box? |
+|---|---|
+| untagged — `bridge=swbr0`, switch VLAN 1, all 8 jacks (stock `lan-net`) | **yes**, no switch change at all |
+| tagged — `bridge=swbr0,tag=N` for any other VLAN | **no** — `te2` must be given VLAN N first |
+
+This is why `add` reads `te2` and reports what it found instead of assuming: on this platform the
+assumption would have been wrong every time, and the failure mode is a front port correctly in
+VLAN N with nothing from the host ever reaching it. `--fix-backplane` merges N into
+`trunkMemberVLANs` (never replaces — `1,2363` includes the VLAN this session rides on) and writes
+`26-backplane-vlans.xml` so a cold boot gets it back.
+
+`26-backplane-vlans.xml` exists because `--save` deliberately excludes `te1`–`te4` from every replay
+file (see the two hangs above), and that exclusion would otherwise cost VM connectivity on the next
+cold boot.
+
 ## 9. Repository layout
 
 Everything this project produces is described in the README's

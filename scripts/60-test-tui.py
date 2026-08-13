@@ -1184,6 +1184,45 @@ def test_everything_writable_is_replayed():
               f"it would be lost on a cold power cycle")
 
 
+def test_vnet_view():
+    """The host-side view, and the import that makes it possible.
+
+    encs-switch-vnet imports THIS module and is imported back by it. If that
+    round trip ever loads a second copy, the two SwitchError classes stop
+    being the same class and every `except SwitchError` in the tool silently
+    misses - a failure that looks like the switch hanging, not like a bug.
+    """
+    print("vnet view")
+    vn = t.load_vnet()
+    check(vn is not None, "encs-switch-vnet loads from the bundle")
+    if vn is None:
+        return
+    check(vn.t.SwitchError is t.SwitchError,
+          "the tool shares this module's SwitchError, not a second copy")
+    check(vn.t.Switch is t.Switch, "and the same Switch class")
+
+    sw = FakeSwitch()
+    d = t.fetch_vnet(sw)
+    rows = d["rows"]
+    check(rows and all("VLANID" in r for r in rows),
+          "one row per VLAN, keyed the way act_vlan_ports expects")
+    mgmt = [r for r in rows if r["VLANID"] == t.MGMT_VLAN]
+    check(mgmt and "management" in mgmt[0]["attach"],
+          "the management VLAN is never offered as somewhere to put a VM")
+    ones = [r for r in rows if r["VLANID"] == "1"]
+    check(ones and "," not in ones[0]["attach"],
+          "VLAN 1 attaches untagged - no tag= at all")
+
+    # Off-host, with no bridge and no /etc/pve, the summary still explains
+    # itself rather than rendering blanks or raising.
+    lines = t.vnet_summary(d["extra"])
+    check(lines and all(isinstance(x, str) for x in lines),
+          "the summary renders with no bridge present")
+    check(any("lan-br" in x or "not created" in x or "up," in x
+              for x in lines),
+          "and says which of the two states it is in")
+
+
 def test_menu():
     print("menu navigation")
     sw = FakeSwitch()
@@ -1327,7 +1366,8 @@ def main():
                test_guards, test_config_roundtrip,
                test_config_defaults_are_not_saved,
                test_config_extended_roundtrip,
-               test_everything_writable_is_replayed, test_menu, test_spec_keys,
+               test_everything_writable_is_replayed, test_vnet_view,
+               test_menu, test_spec_keys,
                test_curses_render):
         fn()
     print(f"\n{CHECKS[0]} checks, {len(FAILURES)} failed")

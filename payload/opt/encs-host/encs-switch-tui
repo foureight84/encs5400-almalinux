@@ -59,7 +59,7 @@ CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
 
 # Single source of truth for the version. scripts/release.sh reads this line
 # to name the tag and the tarball, so keep the literal on one line.
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # Where --update looks. Override for a fork or a test repo.
 GITHUB_REPO = os.environ.get("ENCS_REPO", "foureight84/encs5400-almalinux")
@@ -2104,6 +2104,8 @@ forwarding:
 TAB opens everything else. A tab strip cannot hold twenty entries at 80
 columns, so the rest live in a menu:
 
+  Host
+    vnet       VM networks - see VM NETWORKS below
   Switching
     stp        spanning tree - see SPANNING TREE below
     storm      rate-limit broadcast/unicast/multicast flooding per port
@@ -2217,6 +2219,55 @@ shows rx/tx packet counts: counters moving is the only real proof of use.
 IMPORTANT: after a cold bootstrap every gi port comes up SHUT and PoE off.
 The switch boots but forwards nothing until you enable them. That is what
 Cisco's switch_init.xml did, and we do not run it."""),
+
+    ("VM NETWORKS", """\
+TAB -> vnet is the one view that configures this HOST rather than the
+switch. It exists because "which front jack does this VM come out of" is
+two settings in two places, and getting one without the other is the most
+common way for this to look broken.
+
+NFVIS answered it with a network called lan-net. That network is a bridge
+whose only physical port is the 10G backplane link (int-LAN = te2), plus a
+VLAN on the ASIC deciding which jacks it reaches. The jacks themselves are
+never bridge ports and are not host NICs at all.
+
+swbr0 is that bridge, built the Proxmox way: VLAN-aware, with the X710
+backplane NIC as its only port. Then:
+
+  bridge=swbr0            VLAN 1 - every front jack, the stock lan-net
+  bridge=swbr0,tag=100    whichever jacks you put in VLAN 100
+
+  n       create swbr0. Prints the exact diff of /etc/network/interfaces
+          first and writes nothing until you confirm it.
+  D       remove it again. VMs go back to vmbr0. The SWITCH is left alone -
+          front ports keep their VLANs and keep replaying from disk.
+  ENTER   add or remove a front jack for the selected VLAN.
+
+Two things this view will not do. It does not run 'ifreload -a' - nothing
+it writes is live until you do, from a shell, ideally with the serial
+console attached. And it changes no setting on vmbr0: that is Proxmox's own
+management interface, the one link that does not depend on the ASIC, the
+bootstrap VM or a VLAN, and it is how you get back in when this goes wrong.
+
+The one mark it leaves there is a comment. n adds a line to the stanza of
+whichever bridge carries the default route - found by looking, not by
+assuming the name - saying guests belong on swbr0; Proxmox shows it as that
+interface's comment. D removes it again. That is the cheap version of
+renaming vmbr0, with nothing to migrate and nothing that can cost you the
+interface you manage this host over.
+
+Creating swbr0 MOVES sw2363 onto the bridge. That is required, not a
+preference: once the backplane NIC is a bridge port, a VLAN subinterface of
+the NIC itself receives nothing. If the switch stops answering after
+ifreload, the VLAN device was not re-parented - 'ip link del sw2363' then
+'ifreload -a' again.
+
+The same thing from a shell, with more detail on each step:
+
+  encs-switch-vnet status
+  encs-switch-vnet init
+  encs-switch-vnet add 100 --ports gi0
+  encs-switch-vnet teardown"""),
 
     ("LINK AGGREGATION", """\
 Select a gi port in the Ports view and press g. You are asked for a group
@@ -2474,6 +2525,9 @@ VIEWS = [("ports", "p"), ("vlans", "v"), ("poe", "e"),
 # keys (a is already "apply", n "new", d "delete", g "LAG", w "write"), so
 # the menu is the only place these are named.
 GROUPS = [
+    ("Host", [
+        ("vnet", "VM networks - which front jack a VM's traffic comes out of"),
+    ]),
     ("Switching", [
         ("stp", "spanning tree - the loop protection this box boots without"),
         ("storm", "storm control - rate-limit broadcast/multicast floods"),
@@ -3304,6 +3358,103 @@ class UI:
         rows = self.rows()
         return rows[self.sel] if rows and self.sel < len(rows) else None
 
+    def suspend(self, fn):
+        """Hand the terminal back, run fn, then take it again.
+
+        For the host-side actions, which print a unified diff of what they
+        are about to do to /etc/network/interfaces. Squeezing that into a
+        curses panel would mean either truncating it or reimplementing a
+        pager, and a diff you cannot read in full is worse than no diff -
+        this is the one change in the tool that can cost the management VLAN.
+        """
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            fn()
+            try:
+                input("\n  press ENTER to return to the TUI ")
+            except (EOFError, KeyboardInterrupt):
+                pass
+        finally:
+            curses.reset_prog_mode()
+            self.s.redrawwin()
+            self.s.refresh()
+
+    # ======================================================= VM networks
+    def _vnet(self):
+        vn = load_vnet()
+        if vn is None:
+            self.set_msg("encs-switch-vnet is not installed - re-run "
+                         "install.sh from the host bundle", bad=True)
+        return vn
+
+    @staticmethod
+    def _vnet_args(**kw):
+        """A stand-in for the argparse namespace those commands expect."""
+        return type("args", (), kw)()
+
+    def act_vnet_create(self):
+        """Create the bridge that puts VM traffic on the front jacks.
+
+        Two-step on purpose, and both steps happen outside curses: the tool
+        prints the exact diff first and writes nothing until the confirmation
+        that follows it.
+        """
+        vn = self._vnet()
+        if not vn:
+            return
+        if self.extra().get("bridge_up"):
+            self.set_msg(f"{vn.BRIDGE} already exists", bad=True)
+            return
+
+        def go():
+            print(f"\n  {vn.BRIDGE} is the Proxmox equivalent of NFVIS's "
+                  f"lan-br: one VLAN-aware\n  bridge on the backplane NIC. "
+                  f"VMs on it reach the GE1/x jacks instead of\n  sharing the "
+                  f"MGMT CPU port with this hypervisor.\n")
+            try:
+                vn.cmd_init(self._vnet_args(yes=False, reload=False))
+                if input("\n  write this config? type yes: ").strip() == "yes":
+                    vn.cmd_init(self._vnet_args(yes=True, reload=False))
+                else:
+                    print("  nothing written")
+            except SystemExit as e:
+                if e.code and not isinstance(e.code, int):
+                    print(f"  {e.code}")
+        self.suspend(go)
+        self.set_msg("nothing is live until 'ifreload -a' runs from a shell")
+        self.refresh_data()
+
+    def act_vnet_teardown(self):
+        """Give the backplane NIC back: VMs return to vmbr0.
+
+        Deliberately does NOT touch the switch. Front-port VLANs stay as they
+        are and keep replaying from /etc/encs-switch - this is a statement
+        about where VM traffic goes on this host, not about how the switch is
+        configured.
+        """
+        vn = self._vnet()
+        if not vn:
+            return
+        if not self.extra().get("managed"):
+            self.set_msg(f"{vn.BRIDGE} was not created by this tool - "
+                         f"nothing to remove", bad=True)
+            return
+
+        def go():
+            try:
+                vn.cmd_teardown(self._vnet_args(yes=False, force=False))
+                if input("\n  apply this? type yes: ").strip() == "yes":
+                    vn.cmd_teardown(self._vnet_args(yes=True, force=False))
+                else:
+                    print("  nothing written")
+            except SystemExit as e:
+                if e.code and not isinstance(e.code, int):
+                    print(f"  {e.code}")
+        self.suspend(go)
+        self.set_msg("nothing is live until 'ifreload -a' runs from a shell")
+        self.refresh_data()
+
     # ==================================================== spanning tree
     def act_stp_global(self):
         what = self.ask_pick("spanning tree", {
@@ -4069,6 +4220,14 @@ class UI:
             self.set_msg(f"VLAN {vid} carries THIS session - not editable "
                          f"from here", bad=True)
             return
+        # The vnet view lists VLANs a VM is tagged into but the switch does
+        # not have. Assigning a port to one would be accepted and forward
+        # nothing, which is the confusing failure this row exists to warn
+        # about in the first place.
+        if r.get("VLANName") == "NO SUCH VLAN":
+            self.set_msg(f"VLAN {vid} does not exist on the switch - create "
+                         f"it first (VLANs view, n)", bad=True)
+            return
         add = self.ask_pick(f"VLAN {vid}", {
             "a": (True, "add a port"), "r": (False, "remove a port")})
         if add is None:
@@ -4561,6 +4720,123 @@ def rate_col(kind):
 
 
 # ---- fetches ------------------------------------------------------------
+# --------------------------------------------------------------- vnet view
+# The host half of "which jack does this VM come out of" lives in
+# encs-switch-vnet, and stays there: /etc/network/interfaces is a different
+# kind of thing from the switch API, with a different way to be wrong. This
+# view imports that tool and calls it, rather than growing a second copy of
+# a bridge writer inside a curses app.
+_VNET = [None]
+
+
+class _Globals:
+    """Attribute access over another module's globals, without copying it."""
+
+    def __init__(self, g):
+        self.__dict__ = g
+
+
+def load_vnet():
+    """The encs-switch-vnet module, or None if it is not installed.
+
+    An older bundle, or a checkout without it, must degrade to a view that
+    explains itself rather than a traceback. Cached because importing it
+    walks the filesystem.
+    """
+    if _VNET[0] is not None:
+        return _VNET[0] or None
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in ("/usr/local/sbin/encs-switch-vnet",
+                 os.path.join(here, "encs-switch-vnet")):
+        if not os.path.exists(cand):
+            continue
+        try:
+            loader = SourceFileLoader("encs_switch_vnet", cand)
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            # It imports this module back. Hand it the instance that is
+            # already running: a second copy would define a second
+            # SwitchError, and its except clauses would stop catching the
+            # exceptions raised by the Switch object it is handed.
+            #
+            # Not via sys.modules - a module loaded by SourceFileLoader is
+            # not registered there, which is how both this file and the
+            # test harness load it. _Globals wraps this module's globals so
+            # attribute lookups reach the live objects with no copying.
+            mod.__dict__["_TUI_MODULE"] = _Globals(globals())
+            loader.exec_module(mod)
+            _VNET[0] = mod
+            return mod
+        except Exception:
+            break
+    _VNET[0] = False
+    return None
+
+
+def fetch_vnet(sw):
+    """One row per VLAN: which jacks it reaches, and how a VM attaches."""
+    vn = load_vnet()
+    ifv = {r["interfaceName"]: r for r in (_try(sw.vlan_interfaces, []) or [])}
+    ports = {p["interfaceName"]: p for p in (_try(sw.ports, []) or [])}
+    host = vn.host_status() if vn else {}
+    users = host.get("users", {})
+    rows = []
+    for vl in (_try(sw.vlans, []) or []):
+        vid = vl["VLANID"]
+        jacks = []
+        for i in range(8):
+            name = f"gi{i}"
+            if name not in ifv or vn is None:
+                continue
+            if vn.access_vlan_of(ifv[name]) != vid:
+                continue
+            mark = "*" if ports.get(name, {}).get("linkState") == "1" else (
+                "x" if ports.get(name, {}).get("adminState") == "2" else "")
+            jacks.append(panel_label(name).replace("GE", "") + mark)
+        if vid == MGMT_VLAN:
+            attach, who = "-- management --", ""
+        else:
+            br = host.get("bridge", "swbr0")
+            attach = br if vid == "1" else f"{br},tag={vid}"
+            who = ", ".join(users.get(None if vid == "1" else vid, []))
+        rows.append({"VLANID": vid, "VLANName": vl.get("VLANName") or "",
+                     "jacks": " ".join(jacks), "attach": attach, "vms": who})
+    # A VM tagged into a VLAN the switch does not have looks like a broken
+    # NIC from inside the guest, and like nothing at all from here - so it
+    # gets a row of its own rather than no mention.
+    known = {r["VLANID"] for r in rows}
+    for tag, who in sorted((k, v) for k, v in users.items() if k):
+        if tag not in known:
+            rows.append({"VLANID": tag, "VLANName": "NO SUCH VLAN",
+                         "jacks": "-", "attach": f"{host.get('bridge')},"
+                                                 f"tag={tag}",
+                         "vms": ", ".join(who)})
+    host["te2"] = ifv.get("te2", {})
+    host["missing"] = vn is None
+    return {"rows": rows, "extra": host}
+
+
+def vnet_summary(x):
+    """The host half, above the table: does the bridge exist, and is it sane."""
+    if x.get("missing"):
+        return ["encs-switch-vnet is not installed - this view can only look",
+                "on. Copy the host bundle again and re-run install.sh."]
+    br, bp = x.get("bridge", "swbr0"), x.get("backplane")
+    if not x.get("bridge_up"):
+        return [f"{br}: not created. VMs land on vmbr0 - the MGMT CPU jack -",
+                f"and share the interface you manage this host over.",
+                f"n creates it (the Proxmox equivalent of NFVIS's lan-br)."]
+    members = ", ".join(x.get("members") or []) or "none"
+    ok = bp and bp in (x.get("members") or [])
+    line = f"{br}: up, ports {members}" + ("" if ok else
+                                           f"  <- expected {bp}")
+    mgmt = f"{x.get('mgmt_if')}: " + ("up" if x.get("mgmt_up") else "MISSING")
+    named = ", ".join(f"{n} (vlan {v})" for n, v in x.get("vnets") or [])
+    return [line, f"{mgmt}   {'named bridges: ' + named if named else ''}"]
+
+
 def fetch_stp(sw):
     d = sw.stp()
     g = dict(_try(sw.stp_global, {}))
@@ -4786,6 +5062,19 @@ def l3_detail_for(ui):
 
 
 SPECS = {
+    "vnet": {
+        "fetch": fetch_vnet, "summary": vnet_summary,
+        "cols": [("vlan", 7, raw("VLANID")),
+                 ("name", 13, raw("VLANName")),
+                 ("front jacks", 26, raw("jacks")),
+                 ("attach a VM with", 24, raw("attach")),
+                 ("VMs", 0, raw("vms"))],
+        "actions": {"n": "act_vnet_create", "D": "act_vnet_teardown",
+                    "\n": "act_vlan_ports"},
+        "keys": ("n create the bridge   D remove it   "
+                 "ENTER add/remove a jack"),
+        "empty": "the switch reported no VLANs",
+    },
     "stp": {
         "fetch": fetch_stp, "summary": stp_summary,
         "cols": [("port", 8, raw("interfaceName")),
