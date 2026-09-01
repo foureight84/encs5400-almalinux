@@ -748,6 +748,40 @@ an interactive install if you want to choose the disk yourself, and rescue.
 
 ---
 
+## Deploying on ESXi (experimental)
+
+**[docs/ESXI.md](docs/ESXI.md) is the walkthrough.** It is marked experimental
+because none of it has been run on hardware — the Proxmox path above is
+verified on a real 5412, that one is reasoned from it. It is written down
+anyway, because the mechanism is hypervisor-agnostic: a passthrough VM pushing
+firmware into the ASIC over PCIe. Nothing in that is Proxmox-specific.
+
+The short version of what changes:
+
+| | Proxmox | ESXi |
+|---|---|---|
+| Passthrough | `hostpci0` | DirectPath I/O, possibly a `/etc/vmware/passthru.map` reset override |
+| Platform gate | `--smbios1 product=...` | `SMBIOS.reflectHost = "TRUE"` |
+| **The switch tools** | on the hypervisor | **inside the bootstrap VM** — ESXi has no bash, systemd or curses to run them |
+| `swbr0` (= NFVIS `lan-br`) | VLAN-aware bridge on the te2 NIC | a standard vSwitch whose only uplink is that vmnic |
+| `bridge=swbr0,tag=100` | | a portgroup with VLAN ID 100 |
+| Guest boot ordering | `--startup order=1,up=90` | autostart entry with a 90 s delay |
+
+Everything switch-side — VLANs, PoE, LAG, mirroring, cold-boot replay — is
+unchanged, because it is the same client speaking the same XML API over the
+same VLAN. Only the machine it runs on moves.
+
+The guide grades every step by how much it can be trusted, and ends with a
+[revert procedure](docs/ESXI.md#reverting-everything) that puts the host back
+exactly as it was — it never touches `vSwitch0` or `vmk0`. Read that before
+starting rather than after.
+
+Automation for it (a VMDK build target, and `esxcli` install/uninstall scripts
+for the host side) lives on the **`experimental/esxi`** branch, kept off `main`
+until somebody has run it on a real chassis. Reports either way are welcome.
+
+---
+
 ## Credentials
 
 There are **two separate logins** here, and they are unrelated.
@@ -887,6 +921,7 @@ payload/                      our code, installed into the image
 docs/
   FINDINGS.md                 the full reverse-engineering writeup
   CONFIG.md                   the /etc/encs-switch/*.xml files, field by field
+  ESXI.md                     running it on ESXi instead (experimental)
 ```
 
 `docs/FINDINGS.md` is worth reading if you want the why: how the bootstrap was
