@@ -16,31 +16,41 @@ firmware on your machine to produce a bootable image.
 ./build.sh /path/to/Cisco_NFVIS-4.15.5-FC4.iso
 ```
 
----
-
-## The problem this solves
-
-The ENCS 5400's 8 front-panel ports are not NICs. They belong to a **Marvell
-BobCat2 switch ASIC that has no flash** — no firmware of its own at all. On
-every power-on, the host CPU must push a bootstrap into its SRAM and a 26 MB
-firmware image into its DDR over PCIe.
-
-Only NFVIS does that. Install anything else and the 8 LAN ports simply do not
-exist. That is why every "I put Proxmox/ESXi on my ENCS" thread ends with the
-switch unused.
-
-This tooling extracts that bootstrap path and packages it as a tiny AlmaLinux
-VM whose only job is to boot the ASIC — leaving the rest of the machine free
-for whatever hypervisor you actually want.
-
-That the switch *can* be booted this way was discovered by
-**[yeyus](https://forums.servethehome.com/index.php?members/yeyus.35233/)** in
-[Switch bootstrap VM](https://yeyus.notion.site/Switch-bootstrap-VM-04cac1d64bde48b684c51e8dac524245).
-This repository automates it and adds switch management — see [Credits](#credits).
-
 **Confirmed working on real hardware:** ASIC bootstrap, L2 forwarding, VLANs,
 MAC learning, 10 G backplane, and **802.3bt PoE** (a class-5 AP powered up and
 linked over a port enabled purely through the API).
+
+**New here:** [Requirements](#requirements) then
+[Build the image](#build-the-image). If you want to know why the LAN ports need
+any of this in the first place, that is [How it works](#how-it-works).
+
+---
+
+## Contents
+
+**Getting it running**
+[Requirements](#requirements) ·
+[Build the image](#build-the-image) ·
+[Deploy on Proxmox](#deploying-on-proxmox) ·
+[Deploy on ESXi](#deploying-on-esxi-experimental)
+
+**Using it**
+[Managing the switch](#managing-the-switch) ·
+[VMs on the front ports](#putting-vms-on-the-front-lan-ports-the-nfvis-lan-net-model) ·
+[Link aggregation](#link-aggregation-lag--port-channel) ·
+[Updating the tools](#updating-the-host-tools) ·
+[The front panel](#the-front-panel) ·
+[Credentials](#credentials)
+
+**Before you trust it**
+[Operational warnings](#operational-warnings) ·
+[What has not been tested](#what-has-not-been-tested)
+
+**Why any of this is necessary**
+[How it works](#how-it-works) ·
+[Repository layout](#repository-layout) ·
+[Legal](#legal) ·
+[Credits](#credits)
 
 ---
 
@@ -73,7 +83,7 @@ sudo dnf install -y libarchive xorriso createrepo_c qemu-kvm edk2-ovmf
 
 ---
 
-## Usage
+## Build the image
 
 ```sh
 git clone https://github.com/foureight84/encs5400-almalinux
@@ -218,7 +228,118 @@ own. See [below](#putting-vms-on-the-front-lan-ports-the-nfvis-lan-net-model).
 It is idempotent — safe to re-run, and it skips anything already in place. Once
 `swbr0` exists, re-running it leaves the network config alone entirely.
 
-**5. Manage the switch**
+### Alternative: install from the ISO instead
+
+If you would rather install into a VM yourself, or you are going bare metal,
+use `AlmaLinux-8.9-ENCS5400-switch.iso`.
+
+**As a Proxmox VM** — upload the ISO to a storage that holds ISO images
+(`local` by default: *Datacenter → local → ISO Images → Upload*, or just
+`scp` it into `/var/lib/vz/template/iso/`), then:
+
+```sh
+qm create 900 --name encs-switch --machine q35 --bios ovmf \
+    --memory 2048 --cores 2 --net0 virtio,bridge=vmbr0 \
+    --serial0 socket --vga serial0
+qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:16
+qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
+qm set 900 --ide2 local:iso/AlmaLinux-8.9-ENCS5400-switch.iso,media=cdrom
+qm set 900 --boot 'order=ide2;virtio0'
+qm set 900 --smbios1 product=RU5DUzU0MTIvSzk=,base64=1
+qm start 900 && qm terminal 900
+```
+
+The default boot entry installs unattended and **erases the disk it picks** —
+which is why the disk is created empty above. When it reboots, drop the CD and
+fix the boot order:
+
+```sh
+qm set 900 --ide2 none --boot order=virtio0
+qm set 900 --hostpci0 0000:$(lspci -d 11ab:be00 | cut -d' ' -f1)   # the Marvell switch
+qm set 900 --onboot 1 --startup order=1
+qm start 900
+```
+
+Passthrough is added *after* installation deliberately — the installer has no
+use for the switch, and leaving it out keeps the install from touching it.
+
+**On bare metal** (AlmaLinux directly on the ENCS, no hypervisor): write the
+ISO to a USB stick and boot it.
+
+```sh
+sudo dd if=AlmaLinux-8.9-ENCS5400-switch.iso of=/dev/sdX bs=4M status=progress oflag=sync
+```
+
+No SMBIOS override is needed — a real ENCS already reports
+`ENCS5412/K9`, so the platform gate passes untouched. Run
+`bash /opt/encs-host/install.sh` locally afterwards; it works the same whether
+"the host" is Proxmox or the ENCS itself.
+
+The boot menu offers three entries: automated install (marked **ERASES DISK**),
+an interactive install if you want to choose the disk yourself, and rescue.
+
+---
+
+## Deploying on ESXi (experimental)
+
+**[docs/ESXI.md](docs/ESXI.md) is the walkthrough.** It is marked experimental
+because none of it has been run on hardware — the Proxmox path above is
+verified on a real 5412, that one is reasoned from it. It is written down
+anyway, because the mechanism is hypervisor-agnostic: a passthrough VM pushing
+firmware into the ASIC over PCIe. Nothing in that is Proxmox-specific.
+
+The short version of what changes:
+
+| | Proxmox | ESXi |
+|---|---|---|
+| Passthrough | `hostpci0` | DirectPath I/O, possibly a `/etc/vmware/passthru.map` reset override |
+| Platform gate | `--smbios1 product=...` | `SMBIOS.reflectHost = "TRUE"` |
+| **The switch tools** | on the hypervisor | **inside the bootstrap VM** — ESXi has no bash, systemd or curses to run them |
+| `swbr0` (= NFVIS `lan-br`) | VLAN-aware bridge on the te2 NIC | a standard vSwitch whose only uplink is that vmnic |
+| `bridge=swbr0,tag=100` | | a portgroup with VLAN ID 100 |
+| Guest boot ordering | `--startup order=1,up=90` | autostart entry with a 90 s delay |
+
+Everything switch-side — VLANs, PoE, LAG, mirroring, cold-boot replay — is
+unchanged, because it is the same client speaking the same XML API over the
+same VLAN. Only the machine it runs on moves.
+
+The guide grades every step by how much it can be trusted, and ends with a
+[revert procedure](docs/ESXI.md#reverting-everything) that puts the host back
+exactly as it was — it never touches `vSwitch0` or `vmk0`. Read that before
+starting rather than after.
+
+**This is the `experimental/esxi` branch**, which carries the automation as
+well as the guide:
+
+```sh
+./build.sh --esxi <nfvis.iso>      # also writes out/esxi/{vmdk,vmx,README}
+scp -r payload/opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'        # plan
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh --yes'  # apply
+```
+
+`install.sh` does passthrough and networking and records everything it creates;
+`uninstall.sh` takes exactly that back out. `--esxi` is a last, separate build
+step — if the conversion fails you still have a working qcow2 and an untouched
+Proxmox path.
+
+`python3 scripts/66-test-esxi.py` runs both against a **fake `esxcli`** — the
+same trick `60-test-tui.py` uses on the TUI. It asserts that the dry run writes
+nothing, that install → uninstall is a bit-identical round trip, and that no
+write command ever names `vSwitch0`. That is not the same as having run it on
+ESXi, and the guide says so.
+
+It is kept off `main` until somebody has run it on a real chassis. Reports
+either way are welcome.
+
+---
+
+## Managing the switch
+
+Everything below runs on the **hypervisor**, not in the bootstrap VM — the
+switch answers on `169.254.1.0` over VLAN 2363 on the X710 backplane, and that
+NIC belongs to the host. (ESXi is the exception, and
+[docs/ESXI.md](docs/ESXI.md) says so.)
 
 ```sh
 encs-switch-tui        # press ? for the built-in manual
@@ -293,136 +414,6 @@ and the table says which one applies.
 
 Every one of these is saved and replayed. The config directory only grows
 with what you actually configure. See [docs/CONFIG.md](docs/CONFIG.md).
-
-### What has not been tested
-
-Nothing here is known broken — it is unmeasured, and the missing piece is
-hardware rather than code. Grouped by what you would need:
-
-| Needs | Untested |
-|---|---|
-| **A second switch** | LAG/LACP negotiation (including the `auto` vs `on` black-hole trap), STP loop breaking, root guard, BPDU guard |
-| **A traffic generator** | Storm-control rate limiting, QoS marking and queueing, policers |
-| **Endpoints with IP addresses** | ACL filtering, IGMP snooping, private VLAN isolation, L3 routing and static ARP |
-| **Nothing — just never run** | MAC flush, counter clear, MSTP, DSCP maps, per-port shaping |
-
-> ⚠ **Spanning tree has never been enabled globally on real hardware.** `te1`
-> and `te2` are both X710 ports to the same host, so the switch may see a loop
-> and block one of them — and if it blocks `te2` the management VLAN goes with
-> it, recoverable only by physical AC removal. Set `STPEnabled=2` on `te1`–`te4`
-> first, and do it with hands on the chassis.
-
-**Still not implemented.** Three of these are blocked on missing information
-rather than effort:
-
-| Area | Why |
-|---|---|
-| IPv4 ACL rules | `switch-confd` only ever built **MAC** ACLs. The element names inside `<IPv4Parameters>` appear nowhere in the extracted source, and a guessed rule is one the switch accepts and never matches. MAC ACLs are complete. |
-| LLDP neighbour table | Does not exist. confd touches only `LLDPGlobalSetting` and `LLDPInterfaceList`, so there is nothing that answers "what is plugged into GE1/3". LLDP can be enabled and timed; it cannot be read back. |
-| Remote SPAN | Needs a reflector port and a remote VLAN. Local SPAN works. |
-| MSTP instances | The client can write region, revision, instance priorities and instance→VLAN maps; there is no view. MSTP on an 8-port edge switch with one region is not worth the screen — use `encs-switch-api`. |
-| DSCP mutation/remark, per-port shaping, class/policy maps | The client can write all of them; there is no view. Reach them with `encs-switch-api`, or see [docs/CONFIG.md](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot). |
-| Port security | `InterfaceSecurityTable` templates exist, but the mode and violation enums were never pinned down. |
-
-**The NIM slot cannot be driven from the host — by any OS.** Extracting the
-CIMC firmware settles why: the FPGA that powers the slot (`dash_fpga`) is
-**BMC-owned**, not a host peripheral. The BMC runs the NIM insertion and
-status threads, reads the module's IDPROM over I²C, **authenticates it**, and
-controls power enable. NFVIS contains no ENCS NIM code at all, which fits.
-
-So a `NIM-SSD` from an ISR 4000 gets identified in the CIMC inventory and goes
-no further: measured across a full cold start with a disk fitted, no block
-device, no PCI change, no SMBIOS change, no kernel event. Not a driver
-problem, and not fixable from Proxmox or NFVIS. See
-[docs/FINDINGS.md §8m](docs/FINDINGS.md).
-
-`encs-switch-api` can drive anything the TUI does not. Whatever you configure
-that way is as volatile as the rest, so it needs its own file in
-`/etc/encs-switch/` to survive a power cycle — the replay service applies
-every `*.xml` there in filename order, and one file must hold exactly one
-table. Full detail with the ConfD paths is in
-[docs/CONFIG.md](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot).
-
-**Verified on hardware (2026-08-12).** All 49 wcd tables read back as expected; VLAN isolation,
-port mirroring, PoE on two ports, speed forcing and live VLAN changes all confirmed on a real
-5412 with two PoE devices attached. The duplex enums were resolved (`duplexAdminMode` and
-`duplexOperMode` are inverted relative to each other), and two ways to hang the ASIC were found
-and blocked. Full detail in [docs/FINDINGS.md §8n](docs/FINDINGS.md).
-
-**Testing without the hardware.** `scripts/60-test-tui.py` runs the TUI
-against a fake switch — no network, no chassis. It checks that every view
-fetches and renders (including at 40 columns and with tables missing), that
-every write produces the element names `switch-confd` used, that config
-save/replay round-trips in dependency order, and that cancelling a prompt
-writes nothing. What it *cannot* check is whether the firmware accepts those
-writes: the fixtures come from Cisco's templates, not from a capture. Run it
-before a release; verify on the box before believing a new view works.
-
-```sh
-python3 scripts/60-test-tui.py        # -v to list every check
-```
-
-**Reading the front panel.** The API calls the switch ports `gi0`–`gi7`; the
-chassis silkscreen calls them `GE1/0`–`GE1/7`, and the TUI shows both. They are
-four vertically stacked pairs, **numbered downwards, not across**:
-
-```
-   GE1/0   GE1/2   GE1/4   GE1/6      <- gi0  gi2  gi4  gi6
-   GE1/1   GE1/3   GE1/5   GE1/7      <- gi1  gi3  gi5  gi7
-```
-
-`GE1/1` is directly below `GE1/0`. Count along the top row and you will
-unplug the wrong thing. Verified on a 5412 by cabling `GE1/0`, `GE1/4` and
-`GE1/7` individually; 5406/5408 are unconfirmed.
-
-**Everything else on the panel bypasses the switch** — those jacks go to the
-host CPU or the BMC, and none of their MACs ever appear in the switch's MAC
-table:
-
-| Panel label | What it really is |
-|---|---|
-| `CONSOLE` (top) | serial console to the host CPU — `ttyS0` at **115200 8N1** |
-| `CIMC` (bottom, serial) | out-of-band serial CLI to the BMC |
-| `MGMT CPU` (top) | I210 → the host. This is the NFVIS management port; under Proxmox it is your normal management NIC. |
-| `MGMT CIMC` (bottom) | a **separate** physical jack straight to the BMC. Invisible to the host — the host reaches the CIMC out `MGMT CPU` and back in via your LAN. |
-| `GE0/0` (top row) | I350 `02:00.0` = `enp2s0f0`, fronted by **both** an RJ45 and an SFP jack |
-| `GE0/1` (bottom row) | I350 `02:00.1` = `enp2s0f1`, likewise RJ45 + SFP |
-
-`GE0/0` and `GE0/1` are dual-media: two jacks, one logical port. Under a stock
-in-tree `igb` both report `Port: FIBRE` and **the RJ45 side will not link at
-all** — and pulling the SFP does not wake it up. The NVM presents these as
-fiber-variant devices (`8086:1522`, `Supported link modes: 1000baseKX/Full`)
-and in-tree `igb` has no media-select parameter, so the copper connector is
-never exposed. Cisco's `igb` fork and its `def_media` knob are what select it.
-
-**So on stock Proxmox your only working uplinks are `MGMT CPU`, or a `GE0/x`
-SFP.** Both cage-to-function mappings above were confirmed by moving one
-transceiver between them and watching which port could read its EEPROM.
-
-**Keep a serial cable for this box.** The `CONSOLE` RJ45 at **115200 8N1**
-gives you the GRUB menu *and* a Proxmox login, courtesy of the settings the
-Proxmox installer drops in `/etc/default/grub.d/installer.cfg`. It depends on
-no network, no VLAN and no switch state — which matters here, because the
-switch management VLAN is link-local, its config is volatile, and shutting
-`te2` or mis-detecting the backplane NIC will cut you off from the ASIC
-entirely. That port is the way back in.
-
-```sh
-screen /dev/ttyUSB0 115200        # Linux
-screen /dev/cu.usbserial-XXXX 115200   # macOS
-```
-
-**Front ports come up disabled (`admin DOWN`) with PoE off** after a bootstrap —
-that is the firmware default, and NFVIS's own init is what used to enable them.
-Open the Ports view and press `space`, or apply a saved config.
-
-**The TUI refuses to disable `te1`–`te4`.** Those are internal backplane ports
-with no front-panel jack, and the switch owns its end of each link — it will
-accept the shut. `te2` carries the management VLAN, so shutting it ends your
-session, and with no flash on the ASIC only a cold power cycle undoes it.
-Worse, the serdes stays trained regardless, so a shut backplane port still
-reports `link UP` and nothing on screen looks wrong. Enabling is always
-allowed; only shutting is blocked. Override with `ENCS_ALLOW_TE_SHUT=1`.
 
 ### Link aggregation (LAG / port-channel)
 
@@ -696,109 +687,127 @@ Nothing here restarts the bootstrap VM or touches the ASIC, so updating the
 tools is safe on a live switch. A running TUI keeps its old code until you
 quit and relaunch it.
 
-### Alternative: install from the ISO instead
+### What has not been tested
 
-If you would rather install into a VM yourself, or you are going bare metal,
-use `AlmaLinux-8.9-ENCS5400-switch.iso`.
+Nothing here is known broken — it is unmeasured, and the missing piece is
+hardware rather than code. Grouped by what you would need:
 
-**As a Proxmox VM** — upload the ISO to a storage that holds ISO images
-(`local` by default: *Datacenter → local → ISO Images → Upload*, or just
-`scp` it into `/var/lib/vz/template/iso/`), then:
+| Needs | Untested |
+|---|---|
+| **A second switch** | LAG/LACP negotiation (including the `auto` vs `on` black-hole trap), STP loop breaking, root guard, BPDU guard |
+| **A traffic generator** | Storm-control rate limiting, QoS marking and queueing, policers |
+| **Endpoints with IP addresses** | ACL filtering, IGMP snooping, private VLAN isolation, L3 routing and static ARP |
+| **Nothing — just never run** | MAC flush, counter clear, MSTP, DSCP maps, per-port shaping |
+
+> ⚠ **Spanning tree has never been enabled globally on real hardware.** `te1`
+> and `te2` are both X710 ports to the same host, so the switch may see a loop
+> and block one of them — and if it blocks `te2` the management VLAN goes with
+> it, recoverable only by physical AC removal. Set `STPEnabled=2` on `te1`–`te4`
+> first, and do it with hands on the chassis.
+
+**Still not implemented.** Three of these are blocked on missing information
+rather than effort:
+
+| Area | Why |
+|---|---|
+| IPv4 ACL rules | `switch-confd` only ever built **MAC** ACLs. The element names inside `<IPv4Parameters>` appear nowhere in the extracted source, and a guessed rule is one the switch accepts and never matches. MAC ACLs are complete. |
+| LLDP neighbour table | Does not exist. confd touches only `LLDPGlobalSetting` and `LLDPInterfaceList`, so there is nothing that answers "what is plugged into GE1/3". LLDP can be enabled and timed; it cannot be read back. |
+| Remote SPAN | Needs a reflector port and a remote VLAN. Local SPAN works. |
+| MSTP instances | The client can write region, revision, instance priorities and instance→VLAN maps; there is no view. MSTP on an 8-port edge switch with one region is not worth the screen — use `encs-switch-api`. |
+| DSCP mutation/remark, per-port shaping, class/policy maps | The client can write all of them; there is no view. Reach them with `encs-switch-api`, or see [docs/CONFIG.md](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot). |
+| Port security | `InterfaceSecurityTable` templates exist, but the mode and violation enums were never pinned down. |
+
+**The NIM slot cannot be driven from the host — by any OS.** Extracting the
+CIMC firmware settles why: the FPGA that powers the slot (`dash_fpga`) is
+**BMC-owned**, not a host peripheral. The BMC runs the NIM insertion and
+status threads, reads the module's IDPROM over I²C, **authenticates it**, and
+controls power enable. NFVIS contains no ENCS NIM code at all, which fits.
+
+So a `NIM-SSD` from an ISR 4000 gets identified in the CIMC inventory and goes
+no further: measured across a full cold start with a disk fitted, no block
+device, no PCI change, no SMBIOS change, no kernel event. Not a driver
+problem, and not fixable from Proxmox or NFVIS. See
+[docs/FINDINGS.md §8m](docs/FINDINGS.md).
+
+`encs-switch-api` can drive anything the TUI does not. Whatever you configure
+that way is as volatile as the rest, so it needs its own file in
+`/etc/encs-switch/` to survive a power cycle — the replay service applies
+every `*.xml` there in filename order, and one file must hold exactly one
+table. Full detail with the ConfD paths is in
+[docs/CONFIG.md](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot).
+
+**Verified on hardware (2026-08-12).** All 49 wcd tables read back as expected; VLAN isolation,
+port mirroring, PoE on two ports, speed forcing and live VLAN changes all confirmed on a real
+5412 with two PoE devices attached. The duplex enums were resolved (`duplexAdminMode` and
+`duplexOperMode` are inverted relative to each other), and two ways to hang the ASIC were found
+and blocked. Full detail in [docs/FINDINGS.md §8n](docs/FINDINGS.md).
+
+**Testing without the hardware.** `scripts/60-test-tui.py` runs the TUI
+against a fake switch — no network, no chassis. It checks that every view
+fetches and renders (including at 40 columns and with tables missing), that
+every write produces the element names `switch-confd` used, that config
+save/replay round-trips in dependency order, and that cancelling a prompt
+writes nothing. What it *cannot* check is whether the firmware accepts those
+writes: the fixtures come from Cisco's templates, not from a capture. Run it
+before a release; verify on the box before believing a new view works.
 
 ```sh
-qm create 900 --name encs-switch --machine q35 --bios ovmf \
-    --memory 2048 --cores 2 --net0 virtio,bridge=vmbr0 \
-    --serial0 socket --vga serial0
-qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:16
-qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
-qm set 900 --ide2 local:iso/AlmaLinux-8.9-ENCS5400-switch.iso,media=cdrom
-qm set 900 --boot 'order=ide2;virtio0'
-qm set 900 --smbios1 product=RU5DUzU0MTIvSzk=,base64=1
-qm start 900 && qm terminal 900
+python3 scripts/60-test-tui.py        # -v to list every check
 ```
-
-The default boot entry installs unattended and **erases the disk it picks** —
-which is why the disk is created empty above. When it reboots, drop the CD and
-fix the boot order:
-
-```sh
-qm set 900 --ide2 none --boot order=virtio0
-qm set 900 --hostpci0 0000:$(lspci -d 11ab:be00 | cut -d' ' -f1)   # the Marvell switch
-qm set 900 --onboot 1 --startup order=1
-qm start 900
-```
-
-Passthrough is added *after* installation deliberately — the installer has no
-use for the switch, and leaving it out keeps the install from touching it.
-
-**On bare metal** (AlmaLinux directly on the ENCS, no hypervisor): write the
-ISO to a USB stick and boot it.
-
-```sh
-sudo dd if=AlmaLinux-8.9-ENCS5400-switch.iso of=/dev/sdX bs=4M status=progress oflag=sync
-```
-
-No SMBIOS override is needed — a real ENCS already reports
-`ENCS5412/K9`, so the platform gate passes untouched. Run
-`bash /opt/encs-host/install.sh` locally afterwards; it works the same whether
-"the host" is Proxmox or the ENCS itself.
-
-The boot menu offers three entries: automated install (marked **ERASES DISK**),
-an interactive install if you want to choose the disk yourself, and rescue.
 
 ---
 
-## Deploying on ESXi (experimental)
+## The front panel
 
-**[docs/ESXI.md](docs/ESXI.md) is the walkthrough.** It is marked experimental
-because none of it has been run on hardware — the Proxmox path above is
-verified on a real 5412, that one is reasoned from it. It is written down
-anyway, because the mechanism is hypervisor-agnostic: a passthrough VM pushing
-firmware into the ASIC over PCIe. Nothing in that is Proxmox-specific.
+The API calls the switch ports `gi0`–`gi7`; the chassis silkscreen calls them
+`GE1/0`–`GE1/7`, and the TUI shows both. They are four vertically stacked
+pairs, **numbered downwards, not across**:
 
-The short version of what changes:
-
-| | Proxmox | ESXi |
-|---|---|---|
-| Passthrough | `hostpci0` | DirectPath I/O, possibly a `/etc/vmware/passthru.map` reset override |
-| Platform gate | `--smbios1 product=...` | `SMBIOS.reflectHost = "TRUE"` |
-| **The switch tools** | on the hypervisor | **inside the bootstrap VM** — ESXi has no bash, systemd or curses to run them |
-| `swbr0` (= NFVIS `lan-br`) | VLAN-aware bridge on the te2 NIC | a standard vSwitch whose only uplink is that vmnic |
-| `bridge=swbr0,tag=100` | | a portgroup with VLAN ID 100 |
-| Guest boot ordering | `--startup order=1,up=90` | autostart entry with a 90 s delay |
-
-Everything switch-side — VLANs, PoE, LAG, mirroring, cold-boot replay — is
-unchanged, because it is the same client speaking the same XML API over the
-same VLAN. Only the machine it runs on moves.
-
-The guide grades every step by how much it can be trusted, and ends with a
-[revert procedure](docs/ESXI.md#reverting-everything) that puts the host back
-exactly as it was — it never touches `vSwitch0` or `vmk0`. Read that before
-starting rather than after.
-
-**This is the `experimental/esxi` branch**, which carries the automation as
-well as the guide:
-
-```sh
-./build.sh --esxi <nfvis.iso>      # also writes out/esxi/{vmdk,vmx,README}
-scp -r payload/opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
-ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'        # plan
-ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh --yes'  # apply
+```
+   GE1/0   GE1/2   GE1/4   GE1/6      <- gi0  gi2  gi4  gi6
+   GE1/1   GE1/3   GE1/5   GE1/7      <- gi1  gi3  gi5  gi7
 ```
 
-`install.sh` does passthrough and networking and records everything it creates;
-`uninstall.sh` takes exactly that back out. `--esxi` is a last, separate build
-step — if the conversion fails you still have a working qcow2 and an untouched
-Proxmox path.
+`GE1/1` is directly below `GE1/0`. Count along the top row and you will
+unplug the wrong thing. Verified on a 5412 by cabling `GE1/0`, `GE1/4` and
+`GE1/7` individually; 5406/5408 are unconfirmed.
 
-`python3 scripts/66-test-esxi.py` runs both against a **fake `esxcli`** — the
-same trick `60-test-tui.py` uses on the TUI. It asserts that the dry run writes
-nothing, that install → uninstall is a bit-identical round trip, and that no
-write command ever names `vSwitch0`. That is not the same as having run it on
-ESXi, and the guide says so.
+**Everything else on the panel bypasses the switch** — those jacks go to the
+host CPU or the BMC, and none of their MACs ever appear in the switch's MAC
+table:
 
-It is kept off `main` until somebody has run it on a real chassis. Reports
-either way are welcome.
+| Panel label | What it really is |
+|---|---|
+| `CONSOLE` (top) | serial console to the host CPU — `ttyS0` at **115200 8N1** |
+| `CIMC` (bottom, serial) | out-of-band serial CLI to the BMC |
+| `MGMT CPU` (top) | I210 → the host. This is the NFVIS management port; under Proxmox it is your normal management NIC. |
+| `MGMT CIMC` (bottom) | a **separate** physical jack straight to the BMC. Invisible to the host — the host reaches the CIMC out `MGMT CPU` and back in via your LAN. |
+| `GE0/0` (top row) | I350 `02:00.0` = `enp2s0f0`, fronted by **both** an RJ45 and an SFP jack |
+| `GE0/1` (bottom row) | I350 `02:00.1` = `enp2s0f1`, likewise RJ45 + SFP |
+
+`GE0/0` and `GE0/1` are dual-media: two jacks, one logical port. Under a stock
+in-tree `igb` both report `Port: FIBRE` and **the RJ45 side will not link at
+all** — and pulling the SFP does not wake it up. The NVM presents these as
+fiber-variant devices (`8086:1522`, `Supported link modes: 1000baseKX/Full`)
+and in-tree `igb` has no media-select parameter, so the copper connector is
+never exposed. Cisco's `igb` fork and its `def_media` knob are what select it.
+
+**So on stock Proxmox your only working uplinks are `MGMT CPU`, or a `GE0/x`
+SFP.** Both cage-to-function mappings above were confirmed by moving one
+transceiver between them and watching which port could read its EEPROM.
+
+**Keep a serial cable for this box.** The `CONSOLE` RJ45 at **115200 8N1**
+gives you the GRUB menu *and* a Proxmox login, courtesy of the settings the
+Proxmox installer drops in `/etc/default/grub.d/installer.cfg`. It depends on
+no network, no VLAN and no switch state — which matters here, because the
+switch management VLAN is link-local, its config is volatile, and shutting
+`te2` or mis-detecting the backplane NIC will cut you off from the ASIC
+entirely. That port is the way back in.
+
+```sh
+screen /dev/ttyUSB0 115200        # Linux
+screen /dev/cu.usbserial-XXXX 115200   # macOS
+```
 
 ---
 
@@ -848,34 +857,6 @@ wider network.
 
 ---
 
-## How it works
-
-```
- front gi0-gi7 ──┐
- (8x RJ45, PoE)  │
-                 ▼
-          Marvell BobCat2 ASIC ──── te1/te2 (2x 10G) ──── host X710 ──── Proxmox
-                 ▲                                                        │
-                 │ PCIe 11ab:be00 (passed through)                        │
-                 │                                                        │
-          bootstrap VM ◄────────────────────────────────────────────────┘
-          (boots the ASIC; carries no traffic)
-```
-
-Three separate paths, which is the key to understanding everything else:
-
-| Path | Who owns it | What it does |
-|---|---|---|
-| **Data** | Marvell ASIC | port-to-port switching at line rate; never touches the host CPU |
-| **Boot** | bootstrap VM | pushes firmware over PCIe; a permanent watchdog daemon |
-| **Management** | Proxmox host | HTTPS XML API on `169.254.1.0` over VLAN 2363 |
-
-The VM is *infrastructure*, not a data-plane element — 2 vCPU / 2 GB is enough
-regardless of switch throughput. Management deliberately lives on the host,
-because the backplane NIC does.
-
----
-
 ## Operational warnings
 
 **Never restart the bootstrap service, and avoid stopping the VM.**
@@ -912,6 +893,68 @@ and excludes `kernel*`; if you defeat that, the switch dies silently.
 and newer NFVIS images reportedly lock the BIOS so F2 setup becomes
 unreachable — which would make PCI passthrough impossible to configure.
 
+**Front ports come up disabled (`admin DOWN`) with PoE off** after a bootstrap —
+that is the firmware default, and NFVIS's own init is what used to enable them.
+Open the Ports view and press `space`, or apply a saved config.
+
+**The TUI refuses to disable `te1`–`te4`.** Those are internal backplane ports
+with no front-panel jack, and the switch owns its end of each link — it will
+accept the shut. `te2` carries the management VLAN, so shutting it ends your
+session, and with no flash on the ASIC only a cold power cycle undoes it.
+Worse, the serdes stays trained regardless, so a shut backplane port still
+reports `link UP` and nothing on screen looks wrong. Enabling is always
+allowed; only shutting is blocked. Override with `ENCS_ALLOW_TE_SHUT=1`.
+
+---
+
+## How it works
+
+### The problem this solves
+
+The ENCS 5400's 8 front-panel ports are not NICs. They belong to a **Marvell
+BobCat2 switch ASIC that has no flash** — no firmware of its own at all. On
+every power-on, the host CPU must push a bootstrap into its SRAM and a 26 MB
+firmware image into its DDR over PCIe.
+
+Only NFVIS does that. Install anything else and the 8 LAN ports simply do not
+exist. That is why every "I put Proxmox/ESXi on my ENCS" thread ends with the
+switch unused.
+
+This tooling extracts that bootstrap path and packages it as a tiny AlmaLinux
+VM whose only job is to boot the ASIC — leaving the rest of the machine free
+for whatever hypervisor you actually want.
+
+That the switch *can* be booted this way was discovered by
+**[yeyus](https://forums.servethehome.com/index.php?members/yeyus.35233/)** in
+[Switch bootstrap VM](https://yeyus.notion.site/Switch-bootstrap-VM-04cac1d64bde48b684c51e8dac524245).
+This repository automates it and adds switch management — see [Credits](#credits).
+
+### The three paths
+
+```
+ front gi0-gi7 ──┐
+ (8x RJ45, PoE)  │
+                 ▼
+          Marvell BobCat2 ASIC ──── te1/te2 (2x 10G) ──── host X710 ──── Proxmox
+                 ▲                                                        │
+                 │ PCIe 11ab:be00 (passed through)                        │
+                 │                                                        │
+          bootstrap VM ◄────────────────────────────────────────────────┘
+          (boots the ASIC; carries no traffic)
+```
+
+Three separate paths, which is the key to understanding everything else:
+
+| Path | Who owns it | What it does |
+|---|---|---|
+| **Data** | Marvell ASIC | port-to-port switching at line rate; never touches the host CPU |
+| **Boot** | bootstrap VM | pushes firmware over PCIe; a permanent watchdog daemon |
+| **Management** | Proxmox host | HTTPS XML API on `169.254.1.0` over VLAN 2363 |
+
+The VM is *infrastructure*, not a data-plane element — 2 vCPU / 2 GB is enough
+regardless of switch throughput. Management deliberately lives on the host,
+because the backplane NIC does.
+
 ---
 
 ## Repository layout
@@ -925,10 +968,10 @@ scripts/
   30-build-iso.sh             trim, regenerate repodata, remaster
   40-build-qcow2.sh           run the install under QEMU/KVM
   45-build-vmdk.sh            qcow2 -> ESXi VMDK + .vmx (experimental)
-  66-test-esxi.py             offline tests for the ESXi bundle (fake esxcli)
   50-verify-qcow2.py          boot the result and assert its state
   60-test-tui.py              offline tests for the TUI and the config files
   64-test-vnet.py             offline tests for encs-switch-vnet
+  66-test-esxi.py             offline tests for the ESXi bundle (fake esxcli)
   release.sh                  package + publish the host tools to GitHub
 kickstart/ks-encs.cfg         the kickstart, heavily commented
 payload/                      our code, installed into the image
@@ -991,6 +1034,8 @@ modern kernel.
 
 Project code is **Apache-2.0** (see `LICENSE` and `NOTICE`). Use at your own
 risk on end-of-life hardware.
+
+---
 
 ## Credits
 
