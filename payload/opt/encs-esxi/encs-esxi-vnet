@@ -60,8 +60,11 @@ check_vlan() {
 cmd_status() {
     say "Host half"
     if esxcli network vswitch standard list --vswitch-name="$VSWITCH" >/dev/null 2>&1; then
+        # awk, not `sed -n 's/^   \(Name\|MTU\):/../p'`: BRE alternation with
+        # \| is a GNU/busybox extension that silently matches nothing elsewhere,
+        # so the section would just come out empty.
         esxcli network vswitch standard list --vswitch-name="$VSWITCH" \
-            | sed -n 's/^   \(Name\|MTU\|Uplinks\):/    \1:/p'
+            | awk '/^ *(Name|MTU|Uplinks):/ { sub(/^ */, ""); print "    " $0 }'
     else
         warn "$VSWITCH does not exist - run install.sh first"
         return 0

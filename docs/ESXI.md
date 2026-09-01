@@ -35,6 +35,7 @@
 # build host
 ./build.sh --esxi /path/to/Cisco_NFVIS-4.15.5-FC4.iso
 scp -r payload/opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
+ssh root@<esxi> 'mkdir -p /vmfs/volumes/datastore1/encs-switch'
 scp out/esxi/encs-switch.vmdk out/esxi/encs-switch.vmx root@<esxi>:/vmfs/volumes/datastore1/encs-switch/
 
 # ESXi host - prints the plan and stops
@@ -118,13 +119,21 @@ an X710 port, move it back before starting.
 between `0d:00.0` and `0e:00.0` on the same machine across reinstalls.
 
 ```sh
-esxcli hardware pci list | awk '/^[0-9a-f]{4}:[0-9a-f]{2}:/{a=$1} /Vendor ID: 0x11ab/{print a}'
+esxcli hardware pci list | awk '
+    /^[0-9a-f][0-9a-f]*:[0-9a-f][0-9a-f]*:/ { addr=$1; vid=""; did="" }
+    /^[ \t]*Vendor ID:/ { vid=$3 }
+    /^[ \t]*Device ID:/ { did=$3 }
+    vid == "0x11ab" && did == "0xbe00" && addr != "" { print addr; addr="" }'
 # cross-check:
 lspci | grep -i 11ab
 ```
 
-Take the address of the device whose Device ID is `0xbe00`. Call it `$DEV`
-below.
+Match on **both** IDs and anchor the field names. Each block also carries
+`SubVendor ID` and `SubDevice ID`, which an unanchored `/Vendor ID:/` matches
+too — and on this chassis that is not hypothetical: `0e:00.0` has been the I210
+management NIC on one install and the Marvell on another
+([FINDINGS §8](FINDINGS.md)), so a loose match can hand a VM the wrong device.
+Call the result `$DEV` below.
 
 `encs-esxi/install.sh` derives it exactly this way and refuses to run if it
 finds nothing — it never takes a BDF as an argument, because a stale one would
@@ -270,12 +279,15 @@ in the kickstart — so `vmw_pvscsi` and `vmxnet3` are present and it boots on
 VMware hardware without modification.
 
 `build.sh --esxi` writes `out/esxi/encs-switch.vmx` with all of this already
-set, so registering that file is the short way:
+set (`VM_HWVERSION=17 build.sh --esxi ...` for an older ESXi), so registering
+that file is the short way:
 `vim-cmd solo/registervm /vmfs/volumes/datastore1/encs-switch/encs-switch.vmx`.
 Otherwise the Host Client (New VM → guest `CentOS 8 (64-bit)`) with the
 settings below. The VMX keys, for reference:
 
 ```ini
+virtualHW.version = "19"        # 7.0 U2+. Use 17 on 7.0 GA/U1, or the VM
+                                # will not register.
 firmware = "efi"
 uefi.secureBoot.enabled = "FALSE"
 numvcpus = "2"
@@ -408,11 +420,11 @@ Do **not** enable `encs-switch-startup.service` here. It is Proxmox-only —
 it orders guests via `qm` and `/etc/pve/qemu-server`. The ESXi equivalent is
 [step 8](#8-boot-ordering).
 
-On this branch `encs-switch-vnet` refuses `init`, `teardown` and `startup`
-outright when `/etc/network/interfaces` and `/etc/pve/qemu-server` are not
-both present, and says so with the ESXi alternative — rather than writing a
-file nothing on an AlmaLinux guest reads and leaving you convinced a bridge
-exists.
+On this branch `encs-switch-vnet` refuses `init`, `teardown` and `startup` when
+the files they edit are not there — `/etc/network/interfaces` for the first
+two, plus `/etc/pve/qemu-server` for `startup` — and names the ESXi alternative
+when it sees it is running in a VMware guest. Better than writing a file
+nothing on an AlmaLinux guest reads and leaving you convinced a bridge exists.
 
 ---
 
@@ -467,8 +479,8 @@ session rides on.
 |---|---|
 | `add`, `remove` | **work** — pure switch-side, apart from a closing hint that names `qm` |
 | `status` | **works**, but the host half is always reported as absent — there is no `swbr0` to find, which is correct |
-| `init`, `teardown` | **Proxmox-only.** They write `/etc/network/interfaces`, which on AlmaLinux is not read by anything. Nothing catastrophic, but nothing useful either — the ESXi equivalent is the `esxcli` above |
-| `startup` | **Proxmox-only** — reads `/etc/pve/qemu-server` |
+| `init`, `teardown` | **Proxmox-only** — they edit `/etc/network/interfaces`, which nothing on an AlmaLinux guest reads. On this branch they refuse outright rather than writing it |
+| `startup` | **Proxmox-only** — also needs `/etc/pve/qemu-server`; likewise refuses |
 
 The same isolation caveat applies as on Proxmox, one layer over: anything on a
 portgroup tagged 2363 can configure the switch, because the API has no
@@ -531,8 +543,10 @@ sh /vmfs/volumes/datastore1/encs-esxi/uninstall.sh --yes    # do it
 `uninstall.sh` removes exactly what `install.sh` recorded in
 `/etc/encs-esxi/created` and nothing else, in the order below, and refuses to
 remove a portgroup that still has VMs on it. It does not touch the VM — power
-that off and unregister it first. If the record was lost, `--force` falls back
-to matching the default names.
+that off and unregister it first. If the record was lost, `--force` rebuilds
+the list: portgroups and the vSwitch by their default names, and the uplink and
+the passthrough device by reading them back off the vSwitch and the PCI list —
+the same queries `install.sh` used to find them in the first place.
 
 The manual version, which is also what the script does. Every step is
 reversible and none of it touches `vSwitch0`, `vmk0`, or any VM you did not
@@ -552,10 +566,13 @@ re-bootstrap without a cold power cycle will wedge the loader.
 **2. Remove it from autostart.**
 
 ```sh
-vim-cmd hostsvc/autostartmanager/update_autostartentry <vmid> "None" "0" "0" "None" "0" "systemDefault"
+vim-cmd hostsvc/autostartmanager/update_autostartentry <vmid> "None" "-1" "-1" "None" "-1" "systemDefault"
 # and, if you turned it on for this and want it off again:
 vim-cmd hostsvc/autostartmanager/enable_autostart 0
 ```
+
+`-1` is the sentinel for "not in the autostart sequence" — `0` is a valid
+order and would leave the VM in it with no delay.
 
 **3. Release the passthrough device.**
 

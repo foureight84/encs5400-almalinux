@@ -23,6 +23,9 @@ OUT="${2:?}"
 NAME="${VM_NAME:-encs-switch}"
 MEM="${VM_MEM:-2048}"
 CPUS="${VM_CPUS:-2}"
+# 19 is ESXi 7.0 U2+. An older host refuses to register a VMX whose hardware
+# version it does not know, so 7.0 GA/U1 needs 17.
+HW="${VM_HWVERSION:-19}"
 
 [ -f "$QCOW" ] || die "no such file: $QCOW"
 command -v qemu-img >/dev/null 2>&1 || die "qemu-img not found (qemu-utils)"
@@ -43,7 +46,7 @@ say "Writing $NAME.vmx"
 cat > "$OUT/$NAME.vmx" <<EOF
 .encoding = "UTF-8"
 config.version = "8"
-virtualHW.version = "19"
+virtualHW.version = "$HW"
 displayName = "$NAME"
 guestOS = "centos8-64"
 numvcpus = "$CPUS"
@@ -108,6 +111,7 @@ Deploying $NAME.vmdk on ESXi          (experimental - see docs/ESXI.md)
      # prints the plan and stops; re-run with --yes to apply
 
 2. Upload and import the disk:
+     ssh root@<esxi> 'mkdir -p /vmfs/volumes/datastore1/$NAME'
      scp $NAME.vmdk $NAME.vmx root@<esxi>:/vmfs/volumes/datastore1/$NAME/
      ssh root@<esxi>
      cd /vmfs/volumes/datastore1/$NAME

@@ -74,10 +74,13 @@ command -v esxcli >/dev/null 2>&1 || die "esxcli not found"
 # Never hardcode the BDF: it has been observed at both 0d:00.0 and 0e:00.0 on
 # the same machine across reinstalls, where 0e:00.0 was once the I210 instead.
 say "Locating the Marvell switch ASIC (11ab:be00)"
+# The field lines must be anchored: the same block also carries "SubVendor ID"
+# and "SubDevice ID", and an unanchored /Vendor ID:/ matches those too - which
+# happens to work today only because Vendor precedes SubVendor in the output.
 DEV=$(esxcli hardware pci list 2>/dev/null | awk '
     /^[0-9a-f][0-9a-f]*:[0-9a-f][0-9a-f]*:/ { addr=$1; vid=""; did="" }
-    /Vendor ID:/ { vid=$3 }
-    /Device ID:/ { did=$3 }
+    /^[ \t]*Vendor ID:/ { vid=$3 }
+    /^[ \t]*Device ID:/ { did=$3 }
     vid == "0x11ab" && did == "0xbe00" && addr != "" { print addr; addr="" }
 ' | head -1)
 [ -n "$DEV" ] || die "no 11ab:be00 device found. Is this an ENCS 5400?
@@ -105,6 +108,9 @@ if [ -z "$BACKPLANE" ]; then
        Override with: --backplane vmnicN"
     BACKPLANE=$(printf '%s\n' "$NICS" | sed -n 2p)
 fi
+esxcli network nic list 2>/dev/null | awk -v n="$BACKPLANE" '$1 == n { f=1 } END { exit !f }' \
+    || die "no such uplink: $BACKPLANE
+       esxcli network nic list  shows what this host has."
 info "i40en uplinks: $(printf '%s\n' "$NICS" | tr '\n' ' ') (ordered by PCI address)"
 info "backplane    : $BACKPLANE  (te2 - the one carrying VLAN $VLAN)"
 
@@ -121,12 +127,67 @@ have_pg() {
 }
 have_uplink() {
     esxcli network vswitch standard list --vswitch-name="$1" 2>/dev/null \
-        | grep -q "$2"
+        | awk -v n="$2" '/^ *Uplinks:/ { for (i=2; i<=NF; i++) { gsub(",", "", $i); if ($i == n) f=1 } } END { exit !f }'
+}
+# Which vSwitch, if any, already owns a given uplink.
+uplink_owner() {
+    esxcli network vswitch standard list 2>/dev/null | awk -v n="$1" '
+        /^[^ ]/ { sw=$1 }
+        /^ *Uplinks:/ { for (i=2; i<=NF; i++) { gsub(",", "", $i); if ($i == n) print sw } }
+    ' | head -1
+}
+pg_switch() {
+    esxcli network vswitch standard portgroup list 2>/dev/null \
+        | awk -v p="$1" '$1 == p { print $2 }'
+}
+pg_vlan() {
+    esxcli network vswitch standard portgroup list 2>/dev/null \
+        | awk -v p="$1" '$1 == p { print $NF }'
+}
+# A portgroup of the right name on the wrong vSwitch, or with the wrong VLAN,
+# is worse than one that is missing: have_pg would report it present, the plan
+# would say there is nothing to do, and the guests attached to it would reach
+# the wrong place with nothing on screen suggesting why. Refuse instead of
+# adopting something this script did not create.
+check_existing_pg() {
+    have_pg "$1" || return 0
+    _sw=$(pg_switch "$1"); _vl=$(pg_vlan "$1")
+    [ "$_sw" = "$2" ] || die "portgroup '$1' already exists on $_sw, not $2.
+       Nothing was changed. Rename or remove it, or point this script at other
+       names: PG_MGMT= and PG_LAN= in the environment."
+    [ "$_vl" = "$3" ] || die "portgroup '$1' already exists with VLAN $_vl, and
+       this expects VLAN $3. Nothing was changed - it was not created here, so
+       it is not this script's to re-tag."
+}
+
+# Current MTU of a vSwitch, empty if it does not exist.
+vswitch_mtu() {
+    esxcli network vswitch standard list --vswitch-name="$1" 2>/dev/null \
+        | awk '/^ *MTU:/ { print $2 }'
 }
 
 say "Planning the switch vSwitch"
+
+# Refuse to take an uplink away from another vSwitch. On this box the one that
+# matters is vSwitch0: it carries vmk0 on the MGMT CPU jack, and moving its
+# uplink here would cut the session doing the moving. esxcli would refuse the
+# add anyway, but by then the vSwitch is half-built.
+OWNER=$(uplink_owner "$BACKPLANE")
+if [ -n "$OWNER" ] && [ "$OWNER" != "$VSWITCH" ]; then
+    die "$BACKPLANE is already an uplink of $OWNER.
+       Nothing was changed. If that is genuinely the te2 backplane port, take
+       it off $OWNER yourself first - deliberately, and not over a session
+       that rides on it. If $OWNER carries vmk0, it is the wrong port: the
+       ESXi management VMkernel belongs on the I210 MGMT CPU jack."
+fi
+
 have_vswitch "$VSWITCH" || plan "create vSwitch $VSWITCH (mtu $MTU)"
+CUR_MTU=$(vswitch_mtu "$VSWITCH")
+[ -z "$CUR_MTU" ] || [ "$CUR_MTU" = "$MTU" ] \
+    || plan "set $VSWITCH mtu $CUR_MTU -> $MTU"
 have_uplink "$VSWITCH" "$BACKPLANE" || plan "add uplink $BACKPLANE to $VSWITCH"
+check_existing_pg "$PG_MGMT" "$VSWITCH" "$VLAN"
+check_existing_pg "$PG_LAN" "$VSWITCH" "0"
 have_pg "$PG_MGMT" || plan "create portgroup $PG_MGMT on $VSWITCH, VLAN $VLAN"
 have_pg "$PG_LAN"  || plan "create portgroup $PG_LAN on $VSWITCH, VLAN 0 (untagged)"
 
@@ -165,9 +226,12 @@ if [ "$APPLY" -ne 1 ]; then
     info "dry run - nothing was changed. Re-run with --yes to apply."
     exit 0
 fi
-[ -n "$PLAN" ] || exit 0
 
 # ------------------------------------------------------------------ apply
+# Guarded rather than exited on, so a re-run with nothing left to do still
+# prints the next steps instead of stopping silently.
+if [ -n "$PLAN" ]; then
+
 mkdir -p "$(dirname "$STATE")"
 touch "$STATE"
 record() { echo "$1" >> "$STATE"; }
@@ -179,8 +243,10 @@ if ! have_vswitch "$VSWITCH"; then
     record "vswitch $VSWITCH"
     info "created $VSWITCH"
 fi
-esxcli network vswitch standard set --vswitch-name="$VSWITCH" --mtu="$MTU"
-info "mtu $MTU"
+if [ "$(vswitch_mtu "$VSWITCH")" != "$MTU" ]; then
+    esxcli network vswitch standard set --vswitch-name="$VSWITCH" --mtu="$MTU"
+    info "mtu $MTU"
+fi
 
 if ! have_uplink "$VSWITCH" "$BACKPLANE"; then
     esxcli network vswitch standard uplink add --uplink-name="$BACKPLANE" --vswitch-name="$VSWITCH"
@@ -223,6 +289,8 @@ if /sbin/auto-backup.sh >/dev/null 2>&1; then
 else
     warn "auto-backup.sh failed - config may not survive a reboot"
 fi
+
+fi   # PLAN
 
 # ----------------------------------------------------------------- verify
 say "Next"
