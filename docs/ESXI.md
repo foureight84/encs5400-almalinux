@@ -10,11 +10,13 @@
 > [revert](#reverting-everything) section *before* you start: it exists so a
 > failed attempt costs you a reboot, not your ESXi install.
 >
-> This file is the manual path — every step is a command you run yourself, so
-> you can see exactly what changes. Scripts that do the same thing (a VMDK
-> build target and an `esxcli` installer/uninstaller for the host side) live on
-> the **`experimental/esxi`** branch. They are held off `main` for the same
-> reason this file carries a warning: nobody has run them on a chassis yet.
+> **You are on the `experimental/esxi` branch**, which carries the tooling as
+> well as the walkthrough: a VMDK build target and an `esxcli`
+> installer/uninstaller for the host side. It is kept off `main` for the same
+> reason this file carries a warning — nobody has run it on a chassis yet.
+> Everything below is also written as manual commands, because when an
+> experimental script does something you did not expect, the useful thing to
+> have is the list of what it was trying to do.
 
 | Step | Confidence |
 |---|---|
@@ -24,6 +26,29 @@
 | `SMBIOS.reflectHost` satisfying the platform gate | **medium** — documented ESXi behaviour, never checked against this image |
 | DirectPath I/O accepting the Marvell device | **medium** — the reset method is the one thing that can hard-block this. See [step 1](#1-enable-passthrough-for-the-marvell-device) |
 | ESXi running on this chassis at all | **medium** — Broadwell-DE is at the old end of the support matrix. See [prerequisites](#prerequisites) |
+
+---
+
+## The short version
+
+```sh
+# build host
+./build.sh --esxi /path/to/Cisco_NFVIS-4.15.5-FC4.iso
+scp -r payload/opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
+scp out/esxi/encs-switch.vmdk out/esxi/encs-switch.vmx root@<esxi>:/vmfs/volumes/datastore1/encs-switch/
+
+# ESXi host - prints the plan and stops
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh --yes'
+```
+
+That does passthrough and networking. The VM itself is steps
+[2](#2-get-the-disk-onto-a-datastore)–[6](#6-put-the-vm-on-the-switch-management-network)
+below and `out/esxi/README-esxi.txt`, and the one-line revert is
+`sh /vmfs/volumes/datastore1/encs-esxi/uninstall.sh --yes`.
+
+The rest of this file is what those scripts do and why, which is worth reading
+once before running them on a host you care about.
 
 ---
 
@@ -101,6 +126,10 @@ lspci | grep -i 11ab
 Take the address of the device whose Device ID is `0xbe00`. Call it `$DEV`
 below.
 
+`encs-esxi/install.sh` derives it exactly this way and refuses to run if it
+finds nothing — it never takes a BDF as an argument, because a stale one would
+hand a VM the wrong device.
+
 **Mark it for passthrough:**
 
 ```sh
@@ -122,6 +151,9 @@ passthrough or reset error, tell ESXi how to reset it:
 ```sh
 # /etc/vmware/passthru.map — vendor-id device-id reset-method fptShareable
 echo "11ab  be00  bridge  false" >> /etc/vmware/passthru.map
+
+# or, which also handles the persistence problem below:
+sh /vmfs/volumes/datastore1/encs-esxi/install.sh --reset-method bridge --yes
 ```
 
 Valid reset methods are `flr`, `d3d0`, `link`, `bridge` and `default`; try them
@@ -156,12 +188,20 @@ power. So:
 
 ## 2. Get the disk onto a datastore
 
-`build.sh` produces a qcow2. Convert it on your build host:
+`build.sh --esxi` does the conversion as part of the build and also writes a
+`.vmx` with the awkward settings already in it:
 
 ```sh
-qemu-img convert -f qcow2 -O vmdk -o subformat=streamOptimized \
-    out/AlmaLinux-8.9-ENCS5400-switch.qcow2 \
-    out/AlmaLinux-8.9-ENCS5400-switch.vmdk
+./build.sh --esxi /path/to/Cisco_NFVIS-4.15.5-FC4.iso
+ls out/esxi/          # encs-switch.vmdk  encs-switch.vmx  README-esxi.txt
+```
+
+It is a separate, last step that nothing else depends on: if the conversion
+fails you still have a working qcow2 and a working Proxmox path. By hand, from
+an existing build:
+
+```sh
+scripts/45-build-vmdk.sh out/AlmaLinux-8.9-ENCS5400-switch.qcow2 out/esxi
 ```
 
 Upload it to a datastore (Host Client → Storage → Datastore browser, or `scp`
@@ -197,6 +237,9 @@ esxcli network nic list
 A wrong pick here looks exactly like a switch that never booted, which is the
 same trap `install.sh` warns about on Proxmox.
 
+`install.sh` does all of this, picking the uplink by the same rule and
+recording what it created. By hand:
+
 ```sh
 esxcli network vswitch standard add --vswitch-name=vSwitchENCS
 esxcli network vswitch standard set --vswitch-name=vSwitchENCS --mtu=9000
@@ -226,9 +269,11 @@ The image ships a generic (non-hostonly) initramfs — `dracut-config-generic` i
 in the kickstart — so `vmw_pvscsi` and `vmxnet3` are present and it boots on
 VMware hardware without modification.
 
-Easiest path is the Host Client (New VM → guest `CentOS 8 (64-bit)`), then
-these settings. The equivalent VMX keys, for reference or for a hand-written
-`.vmx`:
+`build.sh --esxi` writes `out/esxi/encs-switch.vmx` with all of this already
+set, so registering that file is the short way:
+`vim-cmd solo/registervm /vmfs/volumes/datastore1/encs-switch/encs-switch.vmx`.
+Otherwise the Host Client (New VM → guest `CentOS 8 (64-bit)`) with the
+settings below. The VMX keys, for reference:
 
 ```ini
 firmware = "efi"
@@ -363,6 +408,12 @@ Do **not** enable `encs-switch-startup.service` here. It is Proxmox-only —
 it orders guests via `qm` and `/etc/pve/qemu-server`. The ESXi equivalent is
 [step 8](#8-boot-ordering).
 
+On this branch `encs-switch-vnet` refuses `init`, `teardown` and `startup`
+outright when `/etc/network/interfaces` and `/etc/pve/qemu-server` are not
+both present, and says so with the ESXi alternative — rather than writing a
+file nothing on an AlmaLinux guest reads and leaving you convinced a bridge
+exists.
+
 ---
 
 ## 7. VMs on the front LAN ports — the `lan-net` model
@@ -383,12 +434,24 @@ stock `lan-net`. Attach a guest to `encs-lan` and it comes out `GE1/0`–`GE1/7`
 **A tagged VLAN needs the switch half and the backplane fix:**
 
 ```sh
-# host: one portgroup per VLAN
+# on ESXi: the host half, one portgroup per VLAN
+sh /vmfs/volumes/datastore1/encs-esxi/encs-esxi-vnet add 100 --name dmz
+
+# in the bootstrap VM: the switch half - encs-esxi-vnet prints this line for
+# you, because neither half does anything useful alone
+encs-switch-vnet add 100 --ports gi0 --name dmz --fix-backplane
+```
+
+`encs-esxi-vnet` is a thin thing — it creates `encs-lan-100` with VLAN ID 100,
+records it so `uninstall.sh` can take it back out, and refuses VLAN 1 (that is
+the untagged `encs-lan` portgroup, where every front port already is) and VLAN
+2363 (the switch's own management VLAN: anything on it can configure the ASIC,
+whose only credentials are the firmware defaults). By hand it is two `esxcli`
+lines:
+
+```sh
 esxcli network vswitch standard portgroup add --portgroup-name=encs-lan-100 --vswitch-name=vSwitchENCS
 esxcli network vswitch standard portgroup set --portgroup-name=encs-lan-100 --vlan-id=100
-
-# in the bootstrap VM: the switch half
-encs-switch-vnet add 100 --ports gi0 --name dmz --fix-backplane
 ```
 
 `add` creates VLAN 100 on the ASIC, makes `GE1/0` an access port in it, enables
@@ -448,7 +511,9 @@ As on Proxmox, **the delay goes on the bootstrap VM, not on the guest waiting**
 | Cold-boot replay | `encs-switch-replay.service`, in the VM | |
 | `lan-net` — VMs on front ports | portgroups on `vSwitchENCS` | step 7 |
 | `encs-switch-vnet add/remove/status` | works in the VM | |
-| `encs-switch-vnet init/teardown/startup` | **not applicable** | `esxcli` / `vim-cmd` do these jobs |
+| `encs-switch-vnet init/teardown/startup` | **not applicable** | `encs-esxi-vnet` and `vim-cmd` do these jobs; the Proxmox subcommands refuse to run here |
+| `install.sh` (host side) | `encs-esxi/install.sh` | passthrough + vSwitch only — the tools stay in the VM |
+| — | `encs-esxi/uninstall.sh` | no Proxmox equivalent; ESXi needs one more |
 | Guest boot ordering | autostart delay | step 8 |
 | GUI bridge picker with a comment explaining which is which | portgroup names | `encs-lan*` vs `VM Network` is the same hint, weaker |
 | Host tool updates (`encs-switch-tui --update`) | works, inside the VM | needs the VM to reach github.com |
@@ -458,8 +523,20 @@ As on Proxmox, **the delay goes on the bootstrap VM, not on the guest waiting**
 
 ## Reverting everything
 
-Every step below is reversible and none of it touches `vSwitch0`, `vmk0`, or
-any VM you did not create for this. Work top to bottom.
+```sh
+sh /vmfs/volumes/datastore1/encs-esxi/uninstall.sh          # show the plan
+sh /vmfs/volumes/datastore1/encs-esxi/uninstall.sh --yes    # do it
+```
+
+`uninstall.sh` removes exactly what `install.sh` recorded in
+`/etc/encs-esxi/created` and nothing else, in the order below, and refuses to
+remove a portgroup that still has VMs on it. It does not touch the VM — power
+that off and unregister it first. If the record was lost, `--force` falls back
+to matching the default names.
+
+The manual version, which is also what the script does. Every step is
+reversible and none of it touches `vSwitch0`, `vmk0`, or any VM you did not
+create for this. Work top to bottom.
 
 **1. Stop the VM.**
 

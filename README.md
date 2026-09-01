@@ -776,9 +776,23 @@ The guide grades every step by how much it can be trusted, and ends with a
 exactly as it was — it never touches `vSwitch0` or `vmk0`. Read that before
 starting rather than after.
 
-Automation for it (a VMDK build target, and `esxcli` install/uninstall scripts
-for the host side) lives on the **`experimental/esxi`** branch, kept off `main`
-until somebody has run it on a real chassis. Reports either way are welcome.
+**This is the `experimental/esxi` branch**, which carries the automation as
+well as the guide:
+
+```sh
+./build.sh --esxi <nfvis.iso>      # also writes out/esxi/{vmdk,vmx,README}
+scp -r payload/opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'        # plan
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh --yes'  # apply
+```
+
+`install.sh` does passthrough and networking and records everything it creates;
+`uninstall.sh` takes exactly that back out. `--esxi` is a last, separate build
+step — if the conversion fails you still have a working qcow2 and an untouched
+Proxmox path.
+
+It is kept off `main` until somebody has run it on a real chassis. Reports
+either way are welcome.
 
 ---
 
@@ -904,6 +918,7 @@ scripts/
   20-resolve-packages.py      minimal package closure (~330 pkgs, not @core)
   30-build-iso.sh             trim, regenerate repodata, remaster
   40-build-qcow2.sh           run the install under QEMU/KVM
+  45-build-vmdk.sh            qcow2 -> ESXi VMDK + .vmx (experimental)
   50-verify-qcow2.py          boot the result and assert its state
   60-test-tui.py              offline tests for the TUI and the config files
   64-test-vnet.py             offline tests for encs-switch-vnet
@@ -912,6 +927,9 @@ kickstart/ks-encs.cfg         the kickstart, heavily commented
 payload/                      our code, installed into the image
   usr/local/sbin/encs-switch-status        (VM) bootstrap health check
   etc/systemd/system/marvell-switch-boot.service
+  opt/encs-esxi/                           (ESXi host bundle - experimental)
+    install.sh / uninstall.sh              passthrough + vSwitch, and its undo
+    encs-esxi-vnet                         portgroup per VLAN (the host half)
   opt/encs-host/                           (host bundle, copied to Proxmox)
     install.sh                             host installer
     encs-switch-tui                        curses UI, built-in manual

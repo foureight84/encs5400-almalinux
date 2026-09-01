@@ -1,0 +1,156 @@
+#!/bin/sh
+# encs-esxi-vnet - the host half of the NFVIS lan-net model, on ESXi.
+# EXPERIMENTAL. Run this ON THE ESXi HOST.
+#
+# On Proxmox one tool does both halves: encs-switch-vnet creates the bridge on
+# the backplane NIC *and* configures the VLAN on the ASIC. ESXi cannot run that
+# tool, so the halves split by machine:
+#
+#   host (here)          one portgroup per VLAN on vSwitchENCS
+#   bootstrap VM         encs-switch-vnet add 100 --ports gi0 --fix-backplane
+#
+# Neither half does anything useful alone. A guest on a VLAN-100 portgroup
+# whose ASIC has no VLAN 100 has a working vNIC and reaches nothing; a front
+# port in VLAN 100 that te2 does not carry is equally invisible. This prints
+# the other half's command every time so the pair stays in step.
+#
+#   encs-esxi-vnet status
+#   encs-esxi-vnet add 100 [--name dmz]
+#   encs-esxi-vnet remove 100
+#
+# POSIX sh only - the ESXi shell is busybox ash.
+set -eu
+
+VSWITCH="${VSWITCH:-vSwitchENCS}"
+PREFIX="${PREFIX:-encs-lan}"
+STATE="${STATE:-/etc/encs-esxi/created}"
+
+say()  { printf '\n==> %s\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+warn() { printf '    WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+uname -a | grep -q VMkernel || die "this is not an ESXi host"
+
+pg_list() { esxcli network vswitch standard portgroup list 2>/dev/null; }
+pg_vlan() { pg_list | awk -v p="$1" '$1 == p { print $NF }'; }
+pg_users() { pg_list | awk -v p="$1" '$1 == p { print $3 }'; }
+have_pg()  { pg_list | awk -v p="$1" '$1 == p { f=1 } END { exit !f }'; }
+
+check_vlan() {
+    case "$1" in
+        ''|*[!0-9]*) die "VLAN must be a number, got '$1'" ;;
+    esac
+    [ "$1" -ge 1 ] && [ "$1" -le 4094 ] || die "VLAN must be 1-4094, got $1"
+    # VLAN 1 is where every front port already is - that is the untagged
+    # 'encs-lan' portgroup, not a tagged one. VLAN 2363 is the switch's own
+    # management VLAN and giving guests a portgroup on it hands them the API.
+    [ "$1" -ne 1 ] || die "VLAN 1 is the untagged case: attach guests to '$PREFIX'.
+       Every front port is already in VLAN 1 - that is stock lan-net."
+    [ "$1" -ne 2363 ] || die "VLAN 2363 is the switch management VLAN.
+       Anything on it can configure the ASIC (the API's only credentials are
+       the firmware defaults). Keep it for the bootstrap VM."
+}
+
+cmd_status() {
+    say "Host half"
+    if esxcli network vswitch standard list --vswitch-name="$VSWITCH" >/dev/null 2>&1; then
+        esxcli network vswitch standard list --vswitch-name="$VSWITCH" \
+            | sed -n 's/^   \(Name\|MTU\|Uplinks\):/    \1:/p'
+    else
+        warn "$VSWITCH does not exist - run install.sh first"
+        return 0
+    fi
+    printf '\n    %-22s %-6s %s\n' "PORTGROUP" "VLAN" "CLIENTS"
+    pg_list | awk -v s="$VSWITCH" 'NR>2 && $2 == s { printf "    %-22s %-6s %s\n", $1, $NF, $3 }'
+
+    say "Switch half"
+    info "not visible from here - the ASIC answers on 169.254.1.0, which"
+    info "belongs to the bootstrap VM on this platform. In the VM:"
+    info "  encs-switch-vnet status"
+
+    say "Guests"
+    esxcli network vm list 2>/dev/null | awk 'NR>2 { print "    " $0 }' || true
+}
+
+cmd_add() {
+    VLAN="${1:?usage: encs-esxi-vnet add <vlan> [--name NAME]}"
+    shift || true
+    NAME=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name) [ $# -ge 2 ] || die "--name needs a value"; NAME="$2"; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+        shift
+    done
+    check_vlan "$VLAN"
+    esxcli network vswitch standard list --vswitch-name="$VSWITCH" >/dev/null 2>&1 \
+        || die "$VSWITCH does not exist - run install.sh first"
+
+    PG="$PREFIX-$VLAN"
+    if have_pg "$PG"; then
+        info "$PG already exists (VLAN $(pg_vlan "$PG"))"
+    else
+        esxcli network vswitch standard portgroup add --portgroup-name="$PG" --vswitch-name="$VSWITCH"
+        esxcli network vswitch standard portgroup set --portgroup-name="$PG" --vlan-id="$VLAN"
+        mkdir -p "$(dirname "$STATE")"
+        echo "portgroup $PG $VSWITCH" >> "$STATE"
+        /sbin/auto-backup.sh >/dev/null 2>&1 || warn "auto-backup.sh failed"
+        say "Created $PG on $VSWITCH, VLAN $VLAN"
+    fi
+
+    say "Now the switch half - run this IN THE BOOTSTRAP VM"
+    cat <<EOF
+    encs-switch-vnet add $VLAN --ports gi0${NAME:+ --name $NAME} --fix-backplane
+
+    That creates VLAN $VLAN on the ASIC, makes the GE1/0 jack an access port in
+    it, enables the port if a cold boot left it shut, and saves the config so a
+    power cut does not undo it.
+
+    --fix-backplane is NOT optional for a tagged VLAN. te2's firmware default
+    is 'trunk, members 1,2363' and nothing else, so without it the front port
+    is in VLAN $VLAN and nothing from the host ever reaches it. It merges the
+    id into te2's existing list rather than replacing it - but that write
+    lands on the link your management session rides on, so read the warning it
+    prints.
+
+    Then attach a guest to the '$PG' portgroup.
+EOF
+}
+
+cmd_remove() {
+    VLAN="${1:?usage: encs-esxi-vnet remove <vlan>}"
+    check_vlan "$VLAN"
+    PG="$PREFIX-$VLAN"
+    have_pg "$PG" || die "$PG does not exist"
+    N=$(pg_users "$PG")
+    if [ "${N:-0}" -gt 0 ] 2>/dev/null; then
+        die "$PG still has $N client(s). Move those VMs off first - a VM whose
+       portgroup disappears loses its NIC at the next power-on."
+    fi
+    esxcli network vswitch standard portgroup remove --portgroup-name="$PG" --vswitch-name="$VSWITCH"
+    if [ -f "$STATE" ]; then
+        grep -v "^portgroup $PG " "$STATE" > "$STATE.tmp" 2>/dev/null || true
+        mv "$STATE.tmp" "$STATE"
+    fi
+    /sbin/auto-backup.sh >/dev/null 2>&1 || warn "auto-backup.sh failed"
+    say "Removed $PG"
+    info "The switch side is untouched: VLAN $VLAN and its front ports still"
+    info "exist on the ASIC. In the VM: encs-switch-vnet remove $VLAN"
+}
+
+[ $# -ge 1 ] || usage
+CMD="$1"; shift
+case "$CMD" in
+    status) cmd_status ;;
+    add)    cmd_add "$@" ;;
+    remove) cmd_remove "$@" ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: $CMD (status | add | remove)" ;;
+esac

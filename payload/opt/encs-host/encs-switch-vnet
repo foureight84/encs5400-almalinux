@@ -580,6 +580,33 @@ def read(path):
         return ""
 
 
+def require_proxmox_host(what):
+    """Refuse the host-side subcommands anywhere they cannot mean anything.
+
+    add/remove/status are pure switch-side and run anywhere the ASIC is
+    reachable - notably inside the bootstrap VM, which is where the tools live
+    on ESXi (docs/ESXI.md). init/teardown/startup are not: they edit
+    /etc/network/interfaces and /etc/pve/qemu-server. Run on the wrong machine
+    they would write a file nothing reads, leaving the operator convinced the
+    bridge exists. Say so instead.
+    """
+    if os.path.exists(IFACES) and os.path.isdir(VMCONF):
+        return
+    missing = "/etc/network/interfaces" if not os.path.exists(IFACES) else VMCONF
+    esxi = "VMware" in read("/sys/class/dmi/id/sys_vendor")
+    sys.exit(
+        f"ERROR: '{what}' is Proxmox-only and {missing} is not here.\n"
+        + ("  This looks like a VMware guest. On ESXi the host half of this "
+           "job belongs\n"
+           "  to the hypervisor: use encs-esxi-vnet there, and keep using "
+           "add/remove/status\n"
+           "  here - they are switch-side and work fine. See docs/ESXI.md.\n"
+           if esxi else
+           "  add/remove/status are switch-side and work anywhere the ASIC is "
+           "reachable;\n"
+           "  only init/teardown/startup need a Proxmox host.\n"))
+
+
 def backup(paths):
     stamp = time.strftime("%Y%m%d-%H%M%S")
     dest = os.path.join(BACKUP_ROOT, stamp)
@@ -1071,12 +1098,9 @@ def cmd_status(args):
 
 
 def cmd_init(args):
+    require_proxmox_host("init")
     bp = backplane_nic()
     say(f"Planning {BRIDGE} on {bp}")
-
-    if not os.path.exists(IFACES):
-        sys.exit(f"ERROR: {IFACES} does not exist - this does not look like "
-                 f"a Debian/Proxmox host.")
 
     old_main = read(IFACES)
     vnets = parse_vnets(old_main)
@@ -1175,6 +1199,7 @@ def cmd_teardown(args):
     switch is configured - and a teardown that silently reset eight ports to
     VLAN 1 would be a nasty surprise for anyone with cables in them.
     """
+    require_proxmox_host("teardown")
     old_main = read(IFACES)
     named = parse_vnets(old_main)
     if BEGIN not in old_main and not named and not iface_exists(BRIDGE):
@@ -1269,6 +1294,7 @@ def cmd_startup(args):
     ~60-90s the ASIC takes to boot. DHCP fails, the guest shrugs, and the
     cause is two layers away from where it shows.
     """
+    require_proxmox_host("startup")
     boot = bootstrap_vmid()
     ours = our_bridges()
     vms = vm_inventory()

@@ -16,6 +16,7 @@ usage: $0 [options] <nfvis.iso>
 
   --iso-only        build the installer ISO, skip the qcow2
   --qcow2-only      build the qcow2 from an already-built ISO
+  --esxi            also emit an ESXi VMDK + .vmx from the qcow2 (experimental)
   --full            keep every package (2.7GB ISO instead of ~1.6GB)
   --no-verify       skip the post-build boot verification
   --out DIR         output directory (default: ./out)
@@ -33,7 +34,7 @@ EOF
 }
 
 OUT_DIR="$HERE/out"; WORK_DIR="$HERE/work"
-DO_ISO=1; DO_QCOW=1; DO_VERIFY=1; MODE=""
+DO_ISO=1; DO_QCOW=1; DO_VERIFY=1; DO_ESXI=0; MODE=""
 ISO=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -41,6 +42,7 @@ while [ $# -gt 0 ]; do
         --qcow2-only) DO_ISO=0 ;;
         --full)       MODE="--full" ;;
         --no-verify)  DO_VERIFY=0 ;;
+        --esxi)       DO_ESXI=1 ;;
         --out)        [ $# -ge 2 ] || die "--out needs a directory"
                       OUT_DIR="$2"; shift ;;
         --work)       [ $# -ge 2 ] || die "--work needs a directory"
@@ -85,6 +87,16 @@ if [ "$DO_QCOW" -eq 1 ]; then
     fi
 fi
 
+# EXPERIMENTAL. Nothing else depends on this and it changes no other artifact,
+# so a failure here is reported and does not fail the build - you still have a
+# working qcow2. See docs/ESXI.md.
+if [ "$DO_ESXI" -eq 1 ]; then
+    [ -f "$BUILT_QCOW" ] || die "qcow2 not found: $BUILT_QCOW (build it first)"
+    say "Building the ESXi artifacts (experimental)"
+    "$HERE/scripts/45-build-vmdk.sh" "$BUILT_QCOW" "$OUT_DIR/esxi" \
+        || warn "the ESXi conversion failed - the qcow2 is unaffected"
+fi
+
 say "Artifacts in $OUT_DIR"
 ls -la "$OUT_DIR"
 
@@ -116,3 +128,14 @@ Next steps
 
 See README.md for the full walkthrough and the operational warnings.
 EOF
+
+if [ "$DO_ESXI" -eq 1 ] && [ -d "$OUT_DIR/esxi" ]; then
+cat <<EOF
+ESXi (experimental)
+-------------------
+     $OUT_DIR/esxi/  holds the VMDK, a .vmx and README-esxi.txt.
+     Read docs/ESXI.md first - nothing on that path has been run on hardware,
+     and it ends with a revert procedure that leaves the host as it was.
+
+EOF
+fi

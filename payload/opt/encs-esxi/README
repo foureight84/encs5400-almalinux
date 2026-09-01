@@ -1,0 +1,72 @@
+ENCS 5412 switch — ESXi HOST bundle          EXPERIMENTAL
+=========================================================
+
+This directory ships inside the bootstrap VM but is NOT meant to run here.
+Copy it to the ESXi host and run it there.
+
+    scp -r /opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
+    ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'
+
+Nothing on this path has been run on real hardware. The full walkthrough,
+with every step graded by how far it can be trusted, is docs/ESXI.md in the
+repository. Read the revert section there before you start.
+
+Run the scripts with `sh <path>` rather than executing them directly — files
+on a VMFS datastore do not always carry the execute bit.
+
+WHY IT IS SMALLER THAN THE PROXMOX BUNDLE
+-----------------------------------------
+ESXi cannot run the switch tools. encs-switch-tui is Python + curses,
+encs-switch-api is bash + curl, and the shell here is busybox ash with no
+bash, no systemd and a stripped Python. So the tools stay in the bootstrap
+VM — where they already are, at /opt/encs-host — and the VM gets a second
+vNIC on a portgroup tagged VLAN 2363 to reach the ASIC at 169.254.1.0.
+
+That leaves the host with exactly two jobs, and they are what is here:
+
+    passthrough    give the Marvell 11ab:be00 device to the bootstrap VM
+    networking     one vSwitch on the te2 X710 function, a portgroup per VLAN
+
+    front gi0-gi7 -> Marvell ASIC -> te1/te2 10G -> host X710 -> vSwitchENCS
+                        ^ PCIe                                       |
+                        |                                    encs-mgmt-2363
+                  bootstrap VM  <-------------------------------------+
+                  (boots the ASIC, and on this platform manages it too)
+
+CONTENTS
+--------
+install.sh          passthrough + vSwitch + portgroups. Prints a plan and
+                    stops; --yes applies it. Records everything it creates in
+                    /etc/encs-esxi/created.
+uninstall.sh        removes exactly what is in that record, in an order that
+                    keeps you logged in. Refuses to remove a portgroup that
+                    still has VMs on it.
+encs-esxi-vnet      the host half of the NFVIS lan-net model: one portgroup
+                    per VLAN. Prints the matching encs-switch-vnet command to
+                    run in the VM, because neither half works alone.
+
+WHAT IT NEVER TOUCHES
+---------------------
+vSwitch0, vmk0, any portgroup it did not create, and any VM. The ESXi
+management VMkernel port belongs on the I210 MGMT CPU jack — the one link
+that depends on no ASIC, no VM and no VLAN, and the way back in when the
+switch side goes wrong. If yours is already on an X710 port, move it before
+running any of this.
+
+THE TWO THINGS MOST LIKELY TO BITE
+----------------------------------
+1. Passthrough reset. ESXi refuses devices it cannot reset cleanly. If the VM
+   will not power on, install.sh --reset-method bridge adds an
+   /etc/vmware/passthru.map entry (try flr, d3d0, link, bridge in that order).
+
+2. /etc is restored from the bootbank at boot. install.sh and uninstall.sh
+   both run /sbin/auto-backup.sh for you; if you edit passthru.map by hand,
+   run it yourself or the change silently reverts on the next reboot.
+
+AND ONE THAT IS NOT SPECIFIC TO ESXi
+------------------------------------
+The loader can only bootstrap an ASIC in WFI. Re-running it against a switch
+that is already up wedges it, and the only recovery is physical AC removal —
+a host reboot is not enough, the ASIC is on standby power. So: no HA restart
+policy on the bootstrap VM, and check `ping 169.254.1.0` before power-cycling
+it. A wedged loader does not mean a dead switch; the ASIC keeps forwarding.
