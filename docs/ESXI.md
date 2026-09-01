@@ -627,6 +627,43 @@ power cord. A CIMC power-off is not enough.
 
 ---
 
+## Testing it without an ESXi host
+
+```sh
+python3 scripts/66-test-esxi.py        # -v to list every check
+```
+
+The same trick `60-test-tui.py` uses on the TUI: `install.sh`, `uninstall.sh`
+and `encs-esxi-vnet` run against a **fake `esxcli`** holding its state in a JSON
+file. The fake host has two I210s, two X710 functions and the Marvell — plus a
+decoy device at `0e:00.0` carrying the Marvell's ids in its *SUBsystem* fields,
+because on this chassis that address really has been the I210 on one install
+and the Marvell on another.
+
+What it asserts is the part you would otherwise have to trust:
+
+- the default run writes nothing at all — the host comes back bit-identical
+- `--yes` creates exactly what it printed, and records exactly that
+- install → `vnet add` → uninstall is a **round trip**: the fake host ends up
+  bit-identical to before it started
+- `vSwitch0` keeps its uplink and portgroups, and **no write command so much as
+  names it**, in every single test
+- it refuses to take an uplink off another vSwitch, to adopt a portgroup it did
+  not create, and to remove a portgroup with a VM still on it
+- a failed removal keeps the record — listing only what is left — instead of
+  deleting it and claiming success
+
+Every `esxcli` write in the bundle was also checked against Broadcom's
+published command reference, and the list parsers tolerate both the indented
+and the flat output formats.
+
+**None of that makes this tested on ESXi.** A fake cannot tell you the real
+`esxcli` accepts these command lines or prints its lists in this shape. What it
+tells you is that the scripts do nothing you did not ask for — which is the
+question worth answering before pointing them at a host you care about.
+
+---
+
 ## Known unknowns
 
 Things a first attempt should watch for, so a report back is useful:

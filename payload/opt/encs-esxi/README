@@ -14,6 +14,11 @@ repository. Read the revert section there before you start.
 Run the scripts with `sh <path>` rather than executing them directly — files
 on a VMFS datastore do not always carry the execute bit.
 
+They are exercised against a fake esxcli by scripts/66-test-esxi.py in the
+repository: dry run writes nothing, install/uninstall is a bit-identical round
+trip, and no write command ever names vSwitch0. That is what stands behind the
+claims below; it is not the same as having been run on ESXi.
+
 WHY IT IS SMALLER THAN THE PROXMOX BUNDLE
 -----------------------------------------
 ESXi cannot run the switch tools. encs-switch-tui is Python + curses,

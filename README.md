@@ -791,6 +791,12 @@ ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh --yes'  # appl
 step — if the conversion fails you still have a working qcow2 and an untouched
 Proxmox path.
 
+`python3 scripts/66-test-esxi.py` runs both against a **fake `esxcli`** — the
+same trick `60-test-tui.py` uses on the TUI. It asserts that the dry run writes
+nothing, that install → uninstall is a bit-identical round trip, and that no
+write command ever names `vSwitch0`. That is not the same as having run it on
+ESXi, and the guide says so.
+
 It is kept off `main` until somebody has run it on a real chassis. Reports
 either way are welcome.
 
@@ -919,6 +925,7 @@ scripts/
   30-build-iso.sh             trim, regenerate repodata, remaster
   40-build-qcow2.sh           run the install under QEMU/KVM
   45-build-vmdk.sh            qcow2 -> ESXi VMDK + .vmx (experimental)
+  66-test-esxi.py             offline tests for the ESXi bundle (fake esxcli)
   50-verify-qcow2.py          boot the result and assert its state
   60-test-tui.py              offline tests for the TUI and the config files
   64-test-vnet.py             offline tests for encs-switch-vnet

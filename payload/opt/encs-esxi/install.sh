@@ -130,9 +130,13 @@ have_uplink() {
         | awk -v n="$2" '/^ *Uplinks:/ { for (i=2; i<=NF; i++) { gsub(",", "", $i); if ($i == n) f=1 } } END { exit !f }'
 }
 # Which vSwitch, if any, already owns a given uplink.
+# The switch name is taken from the block's own "Name:" field, not from the
+# unindented header line above it: older ESXi formatters print the fields with
+# no header and no indent at all, and keying off the header would then read
+# "Name:" as the switch name.
 uplink_owner() {
     esxcli network vswitch standard list 2>/dev/null | awk -v n="$1" '
-        /^[^ ]/ { sw=$1 }
+        /^ *Name:/ { sw=$2 }
         /^ *Uplinks:/ { for (i=2; i<=NF; i++) { gsub(",", "", $i); if ($i == n) print sw } }
     ' | head -1
 }
