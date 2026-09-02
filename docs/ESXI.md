@@ -1,10 +1,14 @@
 # Running this on ESXi — experimental
 
-> **Nothing in this file has been run on hardware.** The Proxmox path in the
-> [README](../README.md) is verified on a real 5412; this one is reasoned from
-> it. It is written down because the mechanism is hypervisor-agnostic — a
-> passthrough VM pushing firmware into the ASIC over PCIe — and everything
-> ESXi-specific here is ordinary DirectPath I/O and vSwitch configuration.
+> **The host side is now verified; the VM side is not.** Steps 1 and 7 —
+> passthrough, the vSwitch, the portgroups and `encs-esxi-vnet` — have been run
+> on a real ENCS 5412 (`ENCS5412/K9`, FGL232931K9) under **ESXi 8.0 U3**
+> (build 24677879). Everything from step 2 on, the bootstrap VM itself, is
+> still reasoned from the Proxmox path rather than observed.
+>
+> That first run found four bugs the offline tests could not: see
+> [what real ESXi taught us](#what-real-esxi-taught-us). All four are fixed and
+> the tests now catch them.
 >
 > Every step below says how much it can be trusted. Read the
 > [revert](#reverting-everything) section *before* you start: it exists so a
@@ -12,20 +16,20 @@
 >
 > **You are on the `experimental/esxi` branch**, which carries the tooling as
 > well as the walkthrough: a VMDK build target and an `esxcli`
-> installer/uninstaller for the host side. It is kept off `main` for the same
-> reason this file carries a warning — nobody has run it on a chassis yet.
-> Everything below is also written as manual commands, because when an
-> experimental script does something you did not expect, the useful thing to
-> have is the list of what it was trying to do.
+> installer/uninstaller for the host side. It stays off `main` until the
+> bootstrap VM has been seen to boot the ASIC on this platform. Everything
+> below is also written as manual commands, because when an experimental
+> script does something you did not expect, the useful thing to have is the
+> list of what it was trying to do.
 
 | Step | Confidence |
 |---|---|
-| The bootstrap itself (VM + passthrough boots the ASIC) | **high** — nothing in it is Proxmox-specific; the guest sees a PCI device either way |
-| vSwitch / portgroup model for VLANs | **high** — VST is exactly what the Proxmox VLAN-aware bridge does |
+| ESXi running on this chassis at all | **verified** — 8.0 U3 build 24677879, 12C/24T, all six NICs and the ASIC enumerated |
+| DirectPath I/O accepting the Marvell device | **verified** — `Current Owner: VM Passthru` with **no** `passthru.map` entry and no reboot. See [step 1](#1-enable-passthrough-for-the-marvell-device) |
+| vSwitch / portgroup model for VLANs | **verified** — `install.sh` and `encs-esxi-vnet` both round-trip on the host |
+| The bootstrap itself (VM + passthrough boots the ASIC) | **high** — nothing in it is Proxmox-specific; the guest sees a PCI device either way. Not yet observed here |
 | Running the tools inside the bootstrap VM | **high** — they are ordinary Python/bash speaking HTTPS to `169.254.1.0` |
 | `SMBIOS.reflectHost` satisfying the platform gate | **medium** — documented ESXi behaviour, never checked against this image |
-| DirectPath I/O accepting the Marvell device | **medium** — the reset method is the one thing that can hard-block this. See [step 1](#1-enable-passthrough-for-the-marvell-device) |
-| ESXi running on this chassis at all | **medium** — Broadwell-DE is at the old end of the support matrix. See [prerequisites](#prerequisites) |
 
 ---
 
@@ -91,11 +95,13 @@ the job does not change at all.
   at least a built image. Everything in the [README](../README.md) about the
   NFVIS ISO, the 4.16+ trap and the build applies unchanged — the ESXi
   difference starts after `build.sh` has produced a disk.
-- **ESXi 7.0 U3 is the target.** The ENCS 5412 is a Xeon D-1557 (Broadwell-DE),
-  which sits at the old end of VMware's support matrix: 8.0 installs but flags
-  pre-Skylake CPUs as deprecated, and 9.0 drops them. Check Broadcom's current
-  HCL before committing to a version — and note that the X710 (`i40en`) and
-  I210 (`igbn`) drivers you need have been in-box since 6.5.
+- **ESXi 8.0 U3 works.** It is what the host side was verified on: build
+  24677879 on a Xeon D-1557 (Broadwell-DE), which sits at the old end of
+  VMware's support matrix — 8.0 flags pre-Skylake CPUs as deprecated, and 9.0
+  drops them. It installs and runs regardless; the deprecation warning is not a
+  refusal. 7.0 U3 remains the conservative choice if you want to stay inside
+  the matrix. Either way the X710 (`i40en`) and I210 (`igbn`) drivers you need
+  have been in-box since 6.5.
 - **VT-d enabled** in the ENCS BIOS (F2). ESXi will not offer passthrough
   without it.
 - **A serial cable.** `CONSOLE` on the front panel, 115200 8N1, gives you the
@@ -142,20 +148,40 @@ hand a VM the wrong device.
 **Mark it for passthrough:**
 
 ```sh
-esxcli hardware pci pcipassthru set --device=0000:0d:00.0 --enable=true --active=true
-esxcli hardware pci pcipassthru list | grep -A3 0000:0d:00.0
+esxcli hardware pci pcipassthru set --device-id=0000:0d:00.0 --enable=true --apply-now
+esxcli hardware pci pcipassthru list | grep 0000:0d:00.0
 ```
 
-`--active=true` tries to apply it without a reboot. If the device shows as
-pending rather than enabled, reboot the host — a device the VMkernel still owns
-cannot be assigned to a VM.
+`--device-id`, not `--device`, and `--apply-now` is a bare flag rather than
+`--active=true` — 8.0 U3 rejects both of the other spellings outright with
+`Error: Invalid option --device`. Note also that `pcipassthru list` prints a
+two-column **table**, unlike every other `hardware pci` list, so there is no
+block to `grep -A3` for.
 
-**The reset method is the likely blocker.** ESXi refuses to pass through a
-device it cannot reset cleanly, and unlike Proxmox it will not be talked out of
-it at power-on time. The Marvell sits alone in its IOMMU group behind a Pericom
-bridge ([FINDINGS §8](FINDINGS.md)), so a bridge-level reset is available even
-if the function itself advertises no FLR. If the VM refuses to power on with a
-passthrough or reset error, tell ESXi how to reset it:
+`--apply-now` applies it without a reboot. If the device shows as pending
+rather than enabled, reboot the host — a device the VMkernel still owns cannot
+be assigned to a VM.
+
+**On the real chassis it took the device immediately.** Both `Configured
+Owner` and `Current Owner` went to `VM Passthru` in the same command, with no
+reboot and no `passthru.map` entry, and ESXi picked `Reset Method: Bridge
+reset` on its own — the Pericom bridge below is what makes that available:
+
+```
+   Reset Method: Bridge reset
+   FPT Sharable: true
+   Configured Owner: VM Passthru
+   Current Owner: VM Passthru
+```
+
+**The reset method is still the thing most likely to bite on a different
+chassis.** ESXi refuses to pass through a device it cannot reset cleanly, and
+unlike Proxmox it will not be talked out of it at power-on time. The Marvell
+sits alone in its IOMMU group behind a Pericom bridge
+([FINDINGS §8](FINDINGS.md)), so a bridge-level reset is available even if the
+function itself advertises no FLR — which is exactly what was observed above.
+If the VM refuses to power on with a passthrough or reset error, tell ESXi how
+to reset it explicitly:
 
 ```sh
 # /etc/vmware/passthru.map — vendor-id device-id reset-method fptShareable
@@ -577,7 +603,7 @@ order and would leave the VM in it with no delay.
 **3. Release the passthrough device.**
 
 ```sh
-esxcli hardware pci pcipassthru set --device=0000:0d:00.0 --enable=false --active=true
+esxcli hardware pci pcipassthru set --device-id=0000:0d:00.0 --enable=false --apply-now
 ```
 
 Remove the `11ab be00` line from `/etc/vmware/passthru.map` if you added one,
@@ -657,10 +683,29 @@ Every `esxcli` write in the bundle was also checked against Broadcom's
 published command reference, and the list parsers tolerate both the indented
 and the flat output formats.
 
-**None of that makes this tested on ESXi.** A fake cannot tell you the real
-`esxcli` accepts these command lines or prints its lists in this shape. What it
-tells you is that the scripts do nothing you did not ask for — which is the
-question worth answering before pointing them at a host you care about.
+**That is not the same as being tested on ESXi, and the first real run proved
+it.** A fake tells you the scripts do nothing you did not ask for. It cannot
+tell you that the real `esxcli` accepts these command lines or prints its lists
+in this shape — and on all four counts below, it did not.
+
+### What real ESXi taught us
+
+The first run on hardware failed on the very first line. Four bugs, none of
+which the 111 offline checks could have caught, because in each case the fake
+was more forgiving than the real thing:
+
+| What broke | Why the fake missed it |
+|---|---|
+| `command -v esxcli` → `ERROR: esxcli not found` | busybox ash has no `command` builtin — it exits 127 with `sh: command: not found`. The `sh` the tests run under does have it. Now uses `type`. |
+| Passthrough state always read as unknown | `pcipassthru list` prints a table; the fake printed one field per line like the other `hardware pci` lists. The plan claimed passthrough needed enabling on every run, and a second run recorded it twice. |
+| `tr` silently missing | ESXi's busybox has no `tr`. The test prepended the fake bindir to the *developer's* `PATH`, so it always resolved. It blanked the "i40en uplinks:" line. |
+| `pcipassthru set --device --active=true` rejected | The fake accepted any `--key=value` it was handed. Real options are `--device-id` and a bare `--apply-now`. |
+
+The fixes to the test matter as much as the fixes to the bundle: the fake now
+prints the real table shape, validates option names against `esxcli --help`,
+and runs with `PATH` set to a curated list of what ESXi's `/bin` and `/sbin`
+actually contain — `tr` deliberately absent. `command -v` and `tr` are also
+scanned for statically, because the test host's shell has both.
 
 ---
 
@@ -668,9 +713,10 @@ question worth answering before pointing them at a host you care about.
 
 Things a first attempt should watch for, so a report back is useful:
 
-1. **Does DirectPath I/O accept the device without a `passthru.map` entry?**
-   This is the single most likely hard blocker and the one thing with no
-   workaround if a bridge reset also fails.
+1. ~~**Does DirectPath I/O accept the device without a `passthru.map` entry?**~~
+   **Answered: yes.** ESXi 8.0 U3 selected `Bridge reset` unprompted and moved
+   the device to `VM Passthru` with no map entry and no reboot. This was the
+   one potential hard blocker; it is not one.
 2. **Does `SMBIOS.reflectHost` actually present `ENCS5412/K9` to the guest?**
    Check with `dmidecode -s system-product-name` in the VM. If it does not, and
    the bootstrap works anyway, that settles the question of whether the gate
@@ -681,7 +727,10 @@ Things a first attempt should watch for, so a report back is useful:
    resets a passthrough device on VM power-on, which is a *different* reset from
    the ASIC's own — the ASIC lives past it. Expected to behave the same; worth
    confirming deliberately, with the power cord in reach.
-4. **Whether ESXi 8.0 installs and runs on this chassis at all**, given the
-   deprecated CPU generation.
+4. ~~**Whether ESXi 8.0 installs and runs on this chassis at all**, given the
+   deprecated CPU generation.~~ **Answered: it does.** 8.0 U3 build 24677879,
+   12C/24T, `HV Support: 3`, with the I350s, X552, both X710 functions, the
+   I210 and the Marvell all enumerated.
 
-If you try this, the useful thing to report is which of the four bit you.
+Two of the four are answered, and both landed the good way. What is left (2
+and 3) is entirely inside the bootstrap VM, which is the part still unrun.

@@ -10,12 +10,21 @@ ANYTHING they were not asked to, and does uninstall put it all back?
     python3 scripts/66-test-esxi.py [-v]
 
 What this CANNOT check is whether real esxcli accepts the command lines or
-prints its lists in the shape the mock does. Every write command here was
-checked against Broadcom's published esxcli reference, and the parsers are
-written to tolerate both the indented and the flat list formats, but neither
-of those is the same as having run it. Nothing in this file makes the bundle
-"tested on ESXi" - it makes it tested against a fake, which is what stands
-between an unreviewed script and a host you care about.
+prints its lists in the shape the mock does - and the first run on a real
+ENCS 5412 (ESXi 8.0 U3) found four places where it did not: no `command`
+builtin in busybox ash, no `tr` at all, `pcipassthru list` printed as a table
+rather than as blocks, and `pcipassthru set` taking --device-id and a bare
+--apply-now rather than --device and --active.
+
+All four are now reflected here: the fake prints the real shapes, rejects
+option names that `esxcli --help` does not list, and runs with PATH limited to
+ESXI_BIN - what ESXi's /bin and /sbin actually hold. The two failures that a
+mock cannot express, because the test host's own shell provides them, are
+scanned for as text in test_posix_sh.
+
+Nothing in this file makes the bundle "tested on ESXi" - it makes it tested
+against a fake that has since been calibrated against one, which is what
+stands between an unreviewed script and a host you care about.
 """
 import json
 import os
@@ -66,9 +75,10 @@ FAKE_HOST = {
 }
 
 FAKE_ESXCLI = r'''#!/usr/bin/env python3
-"""Fake esxcli. Output shapes follow ESXi 7.x; the write commands follow
-Broadcom's esxcli reference. Anything not implemented is an error, so a
-script reaching for a command this does not know fails loudly."""
+"""Fake esxcli. Output shapes were checked against ESXi 8.0 U3 on a real
+ENCS 5412; the write commands follow Broadcom's esxcli reference. Anything
+not implemented is an error, so a script reaching for a command this does
+not know fails loudly."""
 import json, os, sys
 
 DB = os.environ["MOCKDB"]
@@ -77,13 +87,43 @@ def save(): json.dump(db, open(DB, "w"), indent=1)
 
 args, opts = [], {}
 for a in sys.argv[1:]:
-    if a.startswith("--") and "=" in a:
-        k, v = a[2:].split("=", 1); opts[k] = v
+    if a.startswith("--"):
+        # Bare flags are real: `pcipassthru set --apply-now` takes no value.
+        k, _, v = a[2:].partition("=")
+        opts[k] = v if _ else True
     else:
         args.append(a)
 cmd = " ".join(args)
 def fail(m):
     print("Error: " + m, file=sys.stderr); sys.exit(1)
+
+# Real esxcli rejects an option it does not know, and the exact spellings are
+# not guessable: `pcipassthru set` takes --device-id and a bare --apply-now,
+# not the --device/--active a reading of the other namespaces suggests. The
+# mock used to take whatever it was handed, so install.sh shipped with option
+# names that ESXi 8.0 U3 refuses outright. Taken from `esxcli <cmd> --help`.
+ALLOWED = {
+    "network vswitch standard add": {"vswitch-name", "ports"},
+    "network vswitch standard set": {"vswitch-name", "mtu", "cdp-status"},
+    "network vswitch standard remove": {"vswitch-name"},
+    "network vswitch standard list": {"vswitch-name"},
+    "network vswitch standard uplink add": {"uplink-name", "vswitch-name"},
+    "network vswitch standard uplink remove": {"uplink-name", "vswitch-name"},
+    "network vswitch standard portgroup add": {"portgroup-name", "vswitch-name"},
+    "network vswitch standard portgroup set": {"portgroup-name", "vlan-id"},
+    "network vswitch standard portgroup remove": {"portgroup-name", "vswitch-name"},
+    "network vswitch standard portgroup list": set(),
+    "network nic list": set(),
+    "network vm list": set(),
+    "network ip interface list": set(),
+    "hardware pci list": set(),
+    "hardware pci pcipassthru list": set(),
+    "hardware pci pcipassthru set": {"device-id", "enable", "apply-now"},
+}
+if cmd in ALLOWED:
+    for k in opts:
+        if k not in ALLOWED[cmd]:
+            print("Error: Invalid option --%s" % k, file=sys.stderr); sys.exit(1)
 def log(m):
     with open(os.environ["MOCKLOG"], "a") as f:
         f.write(m + "\n")
@@ -162,14 +202,16 @@ elif cmd == "hardware pci list":
         print("   SubDevice ID: 0xbe00")
         print()
 elif cmd == "hardware pci pcipassthru list":
+    # A table, unlike every other `hardware pci` list. Checked against ESXi
+    # 8.0 U3 on a real ENCS 5412; the block form this used to print is what
+    # let a parser that could never read it pass.
+    print("Device ID     Enabled")
+    print("------------  -------")
     for addr, en in db["passthru"].items():
-        print(addr)
-        print("   Device Address: %s" % addr)
-        print("   Enabled: %s" % ("true" if en else "false"))
-        print()
+        print("%-14s%s" % (addr, "true" if en else "false"))
 elif cmd == "hardware pci pcipassthru set":
-    if opts["device"] not in db["passthru"]: fail("device not passthru capable")
-    db["passthru"][opts["device"]] = opts["enable"] == "true"; save()
+    if opts["device-id"] not in db["passthru"]: fail("device not passthru capable")
+    db["passthru"][opts["device-id"]] = opts["enable"] == "true"; save()
 elif cmd == "network vm list":
     print("World ID  Name    Num Ports  Networks")
     print("--------  ------  ---------  --------")
@@ -183,6 +225,19 @@ else:
 
 FAKE_UNAME = "#!/bin/sh\nexec /usr/bin/printf '%s\\n' " \
              "'VMkernel esxi 7.0.3 #1 SMP Release build-19193900 x86_64 ESXi'\n"
+
+
+# What ESXi 8.0 U3 has in /bin and /sbin, restricted to the general-purpose
+# tools a shell script might reach for. NOT here, and this is the point:
+# tr, xxd, realpath, column, getopt, timeout's GNU flags, bash.
+ESXI_BIN = ("sh", "python3", "awk", "basename", "cat", "chmod", "cksum", "cp", "cut", "date",
+            "dd", "df", "diff", "dirname", "du", "echo", "egrep", "env",
+            "expr", "false", "fgrep", "find", "grep", "gzip", "head",
+            "hexdump", "hostname", "kill", "ln", "ls", "md5sum", "mkdir",
+            "mkfifo", "mktemp", "more", "mv", "od", "printf", "ps", "pwd",
+            "readlink", "rm", "rmdir", "sed", "seq", "sha1sum", "sha256sum",
+            "sleep", "sort", "stat", "tail", "tar", "tee", "test", "touch",
+            "true", "uname", "uniq", "wc", "which", "xargs")
 
 
 class Host:
@@ -200,6 +255,16 @@ class Host:
             with open(p, "w") as f:
                 f.write(body)
             os.chmod(p, 0o755)
+        # Only what ESXi's /bin actually holds. `tr` is deliberately absent -
+        # it is the one thing the bundle used that busybox is not built with
+        # here. Taken from `ls /bin /sbin` on ESXi 8.0 U3.
+        for name in ESXI_BIN:
+            dst = os.path.join(bindir, name)
+            src = shutil.which(name)
+            # The fakes above win: `uname` is in both lists, and the real one
+            # would report Darwin/Linux and fail the VMkernel check.
+            if src and not os.path.exists(dst):
+                os.symlink(src, dst)
         self.bindir = bindir
         self.reset()
 
@@ -212,7 +277,10 @@ class Host:
 
     def run(self, script, *args, **env):
         e = dict(os.environ)
-        e["PATH"] = self.bindir + os.pathsep + e["PATH"]
+        # PATH is the fake bindir and nothing else. Appending the real PATH
+        # is what hid the `tr` calls: ESXi has no `tr`, but every developer
+        # machine does, so the missing binary only ever showed up on the host.
+        e["PATH"] = self.bindir
         e["MOCKDB"] = self.db
         e["MOCKLOG"] = self.log
         e["STATE"] = self.state
@@ -290,6 +358,11 @@ def test_apply(h):
     check(sw.get("pgs", {}).get("encs-mgmt-2363") == 2363, "mgmt portgroup on VLAN 2363")
     check(sw.get("pgs", {}).get("encs-lan") == 0, "lan portgroup untagged")
     check(d["passthru"]["0000:0d:00.0"] is True, "passthrough enabled on the Marvell")
+    # Not decoration: the uplink list is built with a shell idiom that ESXi's
+    # missing `tr` used to blank silently, printing "i40en uplinks:" and
+    # nothing. An operator reads that line to confirm te2 was picked.
+    check("i40en uplinks: vmnic2 vmnic3" in r.stdout,
+          f"names both uplinks in PCI order: {[l for l in r.stdout.splitlines() if 'uplinks' in l]}")
     check(sorted(h.record()) == sorted([
         "vswitch vSwitchENCS", "uplink vmnic3 vSwitchENCS",
         "portgroup encs-mgmt-2363 vSwitchENCS", "portgroup encs-lan vSwitchENCS",
@@ -547,6 +620,14 @@ def test_posix_sh():
         (r"^\s*declare\s", "declare"),
         (r"^\s*function\s+\w+", "function keyword"),
         (r"\[\s[^]]*\s==\s", "== inside [ ]"),
+        # `command` is a POSIX builtin that busybox ash does not implement: on
+        # ESXi 8.0 U3, `command -v x` exits 127 with "sh: command: not found".
+        # The sh this test runs under does have it, so only a text scan
+        # catches it. `type` is the builtin ESXi does provide.
+        (r"\bcommand\s+-v\b", "command -v (busybox ash has no `command`)"),
+        # No `tr` in ESXi's busybox either. It is absent from ESXI_BIN too, so
+        # a load-bearing use fails the run outright; this catches the rest.
+        (r"(^|[|(;&`]|\$\()\s*tr\s", "tr (not on ESXi)"),
     )
     for f in ("install.sh", "uninstall.sh", "encs-esxi-vnet"):
         p = os.path.join(BUNDLE, f)

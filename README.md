@@ -326,11 +326,18 @@ Proxmox path.
 `python3 scripts/66-test-esxi.py` runs both against a **fake `esxcli`** — the
 same trick `60-test-tui.py` uses on the TUI. It asserts that the dry run writes
 nothing, that install → uninstall is a bit-identical round trip, and that no
-write command ever names `vSwitch0`. That is not the same as having run it on
-ESXi, and the guide says so.
+write command ever names `vSwitch0`. The fake's output shapes and option names
+were checked against ESXi 8.0 U3 on a real 5412, and it runs with `PATH` cut
+down to what ESXi's `/bin` actually holds — the first real run found four bugs
+the earlier, more forgiving fake could not, and those are what that hardening
+is for.
 
-It is kept off `main` until somebody has run it on a real chassis. Reports
-either way are welcome.
+**The host side is verified on hardware**: passthrough, the vSwitch, the
+portgroups and `encs-esxi-vnet` all run on a real ENCS 5412 under ESXi 8.0 U3,
+and DirectPath I/O takes the Marvell with no `passthru.map` entry and no
+reboot. The **bootstrap VM** — everything downstream of `install.sh` — has not
+been booted there yet, which is why this stays off `main`.
+[docs/ESXI.md](docs/ESXI.md) grades every step. Reports either way are welcome.
 
 ---
 

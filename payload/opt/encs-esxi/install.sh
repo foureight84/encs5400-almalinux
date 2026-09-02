@@ -68,7 +68,10 @@ plan() { PLAN="$PLAN$1
 # ------------------------------------------------------------------ sanity
 uname -a | grep -q VMkernel || die "this is not an ESXi host (uname says $(uname -s)).
        The Proxmox/Linux installer is opt/encs-host/install.sh."
-command -v esxcli >/dev/null 2>&1 || die "esxcli not found"
+# `command` is not a builtin in the ESXi busybox ash - `command -v` exits 127
+# with "sh: command: not found", so the check below used to fail on every real
+# host.  `type` is a builtin there and is what busybox actually provides.
+type esxcli >/dev/null 2>&1 || die "esxcli not found"
 
 # ------------------------------------------------------- the Marvell device
 # Never hardcode the BDF: it has been observed at both 0d:00.0 and 0e:00.0 on
@@ -87,10 +90,12 @@ DEV=$(esxcli hardware pci list 2>/dev/null | awk '
        Cross-check with: lspci | grep -i 11ab"
 info "switch ASIC at $DEV"
 
-PT_STATE=$(esxcli hardware pci pcipassthru list 2>/dev/null | awk -v d="$DEV" '
-    $0 ~ "^"d"$" { hit=1; next }
-    hit && /Enabled:/ { print $2; exit }
-')
+# A two-column table - "0000:0d:00.0    false" - not the block-per-device
+# layout the rest of `esxcli hardware pci` uses.  Reading it as blocks left
+# PT_STATE empty on every host, so the plan always claimed passthrough needed
+# enabling and a re-run recorded it a second time.
+PT_STATE=$(esxcli hardware pci pcipassthru list 2>/dev/null \
+    | awk -v d="$DEV" '$1 == d { print $2; exit }')
 info "passthrough currently: ${PT_STATE:-unknown}"
 [ "${PT_STATE:-}" = "true" ] || plan "enable passthrough on $DEV"
 
@@ -103,7 +108,9 @@ say "Locating the X710 backplane uplink"
 NICS=$(esxcli network nic list 2>/dev/null | awk '$3 == "i40en" { print $2" "$1 }' | sort | awk '{print $2}')
 NICCOUNT=$(printf '%s\n' "$NICS" | grep -c . || true)
 if [ -z "$BACKPLANE" ]; then
-    [ "$NICCOUNT" -ge 2 ] || die "expected 2 i40en uplinks, found ${NICCOUNT}: $(printf '%s\n' "$NICS" | tr '\n' ' ')
+    # $NICS unquoted: word splitting joins the lines with spaces.  ESXi has
+    # no `tr`, and the missing binary would have blanked both these lists.
+    [ "$NICCOUNT" -ge 2 ] || die "expected 2 i40en uplinks, found ${NICCOUNT}: $(echo $NICS)
        Is this the ENCS host? Is the i40en driver loaded?
        Override with: --backplane vmnicN"
     BACKPLANE=$(printf '%s\n' "$NICS" | sed -n 2p)
@@ -111,7 +118,7 @@ fi
 esxcli network nic list 2>/dev/null | awk -v n="$BACKPLANE" '$1 == n { f=1 } END { exit !f }' \
     || die "no such uplink: $BACKPLANE
        esxcli network nic list  shows what this host has."
-info "i40en uplinks: $(printf '%s\n' "$NICS" | tr '\n' ' ') (ordered by PCI address)"
+info "i40en uplinks: $(echo $NICS) (ordered by PCI address)"
 info "backplane    : $BACKPLANE  (te2 - the one carrying VLAN $VLAN)"
 
 # ------------------------------------------------------------- the vSwitch
@@ -272,7 +279,11 @@ if ! have_pg "$PG_LAN"; then
 fi
 
 if [ "${PT_STATE:-}" != "true" ]; then
-    esxcli hardware pci pcipassthru set --device="$DEV" --enable=true --active=true
+    # --device-id, not --device, and --apply-now is a bare flag, not
+    # --active=true. Both wrong forms are rejected outright by ESXi 8.0 U3:
+    # "Error: Invalid option --device". --apply-now unbinds the device now
+    # instead of at the next reboot.
+    esxcli hardware pci pcipassthru set --device-id="$DEV" --enable=true --apply-now
     record "passthru $DEV"
     info "passthrough enabled on $DEV"
 fi
@@ -300,7 +311,7 @@ fi   # PLAN
 say "Next"
 cat <<EOF
     1. Check passthrough took effect:
-         esxcli hardware pci pcipassthru list | grep -A2 $DEV
+         esxcli hardware pci pcipassthru list | grep $DEV
        If it says pending rather than enabled, reboot the host - a device the
        VMkernel still owns cannot be given to a VM.
 

@@ -176,7 +176,9 @@ while read -r k a b; do
             warn "could not remove vSwitch $a"; OK=0
         fi ;;
     passthru)
-        if esxcli hardware pci pcipassthru set --device="$a" --enable=false --active=true; then
+        # --device-id / --apply-now: see the note in install.sh. ESXi 8.0 U3
+        # rejects --device and --active outright.
+        if esxcli hardware pci pcipassthru set --device-id="$a" --enable=false --apply-now; then
             info "passthrough disabled on $a"
         else
             warn "could not disable passthrough on $a"; OK=0

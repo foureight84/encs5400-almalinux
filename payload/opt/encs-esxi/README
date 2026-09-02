@@ -7,17 +7,19 @@ Copy it to the ESXi host and run it there.
     scp -r /opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
     ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'
 
-Nothing on this path has been run on real hardware. The full walkthrough,
+These three scripts HAVE been run on a real ENCS 5412 under ESXi 8.0 U3.
+What has not is the bootstrap VM they set the stage for. The full walkthrough,
 with every step graded by how far it can be trusted, is docs/ESXI.md in the
 repository. Read the revert section there before you start.
 
 Run the scripts with `sh <path>` rather than executing them directly — files
 on a VMFS datastore do not always carry the execute bit.
 
-They are exercised against a fake esxcli by scripts/66-test-esxi.py in the
-repository: dry run writes nothing, install/uninstall is a bit-identical round
-trip, and no write command ever names vSwitch0. That is what stands behind the
-claims below; it is not the same as having been run on ESXi.
+They are also exercised against a fake esxcli by scripts/66-test-esxi.py in
+the repository: dry run writes nothing, install/uninstall is a bit-identical
+round trip, and no write command ever names vSwitch0. The fake's output shapes,
+option names and PATH were corrected against 8.0 U3 after the first real run —
+which failed on its first line and found four things the old fake could not.
 
 WHY IT IS SMALLER THAN THE PROXMOX BUNDLE
 -----------------------------------------
@@ -60,9 +62,11 @@ running any of this.
 
 THE TWO THINGS MOST LIKELY TO BITE
 ----------------------------------
-1. Passthrough reset. ESXi refuses devices it cannot reset cleanly. If the VM
-   will not power on, install.sh --reset-method bridge adds an
-   /etc/vmware/passthru.map entry (try flr, d3d0, link, bridge in that order).
+1. Passthrough reset. ESXi refuses devices it cannot reset cleanly. On the
+   5412 it did not need help — 8.0 U3 picked "Bridge reset" itself and took
+   the device live with no reboot. If yours will not power on,
+   install.sh --reset-method bridge adds an /etc/vmware/passthru.map entry
+   (try flr, d3d0, link, bridge in that order).
 
 2. /etc is restored from the bootbank at boot. install.sh and uninstall.sh
    both run /sbin/auto-backup.sh for you; if you edit passthru.map by hand,
