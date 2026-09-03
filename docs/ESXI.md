@@ -42,25 +42,58 @@
 
 ## The short version
 
-```sh
-# build host
-./build.sh --esxi /path/to/Cisco_NFVIS-4.15.5-FC4.iso
-scp -r payload/opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
-ssh root@<esxi> 'mkdir -p /vmfs/volumes/datastore1/encs-switch'
-scp out/esxi/encs-switch.vmdk out/esxi/encs-switch.vmx root@<esxi>:/vmfs/volumes/datastore1/encs-switch/
+Nine steps, start to finish. Each links to the detail below.
 
-# ESXi host - prints the plan and stops
-ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'
-ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh --yes'
+```sh
+# 1. BUILD  (x86_64 Linux with KVM - an arm64 Mac cannot do this)
+./build.sh --esxi /path/to/Cisco_NFVIS-4.15.5-FC4.iso
+
+# 2. HOST SIDE  (passthrough + vSwitch + portgroups)
+scp -r payload/opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'        # plan
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh --yes'  # apply
+
+# 3. DISK
+ssh root@<esxi> 'mkdir -p /vmfs/volumes/datastore1/encs-switch'
+scp out/esxi/encs-switch.vmdk out/esxi/encs-switch.vmx \
+    root@<esxi>:/vmfs/volumes/datastore1/encs-switch/
+ssh root@<esxi> 'cd /vmfs/volumes/datastore1/encs-switch &&
+    vmkfstools -i encs-switch.vmdk -d thin disk.vmdk && rm -f encs-switch.vmdk &&
+    sed -i "s|^scsi0:0.fileName.*|scsi0:0.fileName = \"disk.vmdk\"|" encs-switch.vmx'
+
+# 4. REGISTER + attach the Marvell (Host Client, or the block install.sh printed)
+ssh root@<esxi> 'vim-cmd solo/registervm \
+    /vmfs/volumes/datastore1/encs-switch/encs-switch.vmx'
+
+# 5. BOOTSTRAP - power on, and EXPECT THE VM TO DIE ~60s in. That is normal.
+ssh root@<esxi> 'vim-cmd vmsvc/power.on <vmid>'
+
+# 6. CONFIRM the switch came up anyway (from any VM on encs-mgmt-2363)
+ping -c2 169.254.1.0
+
+# 7. SWITCH TO MANAGEMENT ROLE: remove the PCI device from the VM, power it
+#    back on, then inside it:
+nmcli con add type ethernet ifname ens224 con-name encs-mgmt \
+      ipv4.method manual ipv4.addresses 169.254.1.1/16 \
+      ipv4.never-default yes ipv6.method ignore
+/opt/encs-host/encs-switch-tui
 ```
 
-That does passthrough and networking. The VM itself is steps
-[2](#2-get-the-disk-onto-a-datastore)–[6](#6-put-the-vm-on-the-switch-management-network)
-below and `out/esxi/README-esxi.txt`, and the one-line revert is
+Revert the host side with
 `sh /vmfs/volumes/datastore1/encs-esxi/uninstall.sh --yes`.
 
-The rest of this file is what those scripts do and why, which is worth reading
-once before running them on a host you care about.
+**The three things that surprise people**, all covered below:
+
+1. The bootstrap VM is **killed by an IOMMU fault** every run
+   ([why](#the-iommu-fault)). The switch comes up anyway. Do not read the VM
+   dying as failure.
+2. Bootstrap and management are **two different VM configurations**
+   ([why](#two-jobs-two-vms-how-this-actually-works-on-esxi)), and booting a VM
+   that still has the Marvell attached while the switch is up **wedges it**
+   until AC is pulled.
+3. Bootstrap must re-run after **every host power-on or reboot** - a warm
+   reboot drops the switch, though it leaves the ASIC re-bootstrappable rather
+   than wedged.
 
 ---
 
@@ -98,6 +131,13 @@ the job does not change at all.
 
 ## Prerequisites
 
+- **A build host that is x86_64 Linux with KVM.** The qcow2 step installs
+  AlmaLinux under QEMU, and `createrepo_c` has no Homebrew formula, so an
+  arm64 Mac cannot build this at all. A VM on the ENCS itself works well and is
+  what this was built on; on AlmaLinux 9 you also need two symlinks that
+  `check_deps` does not mention: `qemu-system-x86_64` →
+  `/usr/libexec/qemu-kvm`, and `/usr/share/OVMF/OVMF_CODE.fd` →
+  `../edk2/ovmf/OVMF_CODE.fd`.
 - **An ENCS 5412 (or 5406/5408) that already works with the Proxmox path**, or
   at least a built image. Everything in the [README](../README.md) about the
   NFVIS ISO, the 4.16+ trap and the build applies unchanged — the ESXi
@@ -340,6 +380,24 @@ ethernet1.present = "TRUE"
 ethernet1.virtualDev = "vmxnet3"
 ethernet1.networkName = "encs-mgmt-2363"      # switch management VLAN
 
+# WITHOUT THESE the VM will not power on once a passthrough device is added:
+# "No PCIe slot available for SCSI0 ... Too many PCI devices are already
+# configured". The Host Client writes them for you; a hand-written VMX must
+# say them itself.
+pciBridge0.present = "TRUE"
+pciBridge4.present = "TRUE"
+pciBridge4.virtualDev = "pcieRootPort"
+pciBridge4.functions = "8"
+pciBridge5.present = "TRUE"
+pciBridge5.virtualDev = "pcieRootPort"
+pciBridge5.functions = "8"
+pciBridge6.present = "TRUE"
+pciBridge6.virtualDev = "pcieRootPort"
+pciBridge6.functions = "8"
+pciBridge7.present = "TRUE"
+pciBridge7.virtualDev = "pcieRootPort"
+pciBridge7.functions = "8"
+
 # satisfies switch-confd's dmidecode platform gate by reflecting the real
 # chassis SMBIOS - on an ENCS that is already ENCS5412/K9
 SMBIOS.reflectHost = "TRUE"
@@ -351,8 +409,27 @@ sched.mem.pin = "TRUE"
 ```
 
 Add the PCI device through the Host Client (**Add other device → PCI device**)
-rather than by hand — it fills in `pciPassthru0.id` and the host-specific
-`pciPassthru0.systemId` correctly, and those are easy to get subtly wrong.
+rather than by hand. Both values are host-specific *and* the id is not the
+format anyone guesses:
+
+```ini
+pciPassthru0.present  = "TRUE"
+pciPassthru0.id       = "00000:013:00.0"   # NOT 0000:0d:00.0
+pciPassthru0.deviceId = "0xbe00"
+pciPassthru0.vendorId = "0x11ab"
+pciPassthru0.systemId = "<esxcli system uuid get on THIS host>"
+```
+
+ESXi formats the id as `%05d:%03d:%02d.%d` with **every field in decimal** —
+the format string is in `/usr/lib/vmware/drivers/lib/libpci_bus.so`. So bus
+`0x0d` is `013`, and a device at slot `0x1d` would be `29`, not `1d`. A hex BDF
+is refused with `AH No device hints found` and `Failed to generate predicates
+for pciPassthru0---invalid VM configuration`, which names neither the key nor
+the format.
+
+`install.sh` prints the correct block for whatever address it found on your
+host, so the reliable options are: the Host Client, `govc device.pci.add -vm
+encs-switch 0000:0d:00.0`, or pasting what `install.sh` gave you.
 
 Three things that will otherwise waste your afternoon:
 
@@ -377,26 +454,81 @@ baud inside the VM; the 115200 in the README is the *chassis* console.
 
 ---
 
-## 5. First boot: does the ASIC come up?
+## 5. Bootstrap: power on, and expect the VM to die
 
-Power on and watch the guest:
+Power on the VM. About 60 seconds later ESXi kills it:
 
-```sh
-journalctl -u marvell-switch-boot -f
+```
+PCI passthru device 0000:0d:00.0 caused an IOMMU fault type 5 at
+address 0xe0041000.  Powering off the virtual machine.
 ```
 
-Cold ASIC to operational is about 60 s, ending in `ROS ready!`. The sequence
-and the failure modes are identical to the README's — nothing about them is
-hypervisor-specific.
+**That is the expected outcome, not a failure.** By the time it fires the
+firmware is already in the ASIC's DDR and u-boot carries on without the VM.
+[Why it happens, and why it cannot be fixed from here.](#the-iommu-fault)
 
-`encs-switch-status` inside the VM is the quick check.
+You will *not* see `ROS ready!` in the guest journal, because the VM does not
+live long enough — and the journal usually will not survive the kill either.
+The loader writes progress to `/root/bootstrap-debug.log` as well, which does
+survive; a good run ends:
+
+```
+COMMAND before: 0000
+setpci rc=0
+COMMAND after: 0006
+Reading CPI configuration space BARs: [0] 0xc400000c, [0] 0xc000000c, [0] 0xa000000c
+Loading bootstrap to service CPU SRAM... done.
+Send IRQ to wake service CPU
+Service CPU is not ready for FW yet.        (a few of these are normal)
+Loading firmware to service CPU DDR... done.
+FW upload done !!!
+uboot started ...
+uboot running
+```
+
+### Did it actually work?
+
+Judge by the **switch**, not by the VM. Two independent checks from the host:
+
+```sh
+# both X710 backplane links come up only when the ASIC is running
+esxcli network nic list | grep -E 'vmnic3|vmnic4'
+#   vmnic4  ...  Up  10000     <- good
+#   vmnic4  ...  Down    0     <- ASIC is not running
+```
+
+and, from any VM with a vNIC on `encs-mgmt-2363` holding `169.254.1.1/16`:
+
+```sh
+ping -c2 169.254.1.0
+```
+
+Give it a minute. ROS takes appreciably longer to answer than the links take to
+come up, and calling it dead too early is the single easiest mistake to make
+here.
+
+**If the loader instead says `Service CPU not ready (requires reset?)`,** the
+ASIC has already been bootstrapped. That is the wedge case: pull AC (a host
+reboot is not enough), then try again. See
+[step 9](#9-what-to-do-after-a-reboot-or-a-power-cut).
 
 ---
 
-## 6. Put the VM on the switch management network
+## 6. Switch the VM to the management role
 
-This is the ESXi-specific half. Inside the bootstrap VM, give the second vNIC
-the address `install.sh` would have given the Proxmox host:
+**This step is not optional, and doing it wrong wedges the switch.**
+
+The VM that bootstrapped the ASIC must not keep the Marvell attached.
+`marvell-switch-boot` runs at every boot, and a loader run against an
+already-booted ASIC wedges it until AC is physically removed. So:
+
+1. **Remove the PCI device** from the VM (Host Client → Edit settings → the
+   PCI device → remove). You can drop the memory reservation at the same time;
+   it was only needed for passthrough.
+2. Power the VM back on.
+
+It is now a management VM: no PCI device, one vNIC on `encs-mgmt-2363`. Give
+that vNIC the address the Proxmox host would have held:
 
 ```sh
 # identify the vNIC on the 2363 portgroup - it is the one with no DHCP lease
@@ -408,11 +540,13 @@ nmcli con add type ethernet ifname ens224 con-name encs-mgmt \
 nmcli con up encs-mgmt
 ```
 
-`ipv4.never-default yes` matters: this interface must never become the default
-route. Also make sure NetworkManager's IPv4 link-local fallback is not fighting
-you for the same `169.254.0.0/16` — an autoconfigured address in that range on
-the wrong interface makes the switch look unreachable for reasons nothing on
-screen explains.
+**Use a persistent connection, not a bare `ip addr add`.** NetworkManager drops
+a manually added address on that interface, and the symptom is a switch that
+looks dead from this VM while being perfectly healthy — an easy hour to lose.
+
+`ipv4.never-default yes` matters too: this interface must never become the
+default route. And make sure NetworkManager's own IPv4 link-local fallback is
+not fighting you for `169.254.0.0/16` on some other interface.
 
 Then:
 
@@ -421,11 +555,14 @@ ping -c2 169.254.1.0        # the ASIC
 /opt/encs-host/encs-switch-tui
 ```
 
-Everything the README says about the TUI applies unchanged from here — it is
-the same program talking to the same XML API over the same VLAN. The only
-difference is which machine it runs on.
+Everything the README says about the TUI applies unchanged — same program,
+same XML API, same VLAN. Only the machine it runs on differs.
 
-**Install the tools properly** so the replay service exists:
+`encs-switch-status` will report FAIL for the Marvell, `mv_pciboot` and
+`/dev/servicecpu` on this VM. **That is correct and expected** for a management
+VM; the line that matters is the last one, `switch reachable at 169.254.1.0`.
+
+### Install the tools properly
 
 ```sh
 bash /opt/encs-host/install.sh
@@ -444,20 +581,26 @@ systemctl enable encs-switch-replay.service
 
 `encs-switch-replay.service` waits for `169.254.1.0` to answer and then applies
 every `/etc/encs-switch/*.xml`, which is what restores VLANs, port state and PoE
-after a **cold** boot — the ASIC has no flash and comes back with firmware
-defaults plus every front port shut. Running it inside the bootstrap VM is
-strictly better than running it on the hypervisor: the VM is by definition up
-before the switch is.
+after a cold boot — the ASIC has no flash and comes back with firmware defaults
+plus every front port shut. Running it in this VM is strictly better than on
+the hypervisor: the VM is by definition up before the switch is.
 
-Do **not** enable `encs-switch-startup.service` here. It is Proxmox-only —
-it orders guests via `qm` and `/etc/pve/qemu-server`. The ESXi equivalent is
+Do **not** enable `encs-switch-startup.service` here. It is Proxmox-only — it
+orders guests via `qm` and `/etc/pve/qemu-server`. The ESXi equivalent is
 [step 8](#8-boot-ordering).
 
 On this branch `encs-switch-vnet` refuses `init`, `teardown` and `startup` when
 the files they edit are not there — `/etc/network/interfaces` for the first
 two, plus `/etc/pve/qemu-server` for `startup` — and names the ESXi alternative
-when it sees it is running in a VMware guest. Better than writing a file
-nothing on an AlmaLinux guest reads and leaving you convinced a bridge exists.
+when it sees it is running in a VMware guest.
+
+### Keeping both roles around
+
+Nothing stops you keeping **two registered VMs** on the one disk-image lineage:
+`encs-bootstrap` with the PCI device and no autostart, and `encs-switch-mgmt`
+without it. That is tidier than editing one VM's hardware twice per power
+cycle, and it makes the dangerous configuration something you have to
+deliberately power on rather than something you might leave attached.
 
 ---
 
@@ -542,6 +685,46 @@ vim-cmd hostsvc/autostartmanager/update_autostartentry <vmid> "PowerOn" "0" "2" 
 
 As on Proxmox, **the delay goes on the bootstrap VM, not on the guest waiting**
 — the delay applies before the *next* entry starts.
+
+---
+
+## 9. What to do after a reboot or a power cut
+
+The ASIC has no flash, so the switch is only ever as alive as the last
+bootstrap. What that costs you depends on what happened:
+
+| What happened | Switch | What you do |
+|---|---|---|
+| Bootstrap VM killed by the IOMMU fault | up | nothing - this is every run |
+| Management VM stopped / restarted / rebuilt | up | nothing |
+| ESXi host **warm reboot** | **down** | power on the bootstrap VM again |
+| Host powered off, or AC removed | **down** | power on the bootstrap VM again |
+| Loader run against an already-booted ASIC | **wedged** | **pull AC**, then bootstrap |
+
+Measured on the chassis: after a warm host reboot both X710 links read
+`Link Down` and the switch is gone — the vSwitch, portgroups and passthrough
+setting all survive, but the ASIC does not. The important half is that it comes
+back **re-bootstrappable, not wedged**: powering the bootstrap VM on again goes
+straight through to `uboot running`, the links come up at 10 Gbps and the API
+answers. No AC pull needed.
+
+Only the wedge case needs someone physically at the box, and the way to avoid
+it is the rule from [step 6](#6-switch-the-vm-to-the-management-role): never
+leave the Marvell attached to a VM you might boot while the switch is up.
+
+So the operating loop is:
+
+```
+host power-on / reboot
+    -> power on the bootstrap VM        (it dies; that is fine)
+    -> confirm: ping 169.254.1.0
+    -> power on the management VM       (no PCI device) and everything else
+```
+
+`encs-switch-replay.service` in the management VM reapplies your saved
+`/etc/encs-switch/*.xml` once the ASIC answers, which is what puts VLANs, port
+state and PoE back after any of the "down" rows above. Without it a cold boot
+leaves you with firmware defaults and every front port shut.
 
 ---
 
