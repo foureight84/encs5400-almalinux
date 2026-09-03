@@ -3,30 +3,33 @@
 > **This works, on a real ENCS 5412** (`ENCS5412/K9`, FGL232931K9) under
 > **ESXi 8.0 U3** (build 24677879). The switch boots, stays up, and is fully
 > manageable — VLAN tables, ports, the lot.
->
-> Two things are different from the Proxmox path and you need both. The work
-> splits across [two VM roles](#two-jobs-two-vms-how-this-actually-works-on-esxi):
-> one with the Marvell passed through that bootstraps the ASIC once per AC
-> cycle, and one *without* it that runs the tools. And the bootstrap VM is
-> killed by an [IOMMU fault](#the-iommu-fault) part-way through — which turns
-> out not to matter, because the firmware is already delivered by then and the
-> ASIC finishes on its own.
->
-> Getting here turned up eight bugs the offline tests could not: see
-> [what real ESXi taught us](#what-real-esxi-taught-us). All eight are fixed;
-> the ones a mock can express are now caught by `scripts/66-test-esxi.py`.
->
-> Every step below says how much it can be trusted. Read the
-> [revert](#reverting-everything) section *before* you start: it exists so a
-> failed attempt costs you a reboot, not your ESXi install.
->
-> **You are on the `experimental/esxi` branch**, which carries the tooling as
-> well as the walkthrough: a VMDK build target and an `esxcli`
-> installer/uninstaller for the host side. It stays off `main` until the
-> bootstrap VM has been seen to boot the ASIC on this platform. Everything
-> below is also written as manual commands, because when an experimental
-> script does something you did not expect, the useful thing to have is the
-> list of what it was trying to do.
+
+Two things differ from the Proxmox path, and you need both:
+
+1. **The work splits across [two VM roles](#two-jobs-two-vms-how-this-actually-works-on-esxi)** —
+   one with the Marvell passed through, which bootstraps the ASIC once per AC
+   cycle, and one *without* it, which runs the tools.
+2. **The bootstrap VM is killed by an [IOMMU fault](#the-iommu-fault)**
+   part-way through. This turns out not to matter: the firmware is already
+   delivered by then and the ASIC finishes on its own.
+
+Before you start, read [reverting everything](#reverting-everything) — it
+exists so a failed attempt costs you a reboot, not your ESXi install.
+
+<details>
+<summary>About this branch, and why every step is written out by hand</summary>
+
+You are on `experimental/esxi`, which carries the tooling as well as the
+walkthrough: a VMDK build target and an `esxcli` installer/uninstaller for the
+host side. Getting here turned up eight bugs the offline tests could not — see
+[what real ESXi taught us](#what-real-esxi-taught-us). All eight are fixed, and
+the ones a mock can express are now caught by `scripts/66-test-esxi.py`.
+
+Everything below is also written as manual commands, because when an
+experimental script does something you did not expect, the useful thing to have
+is the list of what it was trying to do.
+
+</details>
 
 | Step | Confidence |
 |---|---|
@@ -37,6 +40,35 @@
 | Managing the switch from a VM on the mgmt VLAN | **verified** — done from a VM with no passthrough device at all |
 | The bootstrap itself (VM + passthrough boots the ASIC) | **verified** — deterministic since the [COMMAND fix](#the-command-register-bug); the VM is killed by an [IOMMU fault](#the-iommu-fault) but the switch comes up regardless |
 | Running the tools (TUI/API/vnet) against the live switch | **verified** — from a VM with no PCI device; VLAN tables read back correctly |
+
+---
+
+## Contents
+
+**Read first:** [what is different](#what-is-different-from-the-proxmox-path) ·
+[where things live](#where-everything-actually-lives) ·
+[prerequisites](#prerequisites) · [the short version](#the-short-version)
+
+**The walkthrough:**
+[1 passthrough](#1-enable-passthrough-for-the-marvell-device) ·
+[2 disk](#2-get-the-disk-onto-a-datastore) ·
+[3 vSwitch](#3-build-the-switch-vswitch) ·
+[4 bootstrap VM](#4-create-the-bootstrap-vm) ·
+[5 bootstrap](#5-bootstrap-power-on-and-expect-the-vm-to-die) ·
+[6 management role](#6-switch-the-vm-to-the-management-role) ·
+[7 LAN ports](#7-vms-on-the-front-lan-ports--the-lan-net-model) ·
+[8 boot order](#8-boot-ordering) ·
+[9 after a reboot](#9-what-to-do-after-a-reboot-or-a-power-cut)
+
+**Day to day:** [the TUI is the switch console](#day-to-day-the-tui-is-the-switch-console) ·
+[feature parity](#feature-parity) · [reverting everything](#reverting-everything)
+
+**Why it works the way it does** — reference, read when something surprises you:
+[two jobs, two VMs](#two-jobs-two-vms-how-this-actually-works-on-esxi) ·
+[the IOMMU fault](#the-iommu-fault) ·
+[the COMMAND register bug](#the-command-register-bug) ·
+[what real ESXi taught us](#what-real-esxi-taught-us) ·
+[known unknowns](#known-unknowns)
 
 ---
 
@@ -1116,41 +1148,90 @@ once in three attempts. The fix was
 enabled the upload completes deterministically, and every run since has ended
 with a working switch.
 
-### Why that address, and why it cannot be moved
+### Where `0xe0041000` comes from
 
-`0xe0041000` is invariant across every variable tried - 2 GB and 4 GB of guest
-RAM, `pciPassthru.use64bitMMIO`, `pciHole.start`, `pciHole.dynStart` and the
-COMMAND fix. `/proc/iomem` in the guest says why:
+The fault is a **write**, by the device, to an address that is not RAM:
 
 ```
-e0000000-e7ffffff : PCI MMCONFIG 0000 [bus 00-7f]
-  e0000000-e7ffffff : pnp 00:05
+WARNING: VTD: IOMMU Fault IOMMU Unit #0: R/W=W, Device 0000:0d:00.0
+                                         Addr = 0xe0041000
 ```
 
-**`0xe0000000` is the guest's PCI MMCONFIG (ECAM) window.** The ASIC's register
-offsets are `0x41xxx` (`regAddr=0x00041804`, `0x00041820`, ...), so a window
-based at `0xe0000000` puts its register accesses inside the guest's
-memory-mapped *config* space - which the IOMMU will never map for device DMA.
-The offset even decodes as a valid ECAM address (bus 0, device 8, function 1).
+`R/W=W` is the whole diagnosis in three characters. The ASIC is not reading
+something it should not; it is **DMA-ing outbound to `0xe0041000`**, and the
+IOMMU domain ESXi built for this VM does not map that address, so the write is
+blocked and the VM is shot.
 
-That is the whole story: the ASIC is not DMAing somewhere random, it is DMAing
-to a base that on this platform collides with ECAM. On Proxmox the same
-`0xe0000000` appears in the working trace ("`2) address: ...41824
-data:0xe0000000`") and is ordinary BAR space there, so nothing faults.
+Two things about that address are established:
 
-Both ways of moving the collision are closed:
+- **`0x41000` is inside the ASIC's own MSYS register block.** The loader
+  programs `0x41804`, `0x41808` and `0x41820`–`0x41864` — the internal
+  address-decode windows. `0x41000` is the base of that block, not a random
+  offset into RAM.
+- **`0xe0000000` is what the loader puts in window 0 on *both* platforms.**
+  The Proxmox trace, from a run that works, writes exactly this:
 
-- **From the host.** `pciHole.dynStart` is not settable. ESXi computes it
-  (2560, i.e. `0xa0000000`, exactly where the BARs land) and *rewrites the VMX
-  back to its own value* on power-on - a `3072` written into the file is `2560`
-  again by the time the VM boots. `pciHole.start` is read but does not govern.
-- **From the guest.** `pci=nommconf` does stop Linux using MMCONFIG, but the
-  range stays reserved as `pnp 00:05` from the virtual firmware's ACPI tables,
-  so the PCI allocator still will not place a BAR there.
+  ```
+  2) address: ...41824 data:0xe0000000        <- win0_base, on Proxmox, working
+  ```
 
-Short of a VM firmware that puts ECAM somewhere else, there is nothing left to
-turn. This is documented rather than fixed - and it costs the bootstrap VM,
-not the switch.
+So the ASIC is being pointed back at its own register window and told to reach
+it *through the PCIe port* rather than internally. That is peer-to-peer DMA:
+device → MMIO, not device → RAM.
+
+### Why it works on Proxmox and not here
+
+Not because the address differs — it is `0xe0000000` on both. Because of what
+each hypervisor puts in the IOMMU domain.
+
+| | Proxmox / VFIO | ESXi DirectPath I/O |
+|---|---|---|
+| Guest RAM mapped for device DMA | yes | yes |
+| Device MMIO mapped for device DMA | yes | **no, by default** |
+| A device write to `0xe0041000` | lands | **faults** |
+
+VFIO maps device BARs into the domain, so a device reaching its own MMIO is
+fine. ESXi does not do this unless asked. **That, not the address, is the
+difference**, and it is why every attempt to *move* the address failed: the
+address was never the problem.
+
+> **This corrects an earlier explanation in this document.** It previously said
+> the cause was `0xe0000000` colliding with the guest's PCI MMCONFIG (ECAM)
+> window. `0xe0000000` genuinely *is* the guest ECAM base — but it is also the
+> value Proxmox writes on a working run, and the low 32 bits of this host's
+> physical BAR2 (`0x383fe0000000`). Three coincidences on one round number.
+> ECAM was never a mechanism: no driver hands a device the MMCONFIG base as a
+> DMA target. The collision was real and irrelevant.
+
+### Untried: two options that match the failure exactly
+
+`0xe0000000` was chased hard, and the levers that move addresses are genuinely
+closed (`pciHole.dynStart` is rewritten to `2560` by ESXi on power-on;
+`pci=nommconf` leaves the range reserved as `pnp 00:05` by ACPI). But if the
+problem is *what the domain maps* rather than *where the write goes*, those
+were the wrong levers. This ESXi build accepts three options that were never
+tried:
+
+```sh
+# confirm your build has them
+ssh root@<esxi> 'grep -ao "pciPassthru\.[A-Za-z0-9]*" /bin/vmx | sort -u'
+```
+
+| VMX option | Why it is a candidate |
+|---|---|
+| `pciPassthru.allowP2P = "TRUE"` | Names the exact operation that is failing: peer-to-peer DMA from a passthrough device to MMIO. The first thing to try. |
+| `pciPassthru.useActualBases = "TRUE"` | Presents host-physical BAR bases to the guest, so a window the loader derives from a BAR is an address the host agrees with. |
+| `pciPassthru.iommuEarlySetup = "TRUE"` | Builds the IOMMU mappings before the guest touches the device, rather than at first fault. |
+
+**Status: hypothesis, not fix.** None has been tried on hardware. Each test
+costs a bootstrap run against a live ASIC, which wedges the switch and needs a
+physical AC pull to clear, so this has not been attempted casually. If you have
+a box you can power-cycle, `allowP2P` is one line in the VMX and is the single
+highest-value experiment left on this platform.
+
+Until then this is documented rather than fixed — and, as everything above
+says, it costs the bootstrap VM and not the switch, so it is an annoyance
+rather than a blocker.
 
 ### The COMMAND register bug
 
@@ -1202,8 +1283,12 @@ Things a first attempt should watch for, so a report back is useful:
    12C/24T, `HV Support: 3`, with the I350s, X552, both X710 functions, the
    I210 and the Marvell all enumerated.
 
-All four are answered. What remains is not on the original list and is no
-longer a mystery, only unfixable from here: the
-[IOMMU fault](#the-iommu-fault) is the ASIC's register window colliding with
-the guest's ECAM range at `0xe0000000`, and neither the host nor the guest can
-move either one. It costs the bootstrap VM, not the switch.
+All four are answered. What remains was not on the original list:
+
+**Can the [IOMMU fault](#the-iommu-fault) be fixed after all?** The fault is a
+device *write* to `0xe0041000` — peer-to-peer DMA from the ASIC back to its own
+register window. Proxmox allows that and ESXi does not map device MMIO into the
+IOMMU domain by default. Three VMX options this build accepts were never tried,
+`pciPassthru.allowP2P` first among them. Until someone runs that test on a box
+they can power-cycle, this stays an open question rather than a closed one — but
+it costs the bootstrap VM, not the switch, so nothing is blocked on the answer.
