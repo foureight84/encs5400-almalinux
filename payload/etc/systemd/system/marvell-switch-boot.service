@@ -8,6 +8,19 @@ Wants=network-pre.target
 
 [Service]
 Type=simple
+# Enable PCI memory decode and bus mastering on the ASIC BEFORE the module
+# loads. mv_pciboot never calls pci_enable_device()/pci_set_master(); it
+# assumes the firmware already left the device enabled, which is true on bare
+# metal and under Proxmox. Under ESXi DirectPath I/O the guest sees
+# COMMAND=0x0000: Mem- BusMaster-, BARs "[disabled]". Every MMIO read then
+# returns 0xffffffff, the module computes its address windows from that
+# garbage, and the ASIC DMAs to a fabricated address - which ESXi's IOMMU
+# rejects, killing the VM:
+#   "PCI passthru device caused an IOMMU fault type 5 at address 0xe0041000"
+# With the bits set, the readback is correct and win_base lands on a real BAR.
+# Masked write (value:mask), so no other COMMAND bits are disturbed. Harmless
+# where the device is already enabled, which is why it is unconditional.
+ExecStartPre=/bin/bash -c '/usr/sbin/setpci -d 11ab:be00 COMMAND=0006:0006 || echo "setpci failed - is pciutils installed?" >&2'
 # Load the out-of-tree Marvell PCIe boot shim if it is not already up.
 ExecStartPre=/bin/bash -c 'lsmod | grep -q "^mv_pciboot" || /sbin/insmod /opt/switch-confd/mv_pciboot.ko.xz'
 # Wait for the misc char device the module registers.
