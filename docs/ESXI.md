@@ -40,63 +40,6 @@
 
 ---
 
-## The short version
-
-Nine steps, start to finish. Each links to the detail below.
-
-```sh
-# 1. BUILD  (x86_64 Linux with KVM - an arm64 Mac cannot do this)
-./build.sh --esxi /path/to/Cisco_NFVIS-4.15.5-FC4.iso
-
-# 2. HOST SIDE  (passthrough + vSwitch + portgroups)
-scp -r payload/opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
-ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'        # plan
-ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh --yes'  # apply
-
-# 3. DISK
-ssh root@<esxi> 'mkdir -p /vmfs/volumes/datastore1/encs-switch'
-scp out/esxi/encs-switch.vmdk out/esxi/encs-switch.vmx \
-    root@<esxi>:/vmfs/volumes/datastore1/encs-switch/
-ssh root@<esxi> 'cd /vmfs/volumes/datastore1/encs-switch &&
-    vmkfstools -i encs-switch.vmdk -d thin disk.vmdk && rm -f encs-switch.vmdk &&
-    sed -i "s|^scsi0:0.fileName.*|scsi0:0.fileName = \"disk.vmdk\"|" encs-switch.vmx'
-
-# 4. REGISTER + attach the Marvell (Host Client, or the block install.sh printed)
-ssh root@<esxi> 'vim-cmd solo/registervm \
-    /vmfs/volumes/datastore1/encs-switch/encs-switch.vmx'
-
-# 5. BOOTSTRAP - power on, and EXPECT THE VM TO DIE ~60s in. That is normal.
-ssh root@<esxi> 'vim-cmd vmsvc/power.on <vmid>'
-
-# 6. CONFIRM the switch came up anyway (from any VM on encs-mgmt-2363)
-ping -c2 169.254.1.0
-
-# 7. SWITCH TO MANAGEMENT ROLE: remove the PCI device from the VM, power it
-#    back on, then inside it:
-nmcli con add type ethernet ifname ens224 con-name encs-mgmt \
-      ipv4.method manual ipv4.addresses 169.254.1.1/16 \
-      ipv4.never-default yes ipv6.method ignore
-/opt/encs-host/encs-switch-tui
-```
-
-Revert the host side with
-`sh /vmfs/volumes/datastore1/encs-esxi/uninstall.sh --yes`.
-
-**The three things that surprise people**, all covered below:
-
-1. The bootstrap VM is **killed by an IOMMU fault** every run
-   ([why](#the-iommu-fault)). The switch comes up anyway. Do not read the VM
-   dying as failure.
-2. Bootstrap and management are **two different VM configurations**
-   ([why](#two-jobs-two-vms-how-this-actually-works-on-esxi)), and booting a VM
-   that still has the Marvell attached while the switch is up **wedges it**
-   until AC is pulled.
-3. Bootstrap must re-run after **every host power-on or reboot** - a warm
-   reboot drops the switch, though it leaves the ASIC re-bootstrappable rather
-   than wedged.
-
----
-
 ## What is different from the Proxmox path
 
 Two things, and both change *where* code runs rather than what it does.
@@ -107,11 +50,40 @@ Two things, and both change *where* code runs rather than what it does.
 systemd, no ifupdown, and a stripped Python without curses. None of that
 bundle runs there.
 
-**So the tools move into the bootstrap VM.** They are already in the image at
+**So the tools move into a VM.** They are already in the image at
 `/opt/encs-host/` — on Proxmox you copy them *out* to the hypervisor, and here
 you simply leave them where they are. The VM gets a second vNIC on a portgroup
-tagged VLAN 2363, which puts it on the switch management network, and it
-configures the ASIC it just booted.
+tagged VLAN 2363, which puts it on the switch management network.
+
+### Where everything actually lives
+
+This is the thing most worth getting straight before you start, because it is
+the reverse of the Proxmox layout:
+
+| | Proxmox | **ESXi** |
+|---|---|---|
+| `encs-switch-tui` / `-api` / `-vnet` | on the **host** | **in a VM** |
+| NFVIS bits (`switch-confd`, `mv_pciboot`, `remote_boot_app`, firmware) | in the bootstrap VM | in the VM image |
+| Reaches `169.254.1.0` | the host | a VM, over `encs-mgmt-2363` |
+| What the hypervisor itself does | everything | **only** passthrough + vSwitch + portgroups |
+
+Nothing from `/opt/encs-host` is ever copied to the ESXi host — it cannot run
+any of it. The ESXi host is pure plumbing. And because bootstrapping and
+managing want opposite VM configurations, the VM side splits in two: see
+[two jobs, two VMs](#two-jobs-two-vms-how-this-actually-works-on-esxi).
+
+### What `opt/encs-esxi/install.sh` does, and does not do
+
+It is the host-side installer only. It **does**: enable passthrough on the
+Marvell, create `vSwitchENCS`, add the te2 X710 function as its uplink, and
+create the `encs-mgmt-2363` and `encs-lan` portgroups. It records all of that
+so `uninstall.sh` can take exactly it back out.
+
+It **does not**: build the image, upload or import the disk, create or register
+a VM, attach the PCI device, or install anything in the guest. Those are
+[steps 2](#2-get-the-disk-onto-a-datastore),
+[4](#4-create-the-bootstrap-vm) and [6](#6-switch-the-vm-to-the-management-role),
+and they are manual.
 
 > **This is not the dependency loop the README warns about.** That warning is
 > about the bootstrap VM's *own* management path: put the machine that boots
@@ -163,6 +135,66 @@ the job does not change at all.
 depends on no ASIC, no VM and no VLAN. Everything below builds a *second*
 vSwitch and never touches the first. If you have already moved management onto
 an X710 port, move it back before starting.
+
+---
+
+## The short version
+
+The whole thing, assuming you have read the
+[prerequisites](#prerequisites) above and have a built image. Each block is one
+of the numbered steps below, which carry the detail and the failure modes —
+this is a map, not a substitute for them.
+
+```sh
+# 1. BUILD  (x86_64 Linux with KVM - an arm64 Mac cannot do this)
+./build.sh --esxi /path/to/Cisco_NFVIS-4.15.5-FC4.iso
+
+# 2. HOST SIDE  (passthrough + vSwitch + portgroups)
+scp -r payload/opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'        # plan
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh --yes'  # apply
+
+# 3. DISK
+ssh root@<esxi> 'mkdir -p /vmfs/volumes/datastore1/encs-switch'
+scp out/esxi/encs-switch.vmdk out/esxi/encs-switch.vmx \
+    root@<esxi>:/vmfs/volumes/datastore1/encs-switch/
+ssh root@<esxi> 'cd /vmfs/volumes/datastore1/encs-switch &&
+    vmkfstools -i encs-switch.vmdk -d thin disk.vmdk && rm -f encs-switch.vmdk &&
+    sed -i "s|^scsi0:0.fileName.*|scsi0:0.fileName = \"disk.vmdk\"|" encs-switch.vmx'
+
+# 4. REGISTER + attach the Marvell (Host Client, or the block install.sh printed)
+ssh root@<esxi> 'vim-cmd solo/registervm \
+    /vmfs/volumes/datastore1/encs-switch/encs-switch.vmx'
+
+# 5. BOOTSTRAP - power on, and EXPECT THE VM TO DIE ~60s in. That is normal.
+ssh root@<esxi> 'vim-cmd vmsvc/power.on <vmid>'
+
+# 6. CONFIRM the switch came up anyway (from any VM on encs-mgmt-2363)
+ping -c2 169.254.1.0
+
+# 7. SWITCH TO MANAGEMENT ROLE: remove the PCI device from the VM, power it
+#    back on, then inside it:
+nmcli con add type ethernet ifname ens224 con-name encs-mgmt \
+      ipv4.method manual ipv4.addresses 169.254.1.1/16 \
+      ipv4.never-default yes ipv6.method ignore
+/opt/encs-host/encs-switch-tui
+```
+
+Revert the host side with
+`sh /vmfs/volumes/datastore1/encs-esxi/uninstall.sh --yes`.
+
+**The three things that surprise people**, all covered below:
+
+1. The bootstrap VM is **killed by an IOMMU fault** every run
+   ([why](#the-iommu-fault)). The switch comes up anyway. Do not read the VM
+   dying as failure.
+2. Bootstrap and management are **two different VM configurations**
+   ([why](#two-jobs-two-vms-how-this-actually-works-on-esxi)), and booting a VM
+   that still has the Marvell attached while the switch is up **wedges it**
+   until AC is pulled.
+3. Bootstrap must re-run after **every host power-on or reboot** - a warm
+   reboot drops the switch, though it leaves the ASIC re-bootstrappable rather
+   than wedged.
 
 ---
 
@@ -601,6 +633,48 @@ Nothing stops you keeping **two registered VMs** on the one disk-image lineage:
 without it. That is tidier than editing one VM's hardware twice per power
 cycle, and it makes the dangerous configuration something you have to
 deliberately power on rather than something you might leave attached.
+
+---
+
+### Day to day: running the TUI again later
+
+Once the management VM exists, there is nothing to repeat. SSH into it (or open
+its VMware console) and run the tool:
+
+```sh
+ssh root@<management-vm>
+encs-switch-tui           # or /opt/encs-host/encs-switch-tui if not installed
+```
+
+It is an ordinary interactive curses program: arrow keys move, `p`/`v`/`e`/`m`
+/`s`/`c` switch views, `TAB` opens the rest, `SPACE` enables or shuts the
+selected port, `ENTER` opens settings, `?` is the built-in manual and `q`
+quits. Any terminal that can run `top` can run this; nothing special is needed.
+
+A live session looks like this — real hardware, front panel and backplane:
+
+```
+ ENCS 5412 switch  169.254.1.0  [connected]                          v0.2.1
+ [p] PORTS  [v] vlans  [e] poe  [m] mac  [s] stats  [c] config  [?] help
+ port   panel  link     admin  speed   media     lag   attached to
+ gi0    GE1/0  down     DOWN   1000    copper    -     -
+ ...
+ te1    -      UP idle  UP     10000   backplane -     -
+ te2    -      UP       UP     10000   backplane -     ens224
+ SPACE up/shut  g LAG  ENTER settings  z counters  r refresh  ? help  q quit
+```
+
+`[connected]` in the header is the thing to look for. If it says otherwise,
+the ASIC is not answering — check `ping 169.254.1.0`, and if that fails see
+[step 9](#9-what-to-do-after-a-reboot-or-a-power-cut).
+
+Two habits worth having:
+
+- **Save what you change.** The ASIC has no flash. `encs-switch-replay.service`
+  reapplies `/etc/encs-switch/*.xml` after every bootstrap, so put your intended
+  configuration there rather than only in the running switch.
+- **The management VM can be left running.** It never touches the loader, so it
+  is safe to autostart, restart or rebuild whenever — unlike the bootstrap VM.
 
 ---
 
