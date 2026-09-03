@@ -8,12 +8,14 @@ Copy it to the ESXi host and run it there.
     ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'
 
 These three scripts HAVE been run on a real ENCS 5412 under ESXi 8.0 U3,
-including a full uninstall/reinstall round trip. The bootstrap VM they set the
-stage for is a different story: an IOMMU fault kills it on every run and the
-switch only comes up when the firmware upload wins that race (once in three
-attempts here). The full walkthrough, with every step graded by how far it can
-be trusted, is docs/ESXI.md in the repository. Read both the IOMMU section and
-the revert section before you start.
+including a full uninstall/reinstall round trip, and the switch they set the
+stage for boots and works. Two things to know before you start, both in
+docs/ESXI.md: the bootstrap VM is killed by an IOMMU fault part-way through
+(harmless - the firmware is already delivered and the ASIC finishes alone),
+and bootstrap and management must be SEPARATE VM configurations. The managing
+VM must NOT have the Marvell attached, or it re-runs the loader at every boot
+and wedges the switch until AC is pulled. Read the IOMMU and revert sections
+first.
 
 Run the scripts with `sh <path>` rather than executing them directly — files
 on a VMFS datastore do not always carry the execute bit.

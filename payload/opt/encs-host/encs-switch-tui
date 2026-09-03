@@ -5,9 +5,24 @@ encs-switch-tui - terminal UI for the Marvell BobCat2 L2 switch in a Cisco ENCS 
 Speaks the same "wcd" XML API that Cisco's switch-confd used, so it needs
 neither ConfD nor the (non-functional) embedded web UI.
 
-RUN THIS ON THE HYPERVISOR. The switch answers on 169.254.1.0 over VLAN 2363
-on the X710 backplane, and that NIC belongs to the host. The bootstrap VM only
-boots the ASIC over PCIe and cannot reach the switch at all.
+WHERE TO RUN THIS depends on the hypervisor, because all this needs is an IP
+path to 169.254.1.0 over VLAN 2363 on the X710 backplane - never the PCIe
+device.
+
+  Proxmox   ON THE HOST. The backplane NIC belongs to the host, so the host
+            holds 169.254.1.1 and the bootstrap VM, which only pushes firmware
+            over PCIe, cannot reach the switch at all.
+
+  ESXi      IN A VM, and specifically one WITHOUT the Marvell passed through.
+            ESXi cannot run this (no bash, no systemd, stripped Python), so a
+            guest gets a vNIC on the encs-mgmt-2363 portgroup and 169.254.1.1
+            instead. Verified against a live switch from a VM with no PCI
+            device at all.
+
+            Do NOT run it in the VM that still has the Marvell attached. That
+            VM re-runs the loader at every boot, and a loader run against an
+            already-booted ASIC wedges it until AC is pulled. Bootstrap and
+            management are separate jobs on this platform; see docs/ESXI.md.
 
 Seven views have a tab and a hotkey (ports, vlans, poe, mac, stats, config,
 help); TAB opens a menu with the rest - spanning tree, storm control, port

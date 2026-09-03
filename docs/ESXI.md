@@ -1,17 +1,19 @@
 # Running this on ESXi — experimental
 
-> **All of this has now been run on a real ENCS 5412** (`ENCS5412/K9`,
-> FGL232931K9) under **ESXi 8.0 U3** (build 24677879), and the honest summary
-> is: the host side works, and the bootstrap works only intermittently.
+> **This works, on a real ENCS 5412** (`ENCS5412/K9`, FGL232931K9) under
+> **ESXi 8.0 U3** (build 24677879). The switch boots, stays up, and is fully
+> manageable — VLAN tables, ports, the lot.
 >
-> The switch *can* be booted this way — it was, and its API answered — but the
-> bootstrap VM is killed by an
-> [IOMMU fault](#the-iommu-fault-the-real-blocker) every single time, and only
-> sometimes does the firmware upload finish first. One success in three
-> attempts. **Do not put this in front of anything you care about yet.**
+> Two things are different from the Proxmox path and you need both. The work
+> splits across [two VM roles](#two-jobs-two-vms-how-this-actually-works-on-esxi):
+> one with the Marvell passed through that bootstraps the ASIC once per AC
+> cycle, and one *without* it that runs the tools. And the bootstrap VM is
+> killed by an [IOMMU fault](#the-iommu-fault) part-way through — which turns
+> out not to matter, because the firmware is already delivered by then and the
+> ASIC finishes on its own.
 >
-> Getting that far turned up seven bugs the offline tests could not: see
-> [what real ESXi taught us](#what-real-esxi-taught-us). All seven are fixed;
+> Getting here turned up eight bugs the offline tests could not: see
+> [what real ESXi taught us](#what-real-esxi-taught-us). All eight are fixed;
 > the ones a mock can express are now caught by `scripts/66-test-esxi.py`.
 >
 > Every step below says how much it can be trusted. Read the
@@ -33,7 +35,8 @@
 | vSwitch / portgroup model for VLANs | **verified** — `install.sh` and `encs-esxi-vnet` both round-trip on the host |
 | `SMBIOS.reflectHost` satisfying the platform gate | **verified** — `dmidecode` in the guest returns `ENCS5412/K9` and the chassis serial |
 | Managing the switch from a VM on the mgmt VLAN | **verified** — done from a VM with no passthrough device at all |
-| The bootstrap itself (VM + passthrough boots the ASIC) | **intermittent** — worked once in three; the VM is always killed by an [IOMMU fault](#the-iommu-fault-the-real-blocker) |
+| The bootstrap itself (VM + passthrough boots the ASIC) | **verified** — deterministic since the [COMMAND fix](#the-command-register-bug); the VM is killed by an [IOMMU fault](#the-iommu-fault) but the switch comes up regardless |
+| Running the tools (TUI/API/vnet) against the live switch | **verified** — from a VM with no PCI device; VLAN tables read back correctly |
 
 ---
 
@@ -708,7 +711,9 @@ was more forgiving than the real thing:
 | `/etc/encs-esxi/created` lost on every reboot | `/etc` is a 28 MB RAM disk, and `auto-backup.sh` archives only files with a `.#<name>` marker. `install.sh` called it believing that persisted the record. `passthru.map` survives only because it ships with its marker. The record now lives beside the bundle on VMFS. |
 | `pciPassthru0.id` is not the hex BDF | ESXi writes `%05d:%03d:%02d.%d`, **all fields decimal** — the format string is in `/usr/lib/vmware/drivers/lib/libpci_bus.so`. `0000:0d:00.0` → `00000:013:00.0`; slot `0x1d` → `29`, not `1d`. A hex BDF is refused with *"AH No device hints found"*, naming neither the key nor the format. |
 
-A seventh was found while fixing the sixth: the conversion above was first
+| `encs-switch-tui` documented the wrong machine | Its help said "RUN THIS ON THE HYPERVISOR … the bootstrap VM cannot reach the switch at all". True on Proxmox, backwards here: ESXi cannot run it, and a VM reaches the switch fine. Nothing offline runs the tools against a live switch. |
+
+A further one was found while fixing the sixth: the conversion above was first
 written with awk's `strtonum()`, which is a gawk extension — ESXi's busybox awk
 answers *"Call to undefined function"*. It is POSIX parameter expansion and
 `$((0x..))` now. The lesson is the same one this whole file keeps teaching:
@@ -722,53 +727,115 @@ scanned for statically, because the test host's shell has both.
 
 ---
 
-## The IOMMU fault: the real blocker
+## Two jobs, two VMs: how this actually works on ESXi
 
-Three runs on a real 5412, ESXi 8.0 U3, ASIC cold (AC removed) before each:
+This is the one structural difference from the Proxmox path, and it is not
+optional. On ESXi the work splits across **two roles**, because the thing that
+boots the ASIC and the thing that manages it need opposite configurations.
 
-| Run | Guest RAM | IOMMU fault | Firmware upload finished first | ASIC |
-|---|---|---|---|---|
-| 1 | 2048 MB | yes, `0xe0041000` | yes — `FW upload done !!!`, `uboot started` | **came up, API answered** |
-| 2 | 4096 MB | yes, `0xe0041000` | no | did not come up |
-| 3 | 2048 MB (byte-identical to run 1) | yes, `0xe0041000` | no | did not come up |
+| | Bootstrap VM | Management VM |
+|---|---|---|
+| Marvell passed through | **yes** | **no - never** |
+| Runs | once per AC power cycle | whenever you like |
+| Survives the run | no, see below | yes |
+| What it does | pushes firmware over PCIe | `encs-switch-tui`, `encs-switch-api`, `encs-switch-vnet` |
+| Needs | `pciPassthru0`, all memory reserved | one vNIC on `encs-mgmt-2363`, `169.254.1.1/16` |
+
+They can be the same VM reconfigured between the two roles, but they cannot be
+the same VM *at the same time*, and the reason is sharp:
+
+> **Never power on a VM that still has the Marvell attached while the switch is
+> up.** `marvell-switch-boot` runs at every boot, and a loader run against an
+> already-booted ASIC wedges it in "Service CPU not ready (requires reset?)"
+> until AC is physically removed. Once the switch is bootstrapped, take the PCI
+> device off that VM.
+
+### The management side needs no PCI device at all
+
+The tools speak HTTPS to `169.254.1.0`; nothing in them touches the ASIC over
+PCIe. Verified on the chassis from a VM with the Marvell **not** attached
+(`lspci -d 11ab:` empty):
+
+```
+    OK  switch reachable at 169.254.1.0        # encs-switch-status
+    $ encs-switch-api get '{VLANInterfaceMembershipTable}'
+    <VLANID>1</VLANID>    <untaggedPorts>gi0-7,te1-4,LAG1-4</untaggedPorts>
+    <VLANID>2363</VLANID> <taggedPorts>te2</taggedPorts>
+```
+
+So `encs-switch-tui` runs in a guest here, not on the host as it does on
+Proxmox. Give that guest a second vNIC on `encs-mgmt-2363`, address it
+`169.254.1.1/16`, give it no default route, and run the tools exactly as the
+README describes. `encs-switch-status` will report FAIL for the Marvell, the
+module and `/dev/servicecpu` - that is correct and expected for a management
+VM, and the line that matters is the last one.
+
+This split has an upside over the original design: the managing VM never
+touches the loader, so it can be restarted, migrated or rebuilt freely. The
+"no HA restart policy" warning applies only to the bootstrap VM.
+
+## The IOMMU fault
+
+The bootstrap VM is killed part-way through every run:
 
 ```
 PCI passthru device 0000:0d:00.0 caused an IOMMU fault type 5 at
 address 0xe0041000.  Powering off the virtual machine.
 ```
 
-**The fault happens on every run.** What varies is only whether the firmware
-upload completes before it lands. Run 3 used the same VMX as run 1 and got the
-opposite result, so this is a race, not a misconfiguration — and the guest
-memory size is not the variable, because the faulting address is *identical*
-at 2 GB and 4 GB.
+**This is survivable and, in practice, cosmetic.** By the time it fires the
+firmware is already in the ASIC's DDR; u-boot carries on to ROS without the VM,
+and the switch comes up and stays up - through the VM's death, and through host
+reboots. What it costs you is the VM, not the switch.
 
-The address belongs to neither side's BARs. The guest sees the device at
-`0xa0000000`/`0xc0000000`/`0xc4000000`; on the host it is mapped 64-bit, up at
-`0x383fc0000000`–`0x383fe4000000` (`vsish -e cat
-/hardware/pci/seg/0000/bus/13/slot/0/func/0/BARInfo/N`). `0xe0041000` is
-neither, so this is not a simple host-vs-guest BAR confusion. The device has no
-RMRR entry, and it is in IOMMU scope. What has not been established is where
-the ASIC's service CPU gets that address; until that is known, there is no
-fix to try, only guesses.
+It took a while to get there. The fault used to land *early*, before the upload
+finished, and the switch then came up only when it happened to win the race -
+once in three attempts. The fix was
+[the PCI COMMAND register](#the-command-register-bug): with memory decode
+enabled the upload completes deterministically, and every run since has ended
+with a working switch.
 
-**What this means in practice.** The switch does get bootstrapped, sometimes,
-and once it is up it stays up — the ASIC keeps running long after the VM that
-booted it has been killed, and it survives the host reboot too. So the
-platform is usable, just not the way this guide originally assumed:
+What is still unexplained is the address. `0xe0041000` is invariant across
+every variable tried - 2 GB and 4 GB of guest RAM, `pciPassthru.use64bitMMIO`,
+`pciHole.start`, and the COMMAND fix itself. It is `0xe0000000 + 0x41000`, and
+`0x41xxx` is the ASIC's register-window offset (`regAddr=0x00041804`,
+`0x00041820`, ...). The same `0xe0000000` appears in the *working* Proxmox
+trace as a window base ("`2) address: ...41824 data:0xe0000000`"), so the value
+is not wrong - ESXi simply has nothing mapped there, because at 2560 MB
+(`pciHole.dynStart`, which ESXi computes and which overrides `pciHole.start`)
+our BARs land at `0xa0000000`/`0xc0000000`/`0xc4000000` and the address falls
+past all of them.
 
-- **Bootstrapping is a coin flip** and each attempt costs an AC power cycle,
-  because a half-loaded ASIC has to be reset before the loader will take again.
-- **Managing the switch does not need the passthrough device at all.** The
-  tools speak HTTPS to `169.254.1.0`; that was confirmed from a VM with no PCI
-  device and a single vNIC on `encs-mgmt-2363`. So the roles can split: one VM
-  with passthrough that bootstraps and dies, any VM on the management VLAN that
-  administers. That also disposes of the "no HA restart policy" hazard for the
-  managing VM, since it never touches the loader.
+The untested idea, for anyone who wants to chase it: `pciHole.dynStart = 3072`
+should shift the BARs up by `0x20000000`, putting `0xe0041000` inside the 64 MB
+BAR2 rather than in unmapped space, and making the layout match Proxmox's.
+Each attempt costs an AC power cycle, which is why it is written down rather
+than done.
 
-Not reproduced on Proxmox, which runs the same image on the same chassis with
-the module loading and the VM surviving. Whatever ESXi's IOMMU is rejecting,
-KVM/VFIO permits.
+### The COMMAND register bug
+
+Worth knowing about even outside ESXi. `mv_pciboot` never calls
+`pci_enable_device()` or `pci_set_master()`; it assumes whatever enumerated the
+bus left the device enabled. That holds on bare metal and under Proxmox. Under
+ESXi DirectPath I/O the guest sees:
+
+```
+COMMAND = 0x0000       Mem-  BusMaster-
+Region 0: Memory at c4000000 (64-bit, prefetchable) [disabled]
+```
+
+Every MMIO read then returns `0xffffffff`, so the module derives its address
+windows from all-ones garbage:
+
+```
+WR regAddr=0x00041824 data=0xc0000000     module writes win0_base
+RD regAddr=0x00041824 data=0xffffffff     reads back all-ones
+```
+
+`setpci -d 11ab:be00 COMMAND=0006:0006` before the module loads fixes it, and
+`marvell-switch-boot.service` now does exactly that. The same reads then come
+back correct and the windows land on real BARs, which is what turns a coin
+flip into a deterministic bootstrap.
 
 ---
 
@@ -783,14 +850,18 @@ Things a first attempt should watch for, so a report back is useful:
    **Answered: yes.** `dmidecode -s system-product-name` in the bootstrap VM
    returns `ENCS5412/K9`, manufacturer `Cisco Systems, Inc.`, and the chassis
    serial. The platform gate is satisfied without any per-VM SMBIOS authoring.
-3. **Does the loader survive an ESXi VM restart?** Overtaken by something
-   worse — see [the IOMMU fault](#the-iommu-fault-the-real-blocker). The VM
-   does not survive the *first* run, so "does it survive a restart" has not
-   been reachable.
+3. ~~**Does the loader survive an ESXi VM restart?**~~ **Answered, but the
+   question was the wrong one.** The VM does not survive its first run at all
+   (the [IOMMU fault](#the-iommu-fault)), and that turns out not to matter: the
+   loader has to run exactly **once per AC power cycle**, not once per VM boot.
+   A restart is not something to survive, it is something to avoid — re-running
+   the loader against a live ASIC wedges it. The managing VM, which has no PCI
+   device, restarts freely.
 4. ~~**Whether ESXi 8.0 installs and runs on this chassis at all**, given the
    deprecated CPU generation.~~ **Answered: it does.** 8.0 U3 build 24677879,
    12C/24T, `HV Support: 3`, with the I350s, X552, both X710 functions, the
    I210 and the Marvell all enumerated.
 
-Two of the four are answered, and both landed the good way. What is left (2
-and 3) is entirely inside the bootstrap VM, which is the part still unrun.
+All four are answered. What remains open is not on the original list: the
+[IOMMU fault](#the-iommu-fault) itself, which costs the bootstrap VM but not
+the switch, and whose address is still unexplained.

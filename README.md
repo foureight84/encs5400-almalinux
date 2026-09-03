@@ -332,16 +332,22 @@ down to what ESXi's `/bin` actually holds — the first real run found four bugs
 the earlier, more forgiving fake could not, and those are what that hardening
 is for.
 
-**Verified on hardware, and the verdict is mixed.** The host side works:
-passthrough, the vSwitch, the portgroups and `encs-esxi-vnet` all run on a real
-ENCS 5412 under ESXi 8.0 U3, DirectPath I/O takes the Marvell with no
-`passthru.map` entry, and `SMBIOS.reflectHost` gives the guest `ENCS5412/K9`.
-The **bootstrap is intermittent**: an IOMMU fault kills the VM on every run,
-and only sometimes does the firmware upload finish first — one success in
-three. The switch does come up and stay up when it wins that race, and
-managing it afterwards needs no passthrough at all. This stays off `main`
-until the fault is understood. [docs/ESXI.md](docs/ESXI.md) grades every step
-and documents the fault; reports from other chassis are welcome.
+**This works on hardware.** Verified end to end on a real ENCS 5412 under
+ESXi 8.0 U3: the switch boots, stays up, and is fully manageable — VLAN tables
+and all. DirectPath I/O takes the Marvell with no `passthru.map` entry and
+`SMBIOS.reflectHost` gives the guest `ENCS5412/K9`.
+
+Two things differ from the Proxmox path. The work splits across **two VM
+roles** — one with the Marvell passed through that bootstraps the ASIC once per
+AC power cycle, and one *without* it that runs `encs-switch-tui` and friends
+over the management VLAN. And the bootstrap VM is killed part-way by an IOMMU
+fault, which turns out not to matter: the firmware is already delivered and the
+ASIC finishes on its own. Never boot a VM that still has the Marvell attached
+while the switch is up — that wedges it until AC is pulled.
+
+It stays off `main` while that fault is unexplained.
+[docs/ESXI.md](docs/ESXI.md) grades every step, documents the fault, and
+carries the eight bugs the offline tests could not catch.
 
 Note the build host must be **x86_64 Linux with KVM**: the qcow2 step installs
 AlmaLinux under QEMU, and `createrepo_c` has no Homebrew formula, so an arm64
