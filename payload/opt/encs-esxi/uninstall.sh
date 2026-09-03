@@ -17,7 +17,8 @@
 #     firmware defaults back.
 set -eu
 
-STATE="${STATE:-/etc/encs-esxi/created}"
+# Alongside the bundle on the datastore, not under /etc - see install.sh.
+STATE="${STATE:-$(dirname "$0")/created}"
 VSWITCH="${VSWITCH:-vSwitchENCS}"
 APPLY=0
 FORCE=0

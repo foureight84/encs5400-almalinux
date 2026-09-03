@@ -7,10 +7,13 @@ Copy it to the ESXi host and run it there.
     scp -r /opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
     ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'
 
-These three scripts HAVE been run on a real ENCS 5412 under ESXi 8.0 U3.
-What has not is the bootstrap VM they set the stage for. The full walkthrough,
-with every step graded by how far it can be trusted, is docs/ESXI.md in the
-repository. Read the revert section there before you start.
+These three scripts HAVE been run on a real ENCS 5412 under ESXi 8.0 U3,
+including a full uninstall/reinstall round trip. The bootstrap VM they set the
+stage for is a different story: an IOMMU fault kills it on every run and the
+switch only comes up when the firmware upload wins that race (once in three
+attempts here). The full walkthrough, with every step graded by how far it can
+be trusted, is docs/ESXI.md in the repository. Read both the IOMMU section and
+the revert section before you start.
 
 Run the scripts with `sh <path>` rather than executing them directly — files
 on a VMFS datastore do not always carry the execute bit.
@@ -68,9 +71,12 @@ THE TWO THINGS MOST LIKELY TO BITE
    install.sh --reset-method bridge adds an /etc/vmware/passthru.map entry
    (try flr, d3d0, link, bridge in that order).
 
-2. /etc is restored from the bootbank at boot. install.sh and uninstall.sh
-   both run /sbin/auto-backup.sh for you; if you edit passthru.map by hand,
-   run it yourself or the change silently reverts on the next reboot.
+2. /etc is restored from the bootbank at boot, and auto-backup.sh only saves
+   files that already have a ".#<name>" marker beside them. passthru.map has
+   one because it ships with ESXi; a file you create does not, and is dropped
+   on the next reboot no matter how often you run auto-backup.sh. That is why
+   the record lives here on the datastore and not under /etc. If you edit
+   passthru.map by hand, run /sbin/auto-backup.sh or the change reverts.
 
 AND ONE THAT IS NOT SPECIFIC TO ESXi
 ------------------------------------

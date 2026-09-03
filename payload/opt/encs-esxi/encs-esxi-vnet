@@ -23,7 +23,7 @@ set -eu
 
 VSWITCH="${VSWITCH:-vSwitchENCS}"
 PREFIX="${PREFIX:-encs-lan}"
-STATE="${STATE:-/etc/encs-esxi/created}"
+STATE="${STATE:-$(dirname "$0")/created}"   # datastore, not /etc - see install.sh
 
 say()  { printf '\n==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }

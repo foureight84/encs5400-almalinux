@@ -1,14 +1,18 @@
 # Running this on ESXi — experimental
 
-> **The host side is now verified; the VM side is not.** Steps 1 and 7 —
-> passthrough, the vSwitch, the portgroups and `encs-esxi-vnet` — have been run
-> on a real ENCS 5412 (`ENCS5412/K9`, FGL232931K9) under **ESXi 8.0 U3**
-> (build 24677879). Everything from step 2 on, the bootstrap VM itself, is
-> still reasoned from the Proxmox path rather than observed.
+> **All of this has now been run on a real ENCS 5412** (`ENCS5412/K9`,
+> FGL232931K9) under **ESXi 8.0 U3** (build 24677879), and the honest summary
+> is: the host side works, and the bootstrap works only intermittently.
 >
-> That first run found four bugs the offline tests could not: see
-> [what real ESXi taught us](#what-real-esxi-taught-us). All four are fixed and
-> the tests now catch them.
+> The switch *can* be booted this way — it was, and its API answered — but the
+> bootstrap VM is killed by an
+> [IOMMU fault](#the-iommu-fault-the-real-blocker) every single time, and only
+> sometimes does the firmware upload finish first. One success in three
+> attempts. **Do not put this in front of anything you care about yet.**
+>
+> Getting that far turned up seven bugs the offline tests could not: see
+> [what real ESXi taught us](#what-real-esxi-taught-us). All seven are fixed;
+> the ones a mock can express are now caught by `scripts/66-test-esxi.py`.
 >
 > Every step below says how much it can be trusted. Read the
 > [revert](#reverting-everything) section *before* you start: it exists so a
@@ -27,9 +31,9 @@
 | ESXi running on this chassis at all | **verified** — 8.0 U3 build 24677879, 12C/24T, all six NICs and the ASIC enumerated |
 | DirectPath I/O accepting the Marvell device | **verified** — `Current Owner: VM Passthru` with **no** `passthru.map` entry and no reboot. See [step 1](#1-enable-passthrough-for-the-marvell-device) |
 | vSwitch / portgroup model for VLANs | **verified** — `install.sh` and `encs-esxi-vnet` both round-trip on the host |
-| The bootstrap itself (VM + passthrough boots the ASIC) | **high** — nothing in it is Proxmox-specific; the guest sees a PCI device either way. Not yet observed here |
-| Running the tools inside the bootstrap VM | **high** — they are ordinary Python/bash speaking HTTPS to `169.254.1.0` |
-| `SMBIOS.reflectHost` satisfying the platform gate | **medium** — documented ESXi behaviour, never checked against this image |
+| `SMBIOS.reflectHost` satisfying the platform gate | **verified** — `dmidecode` in the guest returns `ENCS5412/K9` and the chassis serial |
+| Managing the switch from a VM on the mgmt VLAN | **verified** — done from a VM with no passthrough device at all |
+| The bootstrap itself (VM + passthrough boots the ASIC) | **intermittent** — worked once in three; the VM is always killed by an [IOMMU fault](#the-iommu-fault-the-real-blocker) |
 
 ---
 
@@ -694,12 +698,21 @@ The first run on hardware failed on the very first line. Four bugs, none of
 which the 111 offline checks could have caught, because in each case the fake
 was more forgiving than the real thing:
 
-| What broke | Why the fake missed it |
+| What broke | Why it was not caught earlier |
 |---|---|
 | `command -v esxcli` → `ERROR: esxcli not found` | busybox ash has no `command` builtin — it exits 127 with `sh: command: not found`. The `sh` the tests run under does have it. Now uses `type`. |
 | Passthrough state always read as unknown | `pcipassthru list` prints a table; the fake printed one field per line like the other `hardware pci` lists. The plan claimed passthrough needed enabling on every run, and a second run recorded it twice. |
 | `tr` silently missing | ESXi's busybox has no `tr`. The test prepended the fake bindir to the *developer's* `PATH`, so it always resolved. It blanked the "i40en uplinks:" line. |
 | `pcipassthru set --device --active=true` rejected | The fake accepted any `--key=value` it was handed. Real options are `--device-id` and a bare `--apply-now`. |
+| The shipped `.vmx` would not power on with a passthrough device | No `pciBridge*` lines: *"No PCIe slot available for SCSI0 … Too many PCI devices are already configured."* Nothing offline builds a VM, so nothing exercised it. |
+| `/etc/encs-esxi/created` lost on every reboot | `/etc` is a 28 MB RAM disk, and `auto-backup.sh` archives only files with a `.#<name>` marker. `install.sh` called it believing that persisted the record. `passthru.map` survives only because it ships with its marker. The record now lives beside the bundle on VMFS. |
+| `pciPassthru0.id` is not the hex BDF | ESXi writes `%05d:%03d:%02d.%d`, **all fields decimal** — the format string is in `/usr/lib/vmware/drivers/lib/libpci_bus.so`. `0000:0d:00.0` → `00000:013:00.0`; slot `0x1d` → `29`, not `1d`. A hex BDF is refused with *"AH No device hints found"*, naming neither the key nor the format. |
+
+A seventh was found while fixing the sixth: the conversion above was first
+written with awk's `strtonum()`, which is a gawk extension — ESXi's busybox awk
+answers *"Call to undefined function"*. It is POSIX parameter expansion and
+`$((0x..))` now. The lesson is the same one this whole file keeps teaching:
+on this platform, assume nothing is present until it has been run there.
 
 The fixes to the test matter as much as the fixes to the bundle: the fake now
 prints the real table shape, validates option names against `esxcli --help`,
@@ -709,24 +722,71 @@ scanned for statically, because the test host's shell has both.
 
 ---
 
+## The IOMMU fault: the real blocker
+
+Three runs on a real 5412, ESXi 8.0 U3, ASIC cold (AC removed) before each:
+
+| Run | Guest RAM | IOMMU fault | Firmware upload finished first | ASIC |
+|---|---|---|---|---|
+| 1 | 2048 MB | yes, `0xe0041000` | yes — `FW upload done !!!`, `uboot started` | **came up, API answered** |
+| 2 | 4096 MB | yes, `0xe0041000` | no | did not come up |
+| 3 | 2048 MB (byte-identical to run 1) | yes, `0xe0041000` | no | did not come up |
+
+```
+PCI passthru device 0000:0d:00.0 caused an IOMMU fault type 5 at
+address 0xe0041000.  Powering off the virtual machine.
+```
+
+**The fault happens on every run.** What varies is only whether the firmware
+upload completes before it lands. Run 3 used the same VMX as run 1 and got the
+opposite result, so this is a race, not a misconfiguration — and the guest
+memory size is not the variable, because the faulting address is *identical*
+at 2 GB and 4 GB.
+
+The address belongs to neither side's BARs. The guest sees the device at
+`0xa0000000`/`0xc0000000`/`0xc4000000`; on the host it is mapped 64-bit, up at
+`0x383fc0000000`–`0x383fe4000000` (`vsish -e cat
+/hardware/pci/seg/0000/bus/13/slot/0/func/0/BARInfo/N`). `0xe0041000` is
+neither, so this is not a simple host-vs-guest BAR confusion. The device has no
+RMRR entry, and it is in IOMMU scope. What has not been established is where
+the ASIC's service CPU gets that address; until that is known, there is no
+fix to try, only guesses.
+
+**What this means in practice.** The switch does get bootstrapped, sometimes,
+and once it is up it stays up — the ASIC keeps running long after the VM that
+booted it has been killed, and it survives the host reboot too. So the
+platform is usable, just not the way this guide originally assumed:
+
+- **Bootstrapping is a coin flip** and each attempt costs an AC power cycle,
+  because a half-loaded ASIC has to be reset before the loader will take again.
+- **Managing the switch does not need the passthrough device at all.** The
+  tools speak HTTPS to `169.254.1.0`; that was confirmed from a VM with no PCI
+  device and a single vNIC on `encs-mgmt-2363`. So the roles can split: one VM
+  with passthrough that bootstraps and dies, any VM on the management VLAN that
+  administers. That also disposes of the "no HA restart policy" hazard for the
+  managing VM, since it never touches the loader.
+
+Not reproduced on Proxmox, which runs the same image on the same chassis with
+the module loading and the VM surviving. Whatever ESXi's IOMMU is rejecting,
+KVM/VFIO permits.
+
+---
+
 ## Known unknowns
 
 Things a first attempt should watch for, so a report back is useful:
 
 1. ~~**Does DirectPath I/O accept the device without a `passthru.map` entry?**~~
    **Answered: yes.** ESXi 8.0 U3 selected `Bridge reset` unprompted and moved
-   the device to `VM Passthru` with no map entry and no reboot. This was the
-   one potential hard blocker; it is not one.
-2. **Does `SMBIOS.reflectHost` actually present `ENCS5412/K9` to the guest?**
-   Check with `dmidecode -s system-product-name` in the VM. If it does not, and
-   the bootstrap works anyway, that settles the question of whether the gate
-   matters at runtime.
-3. **Does the loader survive an ESXi VM restart** the way it does a Proxmox one?
-   The README's rule is that a VM restart does not power-cycle the ASIC and so
-   is safe, while re-running the loader against a live switch is not. ESXi
-   resets a passthrough device on VM power-on, which is a *different* reset from
-   the ASIC's own — the ASIC lives past it. Expected to behave the same; worth
-   confirming deliberately, with the power cord in reach.
+   the device to `VM Passthru` with no map entry and no reboot.
+2. ~~**Does `SMBIOS.reflectHost` actually present `ENCS5412/K9` to the guest?**~~
+   **Answered: yes.** `dmidecode -s system-product-name` in the bootstrap VM
+   returns `ENCS5412/K9`, manufacturer `Cisco Systems, Inc.`, and the chassis
+   serial. The platform gate is satisfied without any per-VM SMBIOS authoring.
+3. **Does the loader survive an ESXi VM restart?** Overtaken by something
+   worse — see [the IOMMU fault](#the-iommu-fault-the-real-blocker). The VM
+   does not survive the *first* run, so "does it survive a restart" has not
+   been reachable.
 4. ~~**Whether ESXi 8.0 installs and runs on this chassis at all**, given the
    deprecated CPU generation.~~ **Answered: it does.** 8.0 U3 build 24677879,
    12C/24T, `HV Support: 3`, with the I350s, X552, both X710 functions, the

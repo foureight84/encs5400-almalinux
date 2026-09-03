@@ -21,7 +21,14 @@ PG_MGMT="${PG_MGMT:-encs-mgmt-2363}"
 PG_LAN="${PG_LAN:-encs-lan}"
 VLAN="${VLAN:-2363}"
 MTU="${MTU:-9000}"
-STATE="${STATE:-/etc/encs-esxi/created}"
+# NOT under /etc. /etc on ESXi is a 28 MB RAM disk restored from the bootbank
+# at boot, and auto-backup.sh only archives files that have a companion
+# ".#<name>" marker (see the find in /sbin/auto-backup.sh). A file this script
+# creates has no marker, so it was silently dropped on every reboot - which
+# left uninstall.sh with no record and refusing to run without --force.
+# The bundle already lives on a VMFS datastore, which is real storage, so the
+# record goes next to it.
+STATE="${STATE:-$(dirname "$0")/created}"
 RESET_METHOD="${RESET_METHOD:-}"     # flr | d3d0 | link | bridge | default
 APPLY=0
 
@@ -89,6 +96,18 @@ DEV=$(esxcli hardware pci list 2>/dev/null | awk '
 [ -n "$DEV" ] || die "no 11ab:be00 device found. Is this an ENCS 5400?
        Cross-check with: lspci | grep -i 11ab"
 info "switch ASIC at $DEV"
+
+# The VMX spelling of the same device. ESXi's own format string, in
+# /usr/lib/vmware/drivers/lib/libpci_bus.so, is "%05d:%03d:%02d.%d" - all four
+# fields DECIMAL, so bus 0x0d is "013" and slot 0x1d would be "29". Printed in
+# the Next section because a hand-written hex BDF fails in a way that names
+# neither the key nor the format.
+# Parameter expansion and $((0x..)), NOT awk's strtonum(): that is a gawk
+# extension and ESXi's busybox awk answers "Call to undefined function".
+_r=${DEV#*:}; _seg=${DEV%%:*}; _bus=${_r%%:*}
+_r=${_r#*:};  _slot=${_r%%.*}; _fn=${_r#*.}
+PT_ID=$(printf '%05d:%03d:%02d.%d' \
+    $((0x$_seg)) $((0x$_bus)) $((0x$_slot)) $((0x$_fn)))
 
 # A two-column table - "0000:0d:00.0    false" - not the block-per-device
 # layout the rest of `esxcli hardware pci` uses.  Reading it as blocks left
@@ -320,7 +339,21 @@ cat <<EOF
          - reserve ALL guest memory (passthrough will not power on otherwise)
          - EFI, Secure Boot OFF
          - SMBIOS.reflectHost = "TRUE"
+         - the pciBridge0/4/5/6/7 lines, or the VM will not power on at all
          - vNIC 1 on your normal VM network, vNIC 2 on $PG_MGMT
+
+       If you attach the device by hand rather than through the Host Client,
+       the VMX id is NOT the hex address above. ESXi writes it as
+       %05d:%03d:%02d.%d, every field decimal, so for $DEV it is:
+
+         pciPassthru0.present  = "TRUE"
+         pciPassthru0.id       = "$PT_ID"
+         pciPassthru0.deviceId = "0xbe00"
+         pciPassthru0.vendorId = "0x11ab"
+         pciPassthru0.systemId = "$(esxcli system uuid get 2>/dev/null)"
+
+       A hex BDF there is refused with "AH No device hints found", which names
+       neither the key nor the format. "govc device.pci.add" gets it right too.
 
     3. In the VM: give vNIC 2 169.254.1.1/16, then
          ping 169.254.1.0

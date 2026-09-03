@@ -332,12 +332,22 @@ down to what ESXi's `/bin` actually holds — the first real run found four bugs
 the earlier, more forgiving fake could not, and those are what that hardening
 is for.
 
-**The host side is verified on hardware**: passthrough, the vSwitch, the
-portgroups and `encs-esxi-vnet` all run on a real ENCS 5412 under ESXi 8.0 U3,
-and DirectPath I/O takes the Marvell with no `passthru.map` entry and no
-reboot. The **bootstrap VM** — everything downstream of `install.sh` — has not
-been booted there yet, which is why this stays off `main`.
-[docs/ESXI.md](docs/ESXI.md) grades every step. Reports either way are welcome.
+**Verified on hardware, and the verdict is mixed.** The host side works:
+passthrough, the vSwitch, the portgroups and `encs-esxi-vnet` all run on a real
+ENCS 5412 under ESXi 8.0 U3, DirectPath I/O takes the Marvell with no
+`passthru.map` entry, and `SMBIOS.reflectHost` gives the guest `ENCS5412/K9`.
+The **bootstrap is intermittent**: an IOMMU fault kills the VM on every run,
+and only sometimes does the firmware upload finish first — one success in
+three. The switch does come up and stay up when it wins that race, and
+managing it afterwards needs no passthrough at all. This stays off `main`
+until the fault is understood. [docs/ESXI.md](docs/ESXI.md) grades every step
+and documents the fault; reports from other chassis are welcome.
+
+Note the build host must be **x86_64 Linux with KVM**: the qcow2 step installs
+AlmaLinux under QEMU, and `createrepo_c` has no Homebrew formula, so an arm64
+Mac cannot build this at all. On AlmaLinux 9, `check_deps` passes but two
+symlinks are still needed — `qemu-system-x86_64` → `/usr/libexec/qemu-kvm`,
+and `/usr/share/OVMF/OVMF_CODE.fd` → `../edk2/ovmf/OVMF_CODE.fd`.
 
 ---
 

@@ -57,6 +57,24 @@ memSize = "$MEM"
 firmware = "efi"
 uefi.secureBoot.enabled = "FALSE"
 
+# Without these, adding ANY pciPassthru device fails power-on with
+# "No PCIe slot available for SCSI0 ... Too many PCI devices are already
+# configured". The Host Client writes them when it creates a VM; a
+# hand-written VMX has to say them itself. Verified on ESXi 8.0 U3.
+pciBridge0.present = "TRUE"
+pciBridge4.present = "TRUE"
+pciBridge4.virtualDev = "pcieRootPort"
+pciBridge4.functions = "8"
+pciBridge5.present = "TRUE"
+pciBridge5.virtualDev = "pcieRootPort"
+pciBridge5.functions = "8"
+pciBridge6.present = "TRUE"
+pciBridge6.virtualDev = "pcieRootPort"
+pciBridge6.functions = "8"
+pciBridge7.present = "TRUE"
+pciBridge7.virtualDev = "pcieRootPort"
+pciBridge7.functions = "8"
+
 scsi0.present = "TRUE"
 scsi0.virtualDev = "pvscsi"
 scsi0:0.present = "TRUE"
@@ -97,9 +115,22 @@ sched.mem.pin = "TRUE"
 #serial0.fileName = "telnet://:1234"
 #serial0.yieldOnMsrRead = "TRUE"
 
-# pciPassthru0.* is NOT here on purpose - add the Marvell device through the
-# Host Client (Add other device -> PCI device) so its id and the host-specific
-# systemId are filled in for you.
+# pciPassthru0.* is NOT here on purpose, and the reason is sharper than
+# "host-specific": pciPassthru0.id is NOT the hex BDF. ESXi formats it as
+# %05d:%03d:%02d.%d - every field DECIMAL - the format string that lives in
+# /usr/lib/vmware/drivers/lib/libpci_bus.so. So 0000:0d:00.0 becomes
+# "00000:013:00.0", and a device at slot 0x1d becomes ":29.0", not ":1d.0".
+# A hand-written hex BDF is rejected with "AH No device hints found" and
+# "Failed to generate predicates for pciPassthru0---invalid VM configuration",
+# which names neither the key nor the format.
+#
+# systemId is `esxcli system uuid get` on THIS host, and the BDF moves between
+# reinstalls (see opt/encs-esxi/install.sh), so neither value is portable.
+# Let the Host Client fill both in (Add other device -> PCI device), or use
+# govc, which drives the same API:
+#     govc device.pci.add -vm $NAME 0000:0d:00.0
+# install.sh prints the correct line for the device it found, if you would
+# rather paste it in.
 EOF
 
 cat > "$OUT/README-esxi.txt" <<EOF
