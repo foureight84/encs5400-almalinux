@@ -154,11 +154,32 @@ Deploying $NAME.vmdk on ESXi          (experimental - see docs/ESXI.md)
      # then, in the Host Client: Edit settings -> Add other device ->
      # PCI device -> the Marvell 11ab:be00, and confirm "Reserve all guest
      # memory" is ticked.
+     #
+     # Adding it by hand instead? pciPassthru0.id is NOT the hex BDF - ESXi
+     # writes it as %05d:%03d:%02d.%d, all decimal, so 0000:0d:00.0 is
+     # "00000:013:00.0". install.sh prints the exact block for your host.
+     # "govc device.pci.add -vm $NAME 0000:0d:00.0" also gets it right.
 
-4. Power on and watch it:
+4. Power on. EXPECT THE VM TO DIE - that is normal here:
      vim-cmd vmsvc/power.on <vmid>
-     # in the VM console: journalctl -u marvell-switch-boot -f
-     # ~60s from a cold ASIC to "ROS ready!"
+     # ~60s in, ESXi kills it:
+     #   "PCI passthru device caused an IOMMU fault at address 0xe0041000"
+     # By then the firmware is already in the ASIC and u-boot finishes on its
+     # own, so the SWITCH comes up regardless and stays up - through the VM's
+     # death and through host reboots. Confirm from any VM on encs-mgmt-2363:
+     #   ping 169.254.1.0
+     # Why it happens, and why it cannot be fixed from here: docs/ESXI.md.
+
+5. Switch to the MANAGEMENT role - this is not optional:
+     # Remove the PCI device from the VM (Host Client -> Edit settings), then
+     # power it back on. Now it can run the tools:
+     #   ip addr add 169.254.1.1/16 dev <the encs-mgmt-2363 vNIC>
+     #   /opt/encs-host/encs-switch-tui
+     #
+     # NEVER boot a VM that still has the Marvell attached while the switch is
+     # up. marvell-switch-boot runs at every boot, and a loader run against an
+     # already-booted ASIC wedges it until AC is physically pulled. Bootstrap
+     # once per AC power cycle; manage from a VM with no PCI device.
 
 Revert everything the host side did:
      sh /vmfs/volumes/datastore1/encs-esxi/uninstall.sh          # plan

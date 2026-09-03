@@ -338,12 +338,16 @@ and all. DirectPath I/O takes the Marvell with no `passthru.map` entry and
 `SMBIOS.reflectHost` gives the guest `ENCS5412/K9`.
 
 Two things differ from the Proxmox path. The work splits across **two VM
-roles** — one with the Marvell passed through that bootstraps the ASIC once per
-AC power cycle, and one *without* it that runs `encs-switch-tui` and friends
-over the management VLAN. And the bootstrap VM is killed part-way by an IOMMU
-fault, which turns out not to matter: the firmware is already delivered and the
-ASIC finishes on its own. Never boot a VM that still has the Marvell attached
-while the switch is up — that wedges it until AC is pulled.
+roles** — one with the Marvell passed through that bootstraps the ASIC, and one
+*without* it that runs `encs-switch-tui` and friends over the management VLAN.
+And the bootstrap VM is killed part-way by an IOMMU fault, which turns out not
+to matter: the firmware is already delivered and the ASIC finishes on its own.
+
+Bootstrap has to run again after every host power-on **or reboot** — a warm
+reboot drops the switch, though it leaves the ASIC re-bootstrappable rather
+than wedged, so recovery is one VM run and not a site visit. Never boot a VM
+that still has the Marvell attached while the switch is up: that is the wedge
+case, and it does need AC pulled.
 
 It stays off `main` while that fault is unexplained.
 [docs/ESXI.md](docs/ESXI.md) grades every step, documents the fault, and

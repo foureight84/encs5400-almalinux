@@ -766,7 +766,10 @@ PCIe. Verified on the chassis from a VM with the Marvell **not** attached
 So `encs-switch-tui` runs in a guest here, not on the host as it does on
 Proxmox. Give that guest a second vNIC on `encs-mgmt-2363`, address it
 `169.254.1.1/16`, give it no default route, and run the tools exactly as the
-README describes. `encs-switch-status` will report FAIL for the Marvell, the
+README describes. Configure that address **persistently** (an ifcfg/nmcli
+connection), not with a bare `ip addr add` - NetworkManager will drop a
+manually added address on it, and the symptom is a switch that looks dead from
+that VM while being perfectly healthy. `encs-switch-status` will report FAIL for the Marvell, the
 module and `/dev/servicecpu` - that is correct and expected for a management
 VM, and the line that matters is the last one.
 
@@ -785,8 +788,23 @@ address 0xe0041000.  Powering off the virtual machine.
 
 **This is survivable and, in practice, cosmetic.** By the time it fires the
 firmware is already in the ASIC's DDR; u-boot carries on to ROS without the VM,
-and the switch comes up and stays up - through the VM's death, and through host
-reboots. What it costs you is the VM, not the switch.
+and the switch comes up and stays up. What it costs you is the VM, not the
+switch.
+
+What the switch survives, measured rather than assumed:
+
+| Event | Switch |
+|---|---|
+| The bootstrap VM being killed by the fault | **stays up** |
+| The management VM stopped, restarted, rebuilt | **stays up** |
+| A warm host reboot | **goes down** - both X710 links read `Link Down` |
+| AC removed | goes down |
+
+A host reboot does drop it, but leaves the ASIC **re-bootstrappable, not
+wedged**: run the bootstrap VM again and it goes straight through to
+`uboot running`, both X710 links come up at 10 Gbps and the API answers. No AC
+pull needed. Only a *wedge* - the loader run against an already-booted ASIC -
+costs you a site visit.
 
 It took a while to get there. The fault used to land *early*, before the upload
 finished, and the switch then came up only when it happened to win the race -
