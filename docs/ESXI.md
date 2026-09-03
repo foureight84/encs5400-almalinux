@@ -636,10 +636,18 @@ deliberately power on rather than something you might leave attached.
 
 ---
 
-### Day to day: running the TUI again later
+### Day to day: the TUI is the switch console
 
-Once the management VM exists, there is nothing to repeat. SSH into it (or open
-its VMware console) and run the tool:
+The setup above is done once. `encs-switch-tui` is not — it is how you operate
+the switch from then on, the same way you would log into any managed switch.
+Enabling a front port for a new device, putting jacks in a VLAN, building a
+LAG, turning PoE on or off for a camera, adding storm control, setting up port
+mirroring to debug something: all of it is this tool, run whenever you need it,
+for as long as you own the box.
+
+The management VM exists so that is always available. Leave it running.
+
+SSH into it (or open its VMware console) and run the tool:
 
 ```sh
 ssh root@<management-vm>
@@ -650,6 +658,18 @@ It is an ordinary interactive curses program: arrow keys move, `p`/`v`/`e`/`m`
 /`s`/`c` switch views, `TAB` opens the rest, `SPACE` enables or shuts the
 selected port, `ENTER` opens settings, `?` is the built-in manual and `q`
 quits. Any terminal that can run `top` can run this; nothing special is needed.
+
+What you come back to it for:
+
+| Hotkey | View | Typical reason to return |
+|---|---|---|
+| `p` | ports | enable/shut a jack, change speed or duplex, build a LAG |
+| `v` | vlans | add a VLAN, move front ports between VLANs, tag te2 |
+| `e` | poe | power a camera or AP on/off, set priority, check draw |
+| `m` | mac | find which jack a device is on |
+| `s` | stats | counters and errors when something is flaky |
+| `c` | config | save (`w`) and restore — what gets replayed after a cold boot |
+| `TAB` | more | spanning tree, storm control, port mirroring, static MACs, LLDP/CDP, LACP tuning, private VLANs, ACLs, QoS, 802.1X, RADIUS, IGMP snooping, L3 |
 
 A live session looks like this — real hardware, front panel and backplane:
 
@@ -668,13 +688,33 @@ A live session looks like this — real hardware, front panel and backplane:
 the ASIC is not answering — check `ping 169.254.1.0`, and if that fails see
 [step 9](#9-what-to-do-after-a-reboot-or-a-power-cut).
 
-Two habits worth having:
+**Save every change you intend to keep.** This matters more here than on a
+normal switch, and it is the one habit that will bite you if you skip it: the
+ASIC has no flash, so *nothing you configure survives a power cut or a host
+reboot on its own*. A LAG you built, PoE you enabled, a VLAN you added — all of
+it is gone at the next cold start, and the switch comes back with firmware
+defaults and every front port shut.
 
-- **Save what you change.** The ASIC has no flash. `encs-switch-replay.service`
-  reapplies `/etc/encs-switch/*.xml` after every bootstrap, so put your intended
-  configuration there rather than only in the running switch.
-- **The management VM can be left running.** It never touches the loader, so it
-  is safe to autostart, restart or rebuild whenever — unlike the bootstrap VM.
+What carries configuration across is `encs-switch-replay.service` in the
+management VM, which reapplies `/etc/encs-switch/*.xml` once the ASIC answers
+after each bootstrap. So the rule is: make the change, then write it out.
+
+```sh
+# in the TUI:  press  c  for the config view, then  w  to write
+#              ("saving - reading every table, this takes a few seconds ...")
+# or from a shell, same thing:
+encs-switch-tui --save          # capture running config to /etc/encs-switch
+encs-switch-tui --apply         # replay it (what encs-switch-replay does)
+```
+
+Treat the running switch as volatile and `/etc/encs-switch/` as the real
+configuration. A change you made but never wrote is a change you will lose.
+
+**The management VM can be left running.** It never touches the loader, so it
+is safe to autostart, restart or rebuild whenever — unlike the bootstrap VM.
+Autostarting it is the sensible default, since it is also what replays your
+configuration after every one of the "down" rows in
+[step 9](#9-what-to-do-after-a-reboot-or-a-power-cut).
 
 ---
 
