@@ -140,21 +140,26 @@ an X710 port, move it back before starting.
 
 ## The short version
 
-The whole thing, assuming you have read the
-[prerequisites](#prerequisites) above and have a built image. Each block is one
-of the numbered steps below, which carry the detail and the failure modes —
-this is a map, not a substitute for them.
+Every command, in the order you actually run them, for someone who has done
+this before or wants to see the shape of it first. The numbered sections below
+are the same work with the detail and the failure modes — **read those the
+first time**; the labels here name which step each block belongs to.
+
+Note the execution order is not the section order: `install.sh` does
+[step 1](#1-enable-passthrough-for-the-marvell-device) and
+[step 3](#3-build-the-switch-vswitch) in one go, so the disk work
+([step 2](#2-get-the-disk-onto-a-datastore)) happens after it.
 
 ```sh
-# 1. BUILD  (x86_64 Linux with KVM - an arm64 Mac cannot do this)
+# BUILD - prerequisites; x86_64 Linux with KVM, an arm64 Mac cannot do this
 ./build.sh --esxi /path/to/Cisco_NFVIS-4.15.5-FC4.iso
 
-# 2. HOST SIDE  (passthrough + vSwitch + portgroups)
+# HOST SIDE - steps 1 + 3: passthrough, vSwitch, portgroups
 scp -r payload/opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
 ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'        # plan
 ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh --yes'  # apply
 
-# 3. DISK
+# DISK - step 2
 ssh root@<esxi> 'mkdir -p /vmfs/volumes/datastore1/encs-switch'
 scp out/esxi/encs-switch.vmdk out/esxi/encs-switch.vmx \
     root@<esxi>:/vmfs/volumes/datastore1/encs-switch/
@@ -162,18 +167,19 @@ ssh root@<esxi> 'cd /vmfs/volumes/datastore1/encs-switch &&
     vmkfstools -i encs-switch.vmdk -d thin disk.vmdk && rm -f encs-switch.vmdk &&
     sed -i "s|^scsi0:0.fileName.*|scsi0:0.fileName = \"disk.vmdk\"|" encs-switch.vmx'
 
-# 4. REGISTER + attach the Marvell (Host Client, or the block install.sh printed)
+# VM - step 4: register, then attach the Marvell (Host Client, or the
+#      block install.sh printed - the id is NOT the hex BDF)
 ssh root@<esxi> 'vim-cmd solo/registervm \
     /vmfs/volumes/datastore1/encs-switch/encs-switch.vmx'
 
-# 5. BOOTSTRAP - power on, and EXPECT THE VM TO DIE ~60s in. That is normal.
+# BOOTSTRAP - step 5: power on, and EXPECT THE VM TO DIE ~60s in. Normal.
 ssh root@<esxi> 'vim-cmd vmsvc/power.on <vmid>'
 
-# 6. CONFIRM the switch came up anyway (from any VM on encs-mgmt-2363)
+# CONFIRM - step 5: the switch came up anyway (from a VM on encs-mgmt-2363)
 ping -c2 169.254.1.0
 
-# 7. SWITCH TO MANAGEMENT ROLE: remove the PCI device from the VM, power it
-#    back on, then inside it:
+# MANAGEMENT - step 6: remove the PCI device from the VM, power it back on,
+#               then inside it (and see step 9 for what to do after a reboot):
 nmcli con add type ethernet ifname ens224 con-name encs-mgmt \
       ipv4.method manual ipv4.addresses 169.254.1.1/16 \
       ipv4.never-default yes ipv6.method ignore
