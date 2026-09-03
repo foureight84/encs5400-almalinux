@@ -795,22 +795,41 @@ once in three attempts. The fix was
 enabled the upload completes deterministically, and every run since has ended
 with a working switch.
 
-What is still unexplained is the address. `0xe0041000` is invariant across
-every variable tried - 2 GB and 4 GB of guest RAM, `pciPassthru.use64bitMMIO`,
-`pciHole.start`, and the COMMAND fix itself. It is `0xe0000000 + 0x41000`, and
-`0x41xxx` is the ASIC's register-window offset (`regAddr=0x00041804`,
-`0x00041820`, ...). The same `0xe0000000` appears in the *working* Proxmox
-trace as a window base ("`2) address: ...41824 data:0xe0000000`"), so the value
-is not wrong - ESXi simply has nothing mapped there, because at 2560 MB
-(`pciHole.dynStart`, which ESXi computes and which overrides `pciHole.start`)
-our BARs land at `0xa0000000`/`0xc0000000`/`0xc4000000` and the address falls
-past all of them.
+### Why that address, and why it cannot be moved
 
-The untested idea, for anyone who wants to chase it: `pciHole.dynStart = 3072`
-should shift the BARs up by `0x20000000`, putting `0xe0041000` inside the 64 MB
-BAR2 rather than in unmapped space, and making the layout match Proxmox's.
-Each attempt costs an AC power cycle, which is why it is written down rather
-than done.
+`0xe0041000` is invariant across every variable tried - 2 GB and 4 GB of guest
+RAM, `pciPassthru.use64bitMMIO`, `pciHole.start`, `pciHole.dynStart` and the
+COMMAND fix. `/proc/iomem` in the guest says why:
+
+```
+e0000000-e7ffffff : PCI MMCONFIG 0000 [bus 00-7f]
+  e0000000-e7ffffff : pnp 00:05
+```
+
+**`0xe0000000` is the guest's PCI MMCONFIG (ECAM) window.** The ASIC's register
+offsets are `0x41xxx` (`regAddr=0x00041804`, `0x00041820`, ...), so a window
+based at `0xe0000000` puts its register accesses inside the guest's
+memory-mapped *config* space - which the IOMMU will never map for device DMA.
+The offset even decodes as a valid ECAM address (bus 0, device 8, function 1).
+
+That is the whole story: the ASIC is not DMAing somewhere random, it is DMAing
+to a base that on this platform collides with ECAM. On Proxmox the same
+`0xe0000000` appears in the working trace ("`2) address: ...41824
+data:0xe0000000`") and is ordinary BAR space there, so nothing faults.
+
+Both ways of moving the collision are closed:
+
+- **From the host.** `pciHole.dynStart` is not settable. ESXi computes it
+  (2560, i.e. `0xa0000000`, exactly where the BARs land) and *rewrites the VMX
+  back to its own value* on power-on - a `3072` written into the file is `2560`
+  again by the time the VM boots. `pciHole.start` is read but does not govern.
+- **From the guest.** `pci=nommconf` does stop Linux using MMCONFIG, but the
+  range stays reserved as `pnp 00:05` from the virtual firmware's ACPI tables,
+  so the PCI allocator still will not place a BAR there.
+
+Short of a VM firmware that puts ECAM somewhere else, there is nothing left to
+turn. This is documented rather than fixed - and it costs the bootstrap VM,
+not the switch.
 
 ### The COMMAND register bug
 
@@ -862,6 +881,8 @@ Things a first attempt should watch for, so a report back is useful:
    12C/24T, `HV Support: 3`, with the I350s, X552, both X710 functions, the
    I210 and the Marvell all enumerated.
 
-All four are answered. What remains open is not on the original list: the
-[IOMMU fault](#the-iommu-fault) itself, which costs the bootstrap VM but not
-the switch, and whose address is still unexplained.
+All four are answered. What remains is not on the original list and is no
+longer a mystery, only unfixable from here: the
+[IOMMU fault](#the-iommu-fault) is the ASIC's register window colliding with
+the guest's ECAM range at `0xe0000000`, and neither the host nor the guest can
+move either one. It costs the bootstrap VM, not the switch.
