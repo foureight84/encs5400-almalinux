@@ -1155,83 +1155,71 @@ The fault is a **write**, by the device, to an address that is not RAM:
 ```
 WARNING: VTD: IOMMU Fault IOMMU Unit #0: R/W=W, Device 0000:0d:00.0
                                          Addr = 0xe0041000
+WARNING: VTD: 307: Reason = 0x5 -> PTE not set to allow Write.
 ```
 
-`R/W=W` is the whole diagnosis in three characters. The ASIC is not reading
-something it should not; it is **DMA-ing outbound to `0xe0041000`**, and the
-IOMMU domain ESXi built for this VM does not map that address, so the write is
-blocked and the VM is shot.
+`R/W=W` is most of the diagnosis. The ASIC is not reading something it should
+not; it is **DMA-ing outbound to `0xe0041000`**, and the IOMMU domain ESXi
+built for this VM has no writable mapping there, so the write is blocked and
+the VM is shot.
 
-Two things about that address are established:
+What is established about that address, and how firmly:
 
-- **`0x41000` is inside the ASIC's own MSYS register block.** The loader
-  programs `0x41804`, `0x41808` and `0x41820`–`0x41864` — the internal
-  address-decode windows. `0x41000` is the base of that block, not a random
-  offset into RAM.
-- **`0xe0000000` is what the loader puts in window 0 on *both* platforms.**
-  The Proxmox trace, from a run that works, writes exactly this:
+| Claim | Evidence |
+|---|---|
+| `0x41000` is inside the ASIC's own MSYS register block | The loader programs `0x41804`, `0x41808`, `0x41820`–`0x41864` — the internal address-decode windows. **Firm.** |
+| On Proxmox, working, the loader writes `0xe0000000` to window 0 | The trace: `2) address: ...41824 data:0xe0000000`. **Firm.** |
+| On ESXi the loader writes the same `0xe0000000` | **Inferred** from the fault address only — the post-COMMAND-fix register trace was never captured here. |
+| On ESXi, `0xe0000000` is *not* the device's BAR | `lspci` shows BAR0 at `0xc4000000`, and `0xe0000000` is the guest's PCI MMCONFIG (ECAM) range. **Firm** — before `mv_pciboot` reassigns BARs; not re-checked after. |
 
-  ```
-  2) address: ...41824 data:0xe0000000        <- win0_base, on Proxmox, working
-  ```
+So the ASIC is being told to write to `0xe0000000 + 0x41000`. On Proxmox that
+is the device's own BAR — peer-to-peer DMA back to itself, which QEMU/VFIO
+maps into the IOMMU domain, so it lands. On ESXi it does not land, and there
+are **two candidate reasons, not one**:
 
-So the ASIC is being pointed back at its own register window and told to reach
-it *through the PCIe port* rather than internally. That is peer-to-peer DMA:
-device → MMIO, not device → RAM.
+- **(A) The domain does not map device MMIO.** ESXi DirectPath I/O maps guest
+  RAM for device DMA and nothing else unless told to. If the guest BAR ends up
+  at `0xe0000000` after `mv_pciboot` reassigns it, this alone is the cause.
+- **(B) `0xe0000000` is simply not the device in this guest.** ECAM lives
+  there and Linux will not place a BAR on it. If the window value is fixed at
+  `0xe0000000` regardless of where the BAR is, the write goes to config space,
+  and no P2P mapping helps because there is no device to map.
 
-### Why it works on Proxmox and not here
+They are not exclusive, and the earlier text in this section picked (B) alone
+with more confidence than the evidence supports. (A) was never considered,
+and it has a one-line test.
 
-Not because the address differs — it is `0xe0000000` on both. Because of what
-each hypervisor puts in the IOMMU domain.
+### The levers, sorted by what they test
 
-| | Proxmox / VFIO | ESXi DirectPath I/O |
-|---|---|---|
-| Guest RAM mapped for device DMA | yes | yes |
-| Device MMIO mapped for device DMA | yes | **no, by default** |
-| A device write to `0xe0041000` | lands | **faults** |
-
-VFIO maps device BARs into the domain, so a device reaching its own MMIO is
-fine. ESXi does not do this unless asked. **That, not the address, is the
-difference**, and it is why every attempt to *move* the address failed: the
-address was never the problem.
-
-> **This corrects an earlier explanation in this document.** It previously said
-> the cause was `0xe0000000` colliding with the guest's PCI MMCONFIG (ECAM)
-> window. `0xe0000000` genuinely *is* the guest ECAM base — but it is also the
-> value Proxmox writes on a working run, and the low 32 bits of this host's
-> physical BAR2 (`0x383fe0000000`). Three coincidences on one round number.
-> ECAM was never a mechanism: no driver hands a device the MMCONFIG base as a
-> DMA target. The collision was real and irrelevant.
-
-### Untried: two options that match the failure exactly
-
-`0xe0000000` was chased hard, and the levers that move addresses are genuinely
-closed (`pciHole.dynStart` is rewritten to `2560` by ESXi on power-on;
-`pci=nommconf` leaves the range reserved as `pnp 00:05` by ACPI). But if the
-problem is *what the domain maps* rather than *where the write goes*, those
-were the wrong levers. This ESXi build accepts three options that were never
-tried:
+Everything that *moves* addresses is closed and was tested: `pciHole.dynStart`
+is rewritten to `2560` by ESXi at power-on, `pciHole.start` does not govern,
+and `pci=nommconf` leaves the range reserved as `pnp 00:05` by ACPI. Those all
+attack (B). Nothing has attacked (A). This build accepts three options that
+were never tried:
 
 ```sh
 # confirm your build has them
 ssh root@<esxi> 'grep -ao "pciPassthru\.[A-Za-z0-9]*" /bin/vmx | sort -u'
 ```
 
-| VMX option | Why it is a candidate |
+| VMX option | What it tests |
 |---|---|
-| `pciPassthru.allowP2P = "TRUE"` | Names the exact operation that is failing: peer-to-peer DMA from a passthrough device to MMIO. The first thing to try. |
-| `pciPassthru.useActualBases = "TRUE"` | Presents host-physical BAR bases to the guest, so a window the loader derives from a BAR is an address the host agrees with. |
-| `pciPassthru.iommuEarlySetup = "TRUE"` | Builds the IOMMU mappings before the guest touches the device, rather than at first fault. |
+| `pciPassthru.allowP2P = "TRUE"` | **(A).** Maps the passthrough device's MMIO into the IOMMU domain. Confirmed accepted — it survives into the VMX DICT at power-on, unlike `pciHole.dynStart`. |
+| `pciPassthru.useActualBases = "TRUE"` | **(B), from the other side.** Presents host-physical BAR bases to the guest, so a window the loader derives from a BAR is an address the host agrees with. |
+| `pciPassthru.iommuEarlySetup = "TRUE"` | Builds the mappings before the guest touches the device rather than at first fault. Cheap to add alongside either. |
 
-**Status: hypothesis, not fix.** None has been tried on hardware. Each test
-costs a bootstrap run against a live ASIC, which wedges the switch and needs a
-physical AC pull to clear, so this has not been attempted casually. If you have
-a box you can power-cycle, `allowP2P` is one line in the VMX and is the single
-highest-value experiment left on this platform.
+**How to read a test:** if `allowP2P` alone stops the fault, (A) was the
+cause and the two-VM split may be unnecessary. If the fault persists at the
+same address with `allowP2P` set, (B) is in play too — check where
+`mv_pciboot` left the BAR (`lspci -vs <bdf>` after the module loads) before
+trying `useActualBases`.
 
-Until then this is documented rather than fixed — and, as everything above
-says, it costs the bootstrap VM and not the switch, so it is an annoyance
-rather than a blocker.
+**Status: hypothesis, not fix.** A valid test needs the ASIC in WFI — i.e. an
+AC pull first. The one attempt so far (2026-09-03) was made against a live
+switch; the loader stalled at `Service CPU not ready (requires reset?)` and
+never reached the DMA, so the absence of a fault proved nothing. Until a clean
+run exists this is documented rather than fixed — and it costs the bootstrap
+VM, not the switch.
 
 ### The COMMAND register bug
 
@@ -1286,9 +1274,10 @@ Things a first attempt should watch for, so a report back is useful:
 All four are answered. What remains was not on the original list:
 
 **Can the [IOMMU fault](#the-iommu-fault) be fixed after all?** The fault is a
-device *write* to `0xe0041000` — peer-to-peer DMA from the ASIC back to its own
-register window. Proxmox allows that and ESXi does not map device MMIO into the
-IOMMU domain by default. Three VMX options this build accepts were never tried,
-`pciPassthru.allowP2P` first among them. Until someone runs that test on a box
-they can power-cycle, this stays an open question rather than a closed one — but
-it costs the bootstrap VM, not the switch, so nothing is blocked on the answer.
+device *write* to `0xe0041000`, and there are two candidate causes: ESXi not
+mapping device MMIO into the IOMMU domain, or the target simply not being the
+device in this guest because ECAM occupies `0xe0000000`. Only the second was
+ever attacked. `pciPassthru.allowP2P` tests the first in one line and is
+confirmed accepted by this build. Until someone runs it after an AC pull, this
+stays open — but it costs the bootstrap VM, not the switch, so nothing is
+blocked on the answer.
