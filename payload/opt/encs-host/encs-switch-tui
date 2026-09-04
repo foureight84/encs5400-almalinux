@@ -2057,6 +2057,11 @@ def do_update(force=False, say_=print):
     tag, newer, assets = check_update()
     if not newer and not force:
         say_(f"already up to date: {VERSION} (latest release is {tag})")
+        # Still worth running: the files may be current while the bootstrap
+        # VM's passthrough is not (a BIOS/CIMC update between two --updates),
+        # and a 0.2.1 host's --update installed 0.2.3 with the OLD code, which
+        # had no post-update step - so "run --update again" has to work.
+        _post_update(say_)
         return None
     say_(f"updating {VERSION} -> {tag}")
 
@@ -2485,8 +2490,10 @@ Roll back by copying the files out of the backup directory.
 On Proxmox it finishes by running 'encs-switch-vnet hostpci --fix' and
 'encs-switch-vnet startup --fix': if a BIOS or CIMC update moved the Marvell
 on the PCI bus, the bootstrap VM's hostpci line is re-pointed right away
-instead of at the next boot. It never starts a VM - do that yourself once it
-says the address was fixed.
+instead of at the next boot - also when there was nothing new to install.
+It never starts a VM - do that yourself once it says the address was fixed.
+Coming from 0.2.1 or older, the copy doing the update predates this step, so
+run --update a second time (or 'encs-switch-vnet hostpci --fix').
 
 This updates the HOST tools only. The bootstrap VM's kernel, the Marvell
 module and the firmware loader are baked into the image and are not

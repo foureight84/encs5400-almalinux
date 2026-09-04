@@ -739,12 +739,16 @@ shows the check on demand. **Already installed and hit by this?** One
 command, then start the VM:
 
 ```sh
-encs-switch-tui --update      # installs 0.2.3 and applies the hostpci fix right away
+encs-switch-tui --update      # installs 0.2.3
+encs-switch-tui --update      # again: 0.2.3's --update applies the hostpci fix, even with nothing new
 qm start 900
 ```
 
-`--update` runs the fix itself after installing, so there is no waiting for
-a reboot and no second command to learn. It never starts the VM for you,
+The first run is done by the *old* code, which only installs files; the
+second is done by 0.2.3, which finishes every `--update` — new files or not —
+by re-pointing the bootstrap VM at the Marvell's current address and fixing
+guest boot order. From 0.2.3 on, one run is enough. (`encs-switch-vnet
+hostpci --fix` is the same check by hand.) It never starts the VM for you,
 because booting the loader against an ASIC that is already up is the wedge.
 The same thing on ESXi is a per-address passthrough flag; see
 [docs/ESXI.md](docs/ESXI.md#after-a-bios-or-cimc-update-the-marvell-moves-on-the-pci-bus).
