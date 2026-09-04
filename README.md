@@ -145,7 +145,7 @@ On Proxmox 8 (kernel 6.8) it is usually on already.
 
 ```sh
 qm create 900 --name encs-switch --machine q35 --bios ovmf \
-    --memory 256 --cores 2 --net0 virtio,bridge=vmbr0 \
+    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \
     --serial0 socket --vga serial0
 qm importdisk 900 AlmaLinux-8.9-ENCS5400-switch.qcow2 local-lvm
 qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
@@ -239,7 +239,7 @@ use `AlmaLinux-8.9-ENCS5400-switch.iso`.
 
 ```sh
 qm create 900 --name encs-switch --machine q35 --bios ovmf \
-    --memory 256 --cores 2 --net0 virtio,bridge=vmbr0 \
+    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \
     --serial0 socket --vga serial0
 qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:16
 qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
@@ -978,10 +978,13 @@ Three separate paths, which is the key to understanding everything else:
 | **Boot** | bootstrap VM | pushes firmware over PCIe; a permanent watchdog daemon |
 | **Management** | Proxmox host | HTTPS XML API on `169.254.1.0` over VLAN 2363 |
 
-The VM is *infrastructure*, not a data-plane element — 2 vCPU / 256 MB is enough
-(it idles at 150 MB and bootstraps the ASIC at 256 with the 21 MB initramfs this
-tree builds; an image built before 2026-09-03 carries the 62 MB generic one, which
-GRUB cannot place below ~300 MB — give those 384). With passthrough the whole
+The VM is *infrastructure*, not a data-plane element — 2 vCPU / **384 MB** is
+enough. It idles at 150 MB; what sets the floor is the firmware. Under OVMF
+(Proxmox, and the build's own verify boot) the kernel's EFI stub cannot find
+room below 320 MB — `Failed to allocate usable memory for kernel` at 288 and
+256, measured 2026-09-03 — so 384 is the floor plus one step. (ESXi's firmware
+manages 256; see `docs/ESXI.md`.) Do not hand it 2 GB out of habit: with
+passthrough the whole allocation is pinned. With passthrough the whole
 allocation is pinned, so do not hand it 2 GB out of habit — that is 2 GB the host
 never gets back. The same figure applies on ESXi; see `docs/ESXI.md`.
 Sizing is independent of switch throughput. Management deliberately lives on the host,

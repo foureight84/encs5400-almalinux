@@ -433,7 +433,10 @@ device.
 > than it looks: with a passthrough device ESXi pins the entire allocation
 > (`sched.mem.pin`) and Proxmox/VFIO does the same, so every MB here is a MB
 > the host never sees again. The management role runs the TUI at 256 as
-> well, with ~60 MB to spare and 1.6 GB of swap behind it.
+> well, with ~60 MB to spare and 1.6 GB of swap behind it. **256 is an ESXi
+> number:** under OVMF (Proxmox) the kernel's EFI stub cannot find room
+> below 320 whatever the initramfs size, which is why the Proxmox side
+> ships at 384.
 
 `build.sh --esxi` writes `out/esxi/encs-switch.vmx` with all of this already
 set (`VM_HWVERSION=17 build.sh --esxi ...` for an older ESXi), so registering

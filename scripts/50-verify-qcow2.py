@@ -25,6 +25,18 @@ import threading
 import time
 
 CHECKS = [
+    # The memory floor and the reasons for it. The 62 MB generic initramfs
+    # set the old floor (GRUB: "can't allocate initrd"); the slim one is
+    # ~21 MB. Under OVMF the firmware then sets it at 320; under VMware's
+    # EFI the same image boots at 256.
+    ("memory: this VM's size, and what is left",
+     "free -m | sed -n '1,2p'"),
+    ("initramfs: must be the slim one (well under 32 MB) with LVM and both "
+     "hypervisors' drivers in it",
+     "ls -la /boot/initramfs-$(uname -r).img | awk '{printf \"%d MB\\n\", $5/1048576}'; "
+     "lsinitrd /boot/initramfs-$(uname -r).img 2>/dev/null | grep -cE 'dm-mod.ko|vmw_pvscsi|vmxnet3|virtio_blk|virtio_scsi' | sed 's/^/drivers+dm found: /'"),
+    ("tools on PATH (symlinks into /opt/encs-host)",
+     "for t in tui api vnet; do printf '%s -> ' encs-switch-$t; readlink -f $(command -v encs-switch-$t) || echo MISSING; done; encs-switch-vnet --version"),
     ("kernel + hostname", "hostname; uname -r"),
     ("switch payload",
      "ls -l /opt/switch-confd/mv_pciboot.ko.xz /opt/switch-confd/remote_boot_app "
@@ -75,10 +87,12 @@ def main():
         # -cpu host is KVM-only; TCG rejects it outright, so fall back to 'max'.
         cpumodel = "host" if accel == "kvm" else "max"
         cmd = ["qemu-system-x86_64", "-machine", f"q35,accel={accel}",
-               # 256 MB, the size the image ships at: this boot is the
-               # regression test for the memory floor as much as for the
-               # image. VERIFY_MEM=2048 if you only want to know it boots.
-               "-cpu", cpumodel, "-smp", "4", "-m", os.environ.get("VERIFY_MEM", "256"),
+               # 384 MB, the Proxmox shipping size: this boot runs under OVMF,
+               # and is the regression test for the memory floor as much as
+               # for the image. OVMF's EFI stub cannot place the kernel below
+               # 320 ("Failed to allocate usable memory for kernel" at 288),
+               # whatever the initramfs size. VERIFY_MEM overrides.
+               "-cpu", cpumodel, "-smp", "4", "-m", os.environ.get("VERIFY_MEM", "384"),
                "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf('OVMF_CODE')}",
                "-drive", f"if=pflash,format=raw,file={varsf}",
                "-drive", f"file={copy},format=qcow2,if=virtio",
