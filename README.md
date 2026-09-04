@@ -132,7 +132,7 @@ On Proxmox 8 (kernel 6.8) it is usually on already.
 
 ```sh
 qm create 900 --name encs-switch --machine q35 --bios ovmf \
-    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \   # 512 if you want margin, see How it works
+    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \
     --serial0 socket --vga serial0
 qm importdisk 900 AlmaLinux-8.9-ENCS5400-switch.qcow2 local-lvm
 qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
@@ -144,7 +144,9 @@ qm set 900 --onboot 1 --startup order=1
 qm start 900
 ```
 
-Two things that will otherwise waste your afternoon:
+384 MB is verified; `--memory 512` if you want a margin above the firmware
+floor — see [How it works](#how-it-works). Two things that will otherwise
+waste your afternoon:
 
 - **SMBIOS must be base64.** `switch-confd` gates on
   `dmidecode -s system-product-name` matching `ENCS5412/K9`, and the `/` breaks
@@ -226,7 +228,7 @@ use `AlmaLinux-8.9-ENCS5400-switch.iso`.
 
 ```sh
 qm create 900 --name encs-switch --machine q35 --bios ovmf \
-    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \   # 512 if you want margin, see How it works
+    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \
     --serial0 socket --vga serial0
 qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:16
 qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
