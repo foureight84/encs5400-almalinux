@@ -1189,6 +1189,29 @@ address space, and the value comes from the *host's*. ECAM being at
 silently on some page of guest memory instead, and nobody would have noticed
 until something corrupted.
 
+### Why Proxmox never saw this
+
+Same chassis, same BIOS, so the host BAR2 was `0x383fe0000000` there too and
+the service CPU wrote to the same truncated `0xe0041000`. It landed because
+**q35 happened to place the guest's BAR2 at `0xe0000000`** (the trace:
+`41824 data:0xe0000000`) and VFIO maps guest BARs into the IOMMU domain. The
+truncated address was, by accident, the guest's own BAR. Nobody chose that; it
+fell out of q35's 64-bit BAR placement with 2–4 GB of RAM. ESXi puts ECAM at
+`0xe0000000` instead, and that is the entire difference between the platforms.
+
+So there are exactly two ways to satisfy the firmware, and only one is open on
+ESXi:
+
+| Route | Why it works | On ESXi |
+|---|---|---|
+| Guest BAR2 at exactly `0xe0000000`, plus P2P mapping | truncated address == guest BAR | **shut** — ECAM lives there, and every lever that moves it is closed |
+| Host BAR2 below 4 GB | truncation becomes lossless | **open** — a BIOS setting, see below |
+
+(A third, hacky option: `setpci` the guest BAR2 to `0xe0000000` after `FW
+upload done` and before u-boot writes. A 1–6 s race, ESXi may refuse a BAR
+over its ECAM, and it is unknown which BAR the DDR upload uses. Ranked below
+the BIOS route, not above.)
+
 ### What was tried, and what is left
 
 | Lever | Result |
