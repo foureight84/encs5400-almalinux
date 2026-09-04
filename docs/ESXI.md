@@ -1,4 +1,4 @@
-# Running this on ESXi — experimental
+# Running this on ESXi
 
 > **This works, on a real ENCS 5412** (`ENCS5412/K9`, FGL232931K9) under
 > **ESXi 8.0 U3** (build 24677879). The switch boots, stays up, and is fully
@@ -19,15 +19,15 @@ exists so a failed attempt costs you a reboot, not your ESXi install.
 <details>
 <summary>About this branch, and why every step is written out by hand</summary>
 
-You are on `experimental/esxi`, which carries the tooling as well as the
-walkthrough: a VMDK build target and an `esxcli` installer/uninstaller for the
-host side. Getting here turned up eight bugs the offline tests could not — see
+This was developed on the `experimental/esxi` branch, now merged into `main`,
+which carries the tooling as well as the walkthrough: a VMDK build target and
+an `esxcli` installer/uninstaller for the host side. Getting here turned up eight bugs the offline tests could not — see
 [what real ESXi taught us](#what-real-esxi-taught-us). All eight are fixed, and
 the ones a mock can express are now caught by `scripts/66-test-esxi.py`.
 
-Everything below is also written as manual commands, because when an
-experimental script does something you did not expect, the useful thing to have
-is the list of what it was trying to do.
+Everything below is also written as manual commands, because when a script
+does something you did not expect, the useful thing to have is the list of what
+it was trying to do.
 
 </details>
 

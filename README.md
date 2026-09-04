@@ -32,7 +32,7 @@ any of this in the first place, that is [How it works](#how-it-works).
 [Requirements](#requirements) ·
 [Build the image](#build-the-image) ·
 [Deploy on Proxmox](#deploying-on-proxmox) ·
-[Deploy on ESXi](#deploying-on-esxi-experimental)
+[Deploy on ESXi](#deploying-on-esxi)
 
 **Using it**
 [Managing the switch](#managing-the-switch) ·
@@ -280,13 +280,16 @@ an interactive install if you want to choose the disk yourself, and rescue.
 
 ---
 
-## Deploying on ESXi (experimental)
+## Deploying on ESXi
 
-**[docs/ESXI.md](docs/ESXI.md) is the walkthrough.** It is marked experimental
-because none of it has been run on hardware — the Proxmox path above is
-verified on a real 5412, that one is reasoned from it. It is written down
-anyway, because the mechanism is hypervisor-agnostic: a passthrough VM pushing
-firmware into the ASIC over PCIe. Nothing in that is Proxmox-specific.
+**[docs/ESXI.md](docs/ESXI.md) is the walkthrough.** It is **tested on
+hardware**: a real ENCS 5412 (`ENCS5412/K9`, FGL232931K9) running ESXi 8.0 U3,
+verified 2026-09-02 and in daily use since. The switch boots, survives VM
+death and host reboots, comes back on its own after a power cut via the boot
+hook, and its VLAN tables read back correctly. The mechanism is the same as on
+Proxmox — a passthrough VM pushing firmware into the ASIC over PCIe — but
+getting it to work on ESXi turned up eight bugs the Proxmox path never hit,
+all fixed and written up in the guide.
 
 The short version of what changes:
 
@@ -308,8 +311,8 @@ The guide grades every step by how much it can be trusted, and ends with a
 exactly as it was — it never touches `vSwitch0` or `vmk0`. Read that before
 starting rather than after.
 
-**This is the `experimental/esxi` branch**, which carries the automation as
-well as the guide:
+The automation ships in the tree alongside the guide (it was developed on the
+`experimental/esxi` branch, now merged):
 
 ```sh
 ./build.sh --esxi <nfvis.iso>      # also writes out/esxi/{vmdk,vmx,README}
@@ -1029,7 +1032,7 @@ scripts/
   20-resolve-packages.py      minimal package closure (~330 pkgs, not @core)
   30-build-iso.sh             trim, regenerate repodata, remaster
   40-build-qcow2.sh           run the install under QEMU/KVM
-  45-build-vmdk.sh            qcow2 -> ESXi VMDK + .vmx (experimental)
+  45-build-vmdk.sh            qcow2 -> ESXi VMDK + .vmx
   50-verify-qcow2.py          boot the result and assert its state
   60-test-tui.py              offline tests for the TUI and the config files
   64-test-vnet.py             offline tests for encs-switch-vnet
@@ -1039,7 +1042,7 @@ kickstart/ks-encs.cfg         the kickstart, heavily commented
 payload/                      our code, installed into the image
   usr/local/sbin/encs-switch-status        (VM) bootstrap health check
   etc/systemd/system/marvell-switch-boot.service
-  opt/encs-esxi/                           (ESXi host bundle - experimental)
+  opt/encs-esxi/                           (ESXi host bundle)
     install.sh / uninstall.sh              passthrough + vSwitch, and its undo
     encs-esxi-vnet                         portgroup per VLAN (the host half)
   opt/encs-host/                           (host bundle, copied to Proxmox)
@@ -1051,7 +1054,7 @@ payload/                      our code, installed into the image
 docs/
   FINDINGS.md                 the full reverse-engineering writeup
   CONFIG.md                   the /etc/encs-switch/*.xml files, field by field
-  ESXI.md                     running it on ESXi instead (experimental)
+  ESXI.md                     running it on ESXi instead
 ```
 
 `docs/FINDINGS.md` is worth reading if you want the why: how the bootstrap was
