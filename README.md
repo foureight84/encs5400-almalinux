@@ -132,7 +132,7 @@ On Proxmox 8 (kernel 6.8) it is usually on already.
 
 ```sh
 qm create 900 --name encs-switch --machine q35 --bios ovmf \
-    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \
+    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \   # 512 if you want margin, see How it works
     --serial0 socket --vga serial0
 qm importdisk 900 AlmaLinux-8.9-ENCS5400-switch.qcow2 local-lvm
 qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
@@ -226,7 +226,7 @@ use `AlmaLinux-8.9-ENCS5400-switch.iso`.
 
 ```sh
 qm create 900 --name encs-switch --machine q35 --bios ovmf \
-    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \
+    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \   # 512 if you want margin, see How it works
     --serial0 socket --vga serial0
 qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:16
 qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
@@ -988,10 +988,23 @@ Three separate paths, which is the key to understanding everything else:
 | **Management** | Proxmox host | HTTPS XML API on `169.254.1.0` over VLAN 2363 |
 
 The VM is *infrastructure*, not a data-plane element — 2 vCPU / **384 MB** is
-enough, and sizing is independent of switch throughput. It idles at 150 MB;
-the floor is set by the firmware: under OVMF (Proxmox, and the build's own
-verify boot) the kernel's EFI stub cannot find room below 320 MB, so 384 is
-the floor plus one step. ESXi's firmware manages 256 — see `docs/ESXI.md`.
+what the `qm create` above uses, and sizing is independent of switch
+throughput. **Verified on Proxmox 9.2 (2026-09-04):** at 384 MB the VM
+reaches a login prompt in 16 s, the ASIC is `ROS ready` about 60 s later,
+the guest has ~240 MB in use once the switch is up, and it comes back on its
+own after a host reboot. The floor is set by the firmware, not the workload:
+under OVMF (Proxmox, and the build's own verify boot) the kernel's EFI stub
+cannot find room below 320 MB, so 384 is the floor plus one step. ESXi's
+firmware manages 256 — see `docs/ESXI.md`.
+
+**If you would rather not sit one step above the floor, use 512 MB.** On the
+first-ever start of the VM on that host, one boot at 384 stalled before
+userspace — kernel and initramfs read from disk, then nothing — and a
+stop/start fixed it; it has not recurred across several boots since, and the
+cause was not captured. The EFI stub's placement depends on the firmware's
+memory map, so a margin of one 64 MB step is thinner than it looks. 512 MB
+costs 128 MB more pinned RAM and buys that margin: `qm set 900 --memory 512`.
+
 Do not hand it 2 GB out of habit: with passthrough the whole allocation is
 pinned, and that is 2 GB the host never gets back. Management deliberately
 lives on the host, because the backplane NIC does.
