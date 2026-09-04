@@ -75,7 +75,10 @@ def main():
         # -cpu host is KVM-only; TCG rejects it outright, so fall back to 'max'.
         cpumodel = "host" if accel == "kvm" else "max"
         cmd = ["qemu-system-x86_64", "-machine", f"q35,accel={accel}",
-               "-cpu", cpumodel, "-smp", "4", "-m", "2048",
+               # 256 MB, the size the image ships at: this boot is the
+               # regression test for the memory floor as much as for the
+               # image. VERIFY_MEM=2048 if you only want to know it boots.
+               "-cpu", cpumodel, "-smp", "4", "-m", os.environ.get("VERIFY_MEM", "256"),
                "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf('OVMF_CODE')}",
                "-drive", f"if=pflash,format=raw,file={varsf}",
                "-drive", f"file={copy},format=qcow2,if=virtio",
