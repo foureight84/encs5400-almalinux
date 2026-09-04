@@ -945,7 +945,7 @@ leaves you with firmware defaults and every front port shut.
 
 ### After a BIOS or CIMC update: the Marvell moves on the PCI bus
 
-Seen on the chassis on 2026-09-04, after updating CIMC to 3.2(14.27): the
+Seen on the chassis on 2026-09-04, after updating CIMC to 3.2(14.27) and BIOS to 4.03: the
 Marvell went from `0000:0d:00.0` to `0000:0e:00.0`. Nothing else changed,
 but ESXi enables DirectPath I/O **per PCI address**, so the new address was
 not enabled and the boot hook stopped at

@@ -926,7 +926,7 @@ and newer NFVIS images reportedly lock the BIOS so F2 setup becomes
 unreachable — which would make PCI passthrough impossible to configure.
 
 **A BIOS or CIMC update can move the switch on the PCI bus.** Seen on the
-chassis on 2026-09-04: after updating CIMC to 3.2(14.27) the Marvell went from
+chassis on 2026-09-04: after updating CIMC to 3.2(14.27) and BIOS to 4.03 the Marvell went from
 `0000:0d:00.0` to `0000:0e:00.0`. The bootstrap VM's `hostpci0` line names the
 old address, so `qm start 900` fails with *no PCI device found* — or, worse, if
 another device now sits at the old address the VM gets that one instead. The

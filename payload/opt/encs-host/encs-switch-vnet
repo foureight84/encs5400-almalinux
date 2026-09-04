@@ -683,7 +683,7 @@ def hostpci_plan():
 
     hostpciN names a PCI address, and the address is not a property of the
     device: a BIOS or CIMC update can renumber the bus (2026-09-04: 0d:00.0
-    became 0e:00.0 on ESXi after the 3.2(14.27) update). Then qm start fails
+    became 0e:00.0 after the CIMC 3.2(14.27) + BIOS 4.03 update). Then qm start fails
     with "no PCI device", or worse, the old address now belongs to some other
     device and the VM gets that instead. bootstrap_vmid() matches the live
     address and so finds nothing. The bootstrap VM is then recognised by the
