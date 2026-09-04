@@ -109,7 +109,7 @@ Next steps
      scp $OUT_DIR/$(basename "$BUILT_QCOW") root@<proxmox>:/root/
 
      qm create 900 --name encs-switch --machine q35 --bios ovmf \\
-         --memory 2048 --cores 2 --net0 virtio,bridge=vmbr0 \\
+         --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \\
          --serial0 socket --vga serial0
      qm importdisk 900 $(basename "$BUILT_QCOW") local-lvm
      qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
