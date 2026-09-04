@@ -198,6 +198,14 @@ while read -r k a b; do
     [ "$OK" -eq 1 ] || echo "$k $a $b" >> "$LEFT"
 done < "$WORK"
 
+# The boot hook, if encs-esxi-bootstrap install-hook was run. Harmless when
+# absent; it must go before the record is torn down, or the next boot tries
+# to bootstrap through a vSwitch that no longer exists.
+if [ -f "$(dirname "$0")/encs-esxi-bootstrap" ]; then
+    say "Boot hook"
+    sh "$(dirname "$0")/encs-esxi-bootstrap" remove-hook 2>/dev/null | sed 's/^/    /' || true
+fi
+
 say "Persisting configuration"
 if /sbin/auto-backup.sh >/dev/null 2>&1; then
     info "auto-backup.sh done"

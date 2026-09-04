@@ -72,6 +72,14 @@ FAKE_HOST = {
             ["0000:0e:00.0", "0x8086", "0x1533"]],
     "passthru": {"0000:0d:00.0": False},
     "clients": {},
+    # For encs-esxi-bootstrap: the ASIC is "up" when the i40en links are Up.
+    # power.on of a VMX carrying pciPassthru0 with the ASIC down bootstraps it
+    # (asic -> True, VM dies: the IOMMU fault); with the ASIC already up it
+    # is the wedge the script must never cause.
+    "asic": False,
+    "wedged": False,
+    "vms": {"2": {"name": "encs-switch", "state": "off", "vmx": ""},
+            "3": {"name": "web01", "state": "off", "vmx": ""}},
 }
 
 FAKE_ESXCLI = r'''#!/usr/bin/env python3
@@ -119,6 +127,7 @@ ALLOWED = {
     "hardware pci list": set(),
     "hardware pci pcipassthru list": set(),
     "hardware pci pcipassthru set": {"device-id", "enable", "apply-now"},
+    "system uuid get": set(),
 }
 if cmd in ALLOWED:
     for k in opts:
@@ -188,8 +197,11 @@ elif cmd == "network nic list":
     print("Name    PCI Device    Driver  Admin Status  Link Status  Speed  Duplex  MAC Address        MTU   Description")
     print("------  ------------  ------  ------------  -----------  -----  ------  -----------------  ----  -----------")
     for n, pci, drv in db["nics"]:
+        link = "Up" if (drv != "i40en" or db.get("asic")) else "Down"
         print("%-8s%-14s%-8s%-14s%-13s%-7s%-8s%-19s%-6s%s"
-              % (n, pci, drv, "Up", "Up", 10000, "Full", "00:11:22:33:44:55", 9000, "NIC"))
+              % (n, pci, drv, "Up", link, 10000 if link == "Up" else 0, "Full", "00:11:22:33:44:55", 9000, "NIC"))
+elif cmd == "system uuid get":
+    print("6a98270c-b75f-a36d-06fd-00a0c9000000")
 elif cmd == "hardware pci list":
     for addr, vid, did in db["pci"]:
         print(addr)
@@ -223,6 +235,56 @@ else:
     fail("unknown command: " + cmd)
 '''
 
+FAKE_VIMCMD = r'''#!/usr/bin/env python3
+"""Fake vim-cmd: only the vmsvc calls encs-esxi-bootstrap makes. Output
+shapes as on ESXi 8.0 U3."""
+import json, os, sys
+DB = os.environ["MOCKDB"]
+db = json.load(open(DB))
+def save(): json.dump(db, open(DB, "w"), indent=1)
+def log(m):
+    with open(os.environ["MOCKLOG"], "a") as f: f.write("vim-cmd " + m + "\n")
+a = sys.argv[1:]
+if not a: sys.exit(2)
+log(" ".join(a))
+if a[0] == "vmsvc/getallvms":
+    print("Vmid       Name                         File                        Guest OS       Version   Annotation")
+    for i, v in db["vms"].items():
+        vmx = v["vmx"] or ("[datastore1] %s/%s.vmx" % (v["name"], v["name"]))
+        if v["vmx"]:
+            # tests point vmx at a real temp file; present it as a datastore path
+            vmx = "[%s] %s" % ("TESTDS", os.path.basename(v["vmx"]))
+        print("%-6s %-14s %-30s centos8_64Guest   vmx-19" % (i, v["name"], vmx))
+    sys.exit(0)
+vid = a[1] if len(a) > 1 else ""
+if vid not in db["vms"]:
+    print("Unable to find a VM corresponding to \"%s\"" % vid, file=sys.stderr); sys.exit(1)
+vm = db["vms"][vid]
+def has_pt():
+    p = vm["vmx"]
+    return bool(p) and os.path.exists(p) and 'pciPassthru0.present = "TRUE"' in open(p).read()
+if a[0] == "vmsvc/power.getstate":
+    print("Retrieved runtime info"); print("Powered " + vm["state"])
+elif a[0] == "vmsvc/power.on":
+    print("Powering on VM:")
+    if has_pt():
+        if db["asic"]:
+            db["wedged"] = True; vm["state"] = "on"      # the thing that must never happen
+        elif db.get("asic_never"):
+            vm["state"] = "off"                           # loader failed; ASIC stays down
+        else:
+            db["asic"] = True; vm["state"] = "off"        # bootstrapped, then IOMMU fault
+    else:
+        vm["state"] = "on"
+    save()
+elif a[0] in ("vmsvc/power.off", "vmsvc/power.shutdown", "vmsvc/power.reset"):
+    vm["state"] = "off" if a[0] != "vmsvc/power.reset" else "on"; save()
+elif a[0] == "vmsvc/reload":
+    pass
+else:
+    print("Invalid command '%s'." % a[0], file=sys.stderr); sys.exit(1)
+'''
+
 FAKE_UNAME = "#!/bin/sh\nexec /usr/bin/printf '%s\\n' " \
              "'VMkernel esxi 7.0.3 #1 SMP Release build-19193900 x86_64 ESXi'\n"
 
@@ -250,7 +312,7 @@ class Host:
         self.state = os.path.join(self.dir, "created")
         bindir = os.path.join(self.dir, "bin")
         os.makedirs(bindir)
-        for name, body in (("esxcli", FAKE_ESXCLI), ("uname", FAKE_UNAME)):
+        for name, body in (("esxcli", FAKE_ESXCLI), ("uname", FAKE_UNAME), ("vim-cmd", FAKE_VIMCMD)):
             p = os.path.join(bindir, name)
             with open(p, "w") as f:
                 f.write(body)
@@ -317,6 +379,38 @@ class Host:
 
     def cleanup(self):
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def stage_vm(h, passthru=False, asic=False, state="off"):
+    """A VMX file for the fake VM 2, and the ASIC/VM state around it.
+
+    The tests point the datastore path resolution at h.dir by making
+    /vmfs/volumes/TESTDS a symlink; the fake vim-cmd prints "[TESTDS] file".
+    """
+    os.makedirs(os.path.join(h.dir, "TESTDS"), exist_ok=True)
+    vmx = os.path.join(h.dir, "TESTDS", "encs-switch.vmx")
+    body = 'displayName = "encs-switch"\nmemSize = "384"\nsched.mem.pin = "TRUE"\n'
+    if passthru:
+        body += 'pciPassthru0.present = "TRUE"\npciPassthru0.id = "00000:013:00.0"\n'
+    with open(vmx, "w") as f:
+        f.write(body)
+    d = h.now()
+    d["vms"]["2"]["vmx"] = vmx
+    d["vms"]["2"]["state"] = state
+    d["asic"] = asic
+    d["passthru"]["0000:0d:00.0"] = True
+    with open(h.db, "w") as f:
+        json.dump(d, f)
+    return vmx
+
+
+def run_bootstrap(h, *args, **env):
+    # The script resolves "[TESTDS] x.vmx" to /vmfs/volumes/TESTDS/x.vmx.
+    # Redirect that through an env override rather than touching /vmfs.
+    env.setdefault("VMFS", h.dir)
+    env.setdefault("LOG", os.path.join(h.dir, "bootstrap.log"))
+    env.setdefault("LOCAL_SH", os.path.join(h.dir, "local.sh"))
+    return h.run("encs-esxi-bootstrap", *args, **env)
 
 
 def untouched(h, what):
@@ -607,6 +701,94 @@ def code(path):
     return out
 
 
+# ================================================================== bootstrap
+def test_bootstrap_happy_path(h):
+    print("\n== bootstrap: ASIC down -> attach, power on, links up, detach, power on")
+    h.reset(); vmx = stage_vm(h)
+    r = run_bootstrap(h, "run", START_AFTER="web01 nosuchvm")
+    check(r.returncode == 0, f"exits 0: {r.stdout[-300:]} {r.stderr[-300:]}")
+    d = h.now()
+    check(d["asic"] is True, "the ASIC was bootstrapped")
+    check(d["wedged"] is False, "never powered on with the device against a live ASIC")
+    check('pciPassthru0' not in open(vmx).read(), "the device is removed from the VMX afterwards")
+    check(d["vms"]["2"]["state"] == "on", "the VM is left running in the management role")
+    check(d["vms"]["3"]["state"] == "on", "START_AFTER VM was powered on")
+    check("no VM named nosuchvm" in r.stdout, "unknown START_AFTER names are reported, not fatal")
+    ons = [c for c in h.commands() if c.startswith("vim-cmd vmsvc/power.on 2")]
+    check(len(ons) == 2, f"VM 2 powered on exactly twice (bootstrap, then management): {len(ons)}")
+    # the first power-on had the device, the second did not
+    check("pciPassthru0.id = \"00000:013:00.0\"" in r.stdout or "00000:013:00.0" in r.stdout,
+          "the decimal VMX id was used")
+
+
+def test_bootstrap_refuses_when_up(h):
+    print("\n== bootstrap: ASIC already up -> never attaches the device")
+    h.reset(); vmx = stage_vm(h, asic=True)
+    r = run_bootstrap(h, "run")
+    check(r.returncode == 0, "exits 0")
+    check("already up" in r.stdout, "says why it did nothing")
+    check(h.now()["wedged"] is False, "no wedge")
+    check('pciPassthru0' not in open(vmx).read(), "VMX untouched")
+    check(h.now()["vms"]["2"]["state"] == "on", "management VM is brought up anyway")
+
+
+def test_bootstrap_leftover_device_when_up(h):
+    print("\n== bootstrap: ASIC up but the VMX still carries the device -> strip it first")
+    h.reset(); vmx = stage_vm(h, passthru=True, asic=True)
+    r = run_bootstrap(h, "run")
+    check(r.returncode == 0, "exits 0")
+    check(h.now()["wedged"] is False, "device stripped BEFORE power on - no wedge")
+    check('pciPassthru0' not in open(vmx).read(), "device removed")
+
+
+def test_bootstrap_timeout(h):
+    print("\n== bootstrap: ASIC never comes up -> device removed, exit 1")
+    h.reset(); vmx = stage_vm(h)
+    d = h.now(); d["asic_never"] = True
+    with open(h.db, "w") as f: json.dump(d, f)
+    r = run_bootstrap(h, "run", WAIT="5")
+    check(r.returncode == 1, "exits 1")
+    check("did not come up" in r.stdout, "says the ASIC never came up")
+    check('pciPassthru0' not in open(vmx).read(), "device removed so the next manual power-on is safe")
+    check(h.now()["vms"]["2"]["state"] == "off", "VM left off, not silently restarted as management")
+
+
+def test_bootstrap_needs_passthru(h):
+    print("\n== bootstrap: passthrough not enabled -> refuses before touching the VMX")
+    h.reset(); vmx = stage_vm(h)
+    d = h.now(); d["passthru"]["0000:0d:00.0"] = False
+    with open(h.db, "w") as f: json.dump(d, f)
+    r = run_bootstrap(h, "run")
+    check(r.returncode == 1 and "not enabled for passthrough" in r.stdout, "names the cause")
+    check('pciPassthru0' not in open(vmx).read(), "VMX untouched")
+
+
+def test_bootstrap_status(h):
+    print("\n== bootstrap: status")
+    h.reset(); stage_vm(h, passthru=True)
+    r = run_bootstrap(h, "status")
+    check(r.returncode == 0 and "asic=down" in r.stdout and "role=bootstrap" in r.stdout,
+          f"status line: {r.stdout.strip()}")
+
+
+def test_bootstrap_hook(h):
+    print("\n== bootstrap: install-hook is idempotent and remove-hook is clean")
+    h.reset()
+    local = os.path.join(h.dir, "local.sh")
+    orig = "#!/bin/sh\n\n# local configuration options\n\n# Note: modify at your own risk!\n\nexit 0\n"
+    with open(local, "w") as f: f.write(orig)
+    r1 = run_bootstrap(h, "install-hook", START_AFTER="web01")
+    r2 = run_bootstrap(h, "install-hook")
+    txt = open(local).read()
+    check(r1.returncode == 0 and r2.returncode == 0, "both installs exit 0")
+    check(txt.count("encs-esxi-bootstrap run") == 1, "exactly one hook after two installs")
+    check('START_AFTER="web01"' in txt, "START_AFTER is baked into the hook")
+    check(txt.rstrip().endswith("exit 0"), "exit 0 is still last")
+    check("nohup" not in txt, "no nohup (ESXi has none)")
+    r3 = run_bootstrap(h, "remove-hook")
+    check(r3.returncode == 0 and open(local).read() == orig, "remove-hook restores the file byte for byte")
+
+
 def test_posix_sh():
     print("\n== the scripts are POSIX sh (the ESXi shell is busybox ash)")
     # [[ ]] tests, here-strings, `declare` and `function f {}` are bash;
@@ -629,7 +811,7 @@ def test_posix_sh():
         # a load-bearing use fails the run outright; this catches the rest.
         (r"(^|[|(;&`]|\$\()\s*tr\s", "tr (not on ESXi)"),
     )
-    for f in ("install.sh", "uninstall.sh", "encs-esxi-vnet"):
+    for f in ("install.sh", "uninstall.sh", "encs-esxi-vnet", "encs-esxi-bootstrap"):
         p = os.path.join(BUNDLE, f)
         r = subprocess.run(["sh", "-n", p], capture_output=True, text=True)
         check(r.returncode == 0, f"{f} parses under sh -n")
@@ -650,7 +832,11 @@ def main():
                    test_uninstall_refuses_busy, test_uninstall_round_trip,
                    test_uninstall_keeps_the_record_on_failure,
                    test_uninstall_force,
-                   test_uninstall_does_not_delete_dev_null):
+                   test_uninstall_does_not_delete_dev_null,
+                   test_bootstrap_happy_path, test_bootstrap_refuses_when_up,
+                   test_bootstrap_leftover_device_when_up, test_bootstrap_timeout,
+                   test_bootstrap_needs_passthru,
+                   test_bootstrap_status, test_bootstrap_hook):
             fn(h)
         test_not_esxi()
         test_posix_sh()

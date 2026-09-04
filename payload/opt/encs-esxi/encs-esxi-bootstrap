@@ -1,0 +1,254 @@
+#!/bin/sh
+# encs-esxi-bootstrap - bring the ENCS switch ASIC up from an ESXi host,
+# unattended, and leave the VM in the management role afterwards.
+#
+#   sh /vmfs/volumes/datastore1/encs-esxi/encs-esxi-bootstrap              # run
+#   sh /vmfs/volumes/datastore1/encs-esxi/encs-esxi-bootstrap install-hook # at every host boot
+#
+# On ESXi the switch VM has two configurations, not two lives: with the Marvell
+# passed through it bootstraps the ASIC and is then killed by an IOMMU fault
+# (see docs/ESXI.md, "The IOMMU fault" - expected, unfixable, harmless); with
+# the device removed it runs the tools. Doing that by hand after every host
+# power-on is the "ritual" this script replaces:
+#
+#   1. refuse to touch anything if the ASIC is already up - a loader run
+#      against a live ASIC wedges it until AC is pulled
+#   2. add the Marvell to the VMX, power on, wait for the X710 backplane links
+#      to come up (the ASIC is running) and the VM to die
+#   3. take the Marvell back out, power on again - now it is the management VM
+#   4. power on anything listed in START_AFTER
+#
+# POSIX sh for busybox ash: no bash, no `command`, no `tr`, no `nohup`.
+set -u
+
+CMD="${1:-run}"
+VM="${VM:-encs-switch}"
+HERE=$(cd "$(dirname "$0")" && pwd)
+LOG="${LOG:-$HERE/bootstrap.log}"
+WAIT="${WAIT:-240}"           # seconds to wait for the ASIC before giving up
+START_AFTER="${START_AFTER:-}" # VM names to power on once the switch is up
+FORCE="${FORCE:-0}"           # 1: bootstrap even if the links look up (AC was pulled)
+LOCAL_SH="${LOCAL_SH:-/etc/rc.local.d/local.sh}"
+VMFS="${VMFS:-/vmfs/volumes}"  # tests point this at a temp dir
+MARK="# encs-esxi-bootstrap"
+
+log()  { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" | tee -a "$LOG"; }
+die()  { log "ERROR: $*"; exit 1; }
+
+usage() {
+    cat <<EOF
+usage: sh $0 [run|status|install-hook|remove-hook]
+
+  run            (default) bootstrap the ASIC, then leave "$VM" running in the
+                 management role (no PCI device). Safe to run when the switch is
+                 already up: it then only makes sure the management VM is on.
+  status         one line: ASIC state, VM power state, which role the VMX holds
+  install-hook   run "run" at every ESXi boot, from $LOCAL_SH
+  remove-hook    take that back out
+
+environment:
+  VM=$VM   START_AFTER="name name"   WAIT=$WAIT   FORCE=0|1   LOG=$LOG
+EOF
+    exit 2
+}
+
+# ------------------------------------------------------------ the pieces
+asic_up() {
+    # Both X710 backplane functions link up only when the ASIC is running.
+    # This is the one host-native signal; the host has no leg on VLAN 2363.
+    esxcli network nic list 2>/dev/null \
+        | awk '$3 == "i40en" && $5 == "Up" { n++ } END { exit !(n > 0) }'
+}
+
+vmid() {
+    vim-cmd vmsvc/getallvms 2>/dev/null | awk -v n="$VM" '$2 == n { print $1; exit }'
+}
+
+vmx_path() {
+    # "[datastore1] encs-switch/encs-switch.vmx" -> /vmfs/volumes/datastore1/encs-switch/encs-switch.vmx
+    vim-cmd vmsvc/getallvms 2>/dev/null | awk -v n="$VM" -v root="$VMFS" '
+        $2 == n { ds=$3; sub(/^\[/, "", ds); sub(/\]$/, "", ds);
+                  print root "/" ds "/" $4; exit }'
+}
+
+vm_state() {
+    # "Retrieved runtime info" then "Powered on|off|suspended"
+    vim-cmd vmsvc/power.getstate "$1" 2>/dev/null | tail -1 | sed 's/Powered //'
+}
+
+has_passthru() { grep -q '^pciPassthru0.present *= *"TRUE"' "$1"; }
+
+wait_hostd() {
+    # local.sh runs before hostd answers; power ops fail with "Failed to
+    # login" for the first minute or so.
+    i=0
+    while ! vim-cmd vmsvc/getallvms >/dev/null 2>&1; do
+        i=$((i + 5)); [ $i -le 300 ] || die "hostd not answering after 300s"
+        sleep 5
+    done
+}
+
+marvell() {
+    # Same detection as install.sh; the BDF moves between reinstalls.
+    esxcli hardware pci list 2>/dev/null | awk '
+        /^[0-9a-f][0-9a-f]*:[0-9a-f][0-9a-f]*:/ { addr=$1; vid=""; did="" }
+        /^[ \t]*Vendor ID:/ { vid=$3 }
+        /^[ \t]*Device ID:/ { did=$3 }
+        vid == "0x11ab" && did == "0xbe00" && addr != "" { print addr; addr="" }
+    ' | head -1
+}
+
+# VMX spelling of a BDF: "%05d:%03d:%02d.%d", all decimal (0000:0d:00.0 ->
+# 00000:013:00.0). $((0x..)) not awk strtonum(), which busybox awk lacks.
+pt_id() {
+    _r=${1#*:}; _seg=${1%%:*}; _bus=${_r%%:*}
+    _r=${_r#*:};  _slot=${_r%%.*}; _fn=${_r#*.}
+    printf '%05d:%03d:%02d.%d' $((0x$_seg)) $((0x$_bus)) $((0x$_slot)) $((0x$_fn))
+}
+
+strip_passthru() {
+    # Not sed -i: BSD sed (where the tests run) reads the pattern as a backup
+    # suffix, and a rewrite-through-temp is the same on every sed anyway.
+    grep -v '^pciPassthru' "$1" > "$1.encs.$$"; mv "$1.encs.$$" "$1"
+}
+
+add_passthru() {
+    strip_passthru "$1"
+    cat >> "$1" <<EOF
+pciPassthru0.present = "TRUE"
+pciPassthru0.id = "$(pt_id "$2")"
+pciPassthru0.deviceId = "0xbe00"
+pciPassthru0.vendorId = "0x11ab"
+pciPassthru0.systemId = "$(esxcli system uuid get 2>/dev/null)"
+pciPassthru.use64bitMMIO = "TRUE"
+pciPassthru.64bitMMIOSizeGB = "8"
+EOF
+}
+
+power_on()  { vim-cmd vmsvc/power.on "$1" >/dev/null 2>&1; }
+power_off() { vim-cmd vmsvc/power.off "$1" >/dev/null 2>&1; }
+reload()    { vim-cmd vmsvc/reload "$1" >/dev/null 2>&1; }
+
+to_management() {
+    # Strip the device and make sure the VM is running without it.
+    if has_passthru "$VMX"; then
+        strip_passthru "$VMX"; reload "$ID"
+        log "removed the Marvell from $VM (management role)"
+    fi
+    case "$(vm_state "$ID")" in
+        on) ;;
+        *)  power_on "$ID" && log "powered on $VM (management role)" ;;
+    esac
+}
+
+start_after() {
+    for n in $START_AFTER; do
+        i=$(vim-cmd vmsvc/getallvms 2>/dev/null | awk -v n="$n" '$2 == n { print $1; exit }')
+        if [ -z "$i" ]; then log "START_AFTER: no VM named $n, skipped"; continue; fi
+        case "$(vm_state "$i")" in
+            on) log "START_AFTER: $n already on" ;;
+            *)  power_on "$i" && log "START_AFTER: powered on $n" ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------- commands
+do_status() {
+    wait_hostd
+    ID=$(vmid); [ -n "$ID" ] || die "no VM named $VM"
+    VMX=$(vmx_path)
+    role=management; has_passthru "$VMX" && role=bootstrap
+    if asic_up; then a=up; else a=down; fi
+    printf 'asic=%s vm=%s state=%s role=%s vmx=%s\n' "$a" "$VM" "$(vm_state "$ID")" "$role" "$VMX"
+}
+
+do_run() {
+    wait_hostd
+    ID=$(vmid);     [ -n "$ID" ]  || die "no VM named $VM (vim-cmd vmsvc/getallvms)"
+    VMX=$(vmx_path); [ -f "$VMX" ] || die "cannot find the VMX for $VM at $VMX"
+    log "== $VM (vmid $ID) $VMX"
+
+    if asic_up && [ "$FORCE" != 1 ]; then
+        log "ASIC already up (X710 links Up) - not bootstrapping. FORCE=1 overrides."
+        to_management; start_after; exit 0
+    fi
+
+    DEV=$(marvell); [ -n "$DEV" ] || die "no 11ab:be00 device on this host"
+    esxcli hardware pci pcipassthru list 2>/dev/null \
+        | awk -v d="$DEV" '$1 == d && $2 == "true" { f=1 } END { exit !f }' \
+        || die "$DEV is not enabled for passthrough - run install.sh --yes first"
+
+    case "$(vm_state "$ID")" in
+        on) log "$VM is running; powering it off to change roles"; power_off "$ID"; sleep 3 ;;
+    esac
+
+    add_passthru "$VMX" "$DEV"; reload "$ID"
+    log "bootstrap role: $DEV attached as pciPassthru0.id=$(pt_id "$DEV")"
+    power_on "$ID" || { strip_passthru "$VMX"; reload "$ID"; die "power on failed - is memory reserved (sched.mem.pin)? see vmware.log"; }
+    log "powered on; waiting up to ${WAIT}s for the backplane links (the VM dying meanwhile is expected)"
+
+    t=0; up=0
+    while [ $t -lt "$WAIT" ]; do
+        sleep 5; t=$((t + 5))
+        if asic_up; then up=1; break; fi
+    done
+
+    if [ $up != 1 ]; then
+        power_off "$ID"; strip_passthru "$VMX"; reload "$ID"
+        die "ASIC did not come up in ${WAIT}s. Device removed from the VM again so a manual power-on is safe. If AC was not pulled since the last wedge, pull it."
+    fi
+    log "ASIC up after ${t}s"
+
+    # The VM is normally dead by now (IOMMU fault). If it is not - a hypervisor
+    # that did not kill it - stop it cleanly before taking the device away.
+    case "$(vm_state "$ID")" in
+        on) log "VM still running with the device attached; shutting it down"
+            vim-cmd vmsvc/power.shutdown "$ID" >/dev/null 2>&1
+            i=0; while [ "$(vm_state "$ID")" = on ] && [ $i -lt 60 ]; do sleep 5; i=$((i + 5)); done
+            [ "$(vm_state "$ID")" = on ] && power_off "$ID" ;;
+    esac
+
+    to_management; start_after
+    log "done: switch up, $VM in management role"
+}
+
+do_install_hook() {
+    [ -f "$LOCAL_SH" ] || die "$LOCAL_SH not found - is this ESXi?"
+    grep -q "^$MARK" "$LOCAL_SH" && { log "hook already present in $LOCAL_SH"; exit 0; }
+    # local.sh ends with "exit 0"; the block goes above it. No nohup on ESXi;
+    # a backgrounded subshell is enough, local.sh is not waited on.
+    tmp="$LOCAL_SH.encs.$$"
+    awk -v here="$HERE" -v vm="$VM" -v sa="$START_AFTER" -v mark="$MARK" '
+        /^exit 0[ \t]*$/ && !done {
+            print mark " - bring the ENCS switch up after every host boot (remove-hook to undo)"
+            print "(VM=\"" vm "\" START_AFTER=\"" sa "\" sh " here "/encs-esxi-bootstrap run >/dev/null 2>&1 &)"
+            print mark " end"
+            done=1
+        }
+        { print }' "$LOCAL_SH" > "$tmp" && mv "$tmp" "$LOCAL_SH" && chmod 0755 "$LOCAL_SH"
+    grep -q "^$MARK" "$LOCAL_SH" || die "could not add the hook (no 'exit 0' line in $LOCAL_SH?)"
+    # /etc is a RAM disk; local.sh has a .#local.sh marker so this persists it.
+    [ -x /sbin/auto-backup.sh ] && /sbin/auto-backup.sh >/dev/null 2>&1
+    log "hook installed in $LOCAL_SH: runs at every host boot"
+}
+
+do_remove_hook() {
+    [ -f "$LOCAL_SH" ] || exit 0
+    grep -q "^$MARK" "$LOCAL_SH" || { log "no hook in $LOCAL_SH"; exit 0; }
+    tmp="$LOCAL_SH.encs.$$"
+    awk -v mark="$MARK" '
+        index($0, mark) == 1 && $0 !~ / end$/ { skip=1; next }
+        index($0, mark) == 1 && / end$/       { skip=0; next }
+        !skip { print }' "$LOCAL_SH" > "$tmp" && mv "$tmp" "$LOCAL_SH" && chmod 0755 "$LOCAL_SH"
+    [ -x /sbin/auto-backup.sh ] && /sbin/auto-backup.sh >/dev/null 2>&1
+    log "hook removed from $LOCAL_SH"
+}
+
+case "$CMD" in
+    run)          do_run ;;
+    status)       do_status ;;
+    install-hook) do_install_hook ;;
+    remove-hook)  do_remove_hook ;;
+    -h|--help|help) usage ;;
+    *) printf 'unknown command: %s\n' "$CMD" >&2; usage ;;
+esac

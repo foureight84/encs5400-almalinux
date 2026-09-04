@@ -7,7 +7,7 @@ Copy it to the ESXi host and run it there.
     scp -r /opt/encs-esxi root@<esxi>:/vmfs/volumes/datastore1/
     ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'
 
-These three scripts HAVE been run on a real ENCS 5412 under ESXi 8.0 U3,
+These scripts HAVE been run on a real ENCS 5412 under ESXi 8.0 U3,
 including a full uninstall/reinstall round trip, and the switch they set the
 stage for boots and works. Two things to know before you start, both in
 docs/ESXI.md: the bootstrap VM is killed by an IOMMU fault part-way through
@@ -56,6 +56,12 @@ uninstall.sh        removes exactly what is in that record, in an order that
 encs-esxi-vnet      the host half of the NFVIS lan-net model: one portgroup
                     per VLAN. Prints the matching encs-switch-vnet command to
                     run in the VM, because neither half works alone.
+encs-esxi-bootstrap the two-role dance, unattended: attach the Marvell, power
+                    on, wait for the X710 links, detach, power on again as the
+                    management VM. "install-hook" runs it from
+                    /etc/rc.local.d/local.sh at every host boot, so a power
+                    cut no longer needs a person. Refuses to run against a
+                    switch that is already up (that is the wedge).
 
 WHAT IT NEVER TOUCHES
 ---------------------

@@ -355,9 +355,19 @@ cat <<EOF
        A hex BDF there is refused with "AH No device hints found", which names
        neither the key nor the format. "govc device.pci.add" gets it right too.
 
-    3. In the VM: give vNIC 2 169.254.1.1/16, then
+    3. Bootstrap, unattended, and keep doing so at every host boot:
+         sh $(dirname "$0")/encs-esxi-bootstrap               # now
+         sh $(dirname "$0")/encs-esxi-bootstrap install-hook  # at every boot
+       It attaches the device, powers the VM on, waits for the X710 links
+       (= the ASIC is up; the VM dying meanwhile is the expected IOMMU
+       fault), removes the device and powers the VM on again as the
+       management VM. It refuses to run against a switch that is already up.
+       START_AFTER="name name" powers on guests that depend on the switch.
+
+    4. In the VM: give vNIC 2 169.254.1.1/16 (persistently - nmcli, not
+       ip addr add), then
          ping 169.254.1.0
-         /opt/encs-host/encs-switch-tui
+         encs-switch-tui
 
     Revert everything: sh $(dirname "$0")/uninstall.sh
 EOF
