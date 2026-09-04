@@ -1222,11 +1222,18 @@ the BIOS route, not above.)
 | `pciPassthru.allowP2P = "TRUE"`, Above 4G on | **no effect** — accepted into the DICT, same fault at `0xe0041000` |
 | **BIOS: Above 4G Decoding off** | BAR2 moved from `0x383fe0000000` to `0xe0000000`. Same low 32 bits, so the target address did not change. Harmless, and pointless for this. |
 | `useActualBases` + `allowP2P`, Above 4G off | **crashes the VMX process.** `Failed to map MMIO: Failure` then `PANIC: VERIFY bora/devices/pcipassthru/pciPassthru.c:871`, core dumped. The "actual base" is `0xe0000000`, ESXi cannot place a passthrough BAR over its own ECAM, and it asserts rather than failing cleanly. The ASIC stayed in WFI through it. |
-| `allowP2P` alone, Above 4G off | **same fault**, `0xe0041000`, VM killed at ~35 s, switch up at ~70 s as always |
+| `allowP2P` alone, Above 4G off | **same fault**, `0xe0041000`, VM killed at ~35 s, switch up at ~70 s as always. After an ESXi restart, not an AC pull — see below. |
 | A VMX knob for MMCONFIG placement | none exists — `grep -a` over `/bin/vmx` finds no `mmconfig`/`mcfg` option at all; only `pciHole.*`, which governs the hole, not ECAM |
 
-All tested on 2026-09-03 on the real 5412, each with an AC pull where the ASIC
-needed to be in WFI.
+All tested on 2026-09-03 on the real 5412. **Test conditions, precisely:** the
+first `allowP2P` run followed an AC pull. The three Above-4G-off rows followed
+an ESXi *restart* for the BIOS change with **no AC pull** — the ASIC was in the
+re-bootstrappable state a warm reboot leaves it in, not a verified WFI. That
+does not weaken the results: in the final row the loader completed a full
+bootstrap (the switch came up at ~70 s), so the write that faults was
+genuinely made; and the `useActualBases` crash happened before the guest
+touched the device at all. But a repeat of that final row after an AC pull
+is the belt-and-braces confirmation, and it has not been done.
 
 ### Where that leaves it
 
@@ -1311,7 +1318,8 @@ All four are answered. What remains was not on the original list:
 on this ESXi. The cause is known — u-boot on the ASIC's service CPU writes to
 the low 32 bits of the host BAR2 plus `0x41000`, which is `0xe0041000` with
 Above 4G Decoding on *or* off, and that is ECAM in every ESXi VM. Every lever
-was tested on 2026-09-03: `allowP2P` does nothing, `useActualBases` crashes
+was tested on 2026-09-03 (the Above-4G-off runs after an ESXi restart, not an
+AC pull): `allowP2P` does nothing, `useActualBases` crashes
 the VMX process, and there is no knob for MMCONFIG placement. It costs the
 bootstrap VM, not the switch; the two-VM model is simply how this platform
 works.
