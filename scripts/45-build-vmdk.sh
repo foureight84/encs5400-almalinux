@@ -21,12 +21,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 QCOW="${1:?usage: 45-build-vmdk.sh <input.qcow2> <outdir>}"
 OUT="${2:?}"
 NAME="${VM_NAME:-encs-switch}"
-# 384 MB, not 2048. Measured on the 5412 under ESXi 8.0 U3 (2026-09-03): the
-# image idles at 150 MB, bootstraps the ASIC at 320 MB, and will not boot at
-# 288 or below - GRUB cannot allocate the 62 MB generic initramfs ("can't
-# allocate initrd"). 384 is the tested floor plus one step. With passthrough
-# the whole allocation is pinned, so this is memory the host gets back.
-MEM="${VM_MEM:-384}"
+# 256 MB, not 2048. Measured on the 5412 under ESXi 8.0 U3 (2026-09-03): the
+# image idles at 150 MB and bootstraps the ASIC at 256 - with the 21 MB
+# initramfs this tree builds (payload/etc/dracut.conf.d/90-encs-slim.conf).
+# An image built before that has the 62 MB generic initramfs, which GRUB
+# cannot place below ~300 MB ("can't allocate initrd"): give those 384. With
+# passthrough the whole allocation is pinned, so this is memory the host
+# gets back.
+MEM="${VM_MEM:-256}"
 CPUS="${VM_CPUS:-2}"
 # 19 is ESXi 7.0 U2+. An older host refuses to register a VMX whose hardware
 # version it does not know, so 7.0 GA/U1 needs 17.

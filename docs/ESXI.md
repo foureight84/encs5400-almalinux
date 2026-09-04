@@ -57,7 +57,7 @@ is the list of what it was trying to do.
 [5 bootstrap](#5-bootstrap-power-on-and-expect-the-vm-to-die) ·
 [6 management role](#6-switch-the-vm-to-the-management-role) ·
 [7 LAN ports](#7-vms-on-the-front-lan-ports--the-lan-net-model) ·
-[8 boot order](#8-boot-ordering) ·
+[8 boot order + power-cut recovery](#8-boot-ordering--and-coming-back-from-a-power-cut-on-your-own) ·
 [9 after a reboot](#9-what-to-do-after-a-reboot-or-a-power-cut)
 
 **Day to day:** [the TUI is the switch console](#day-to-day-the-tui-is-the-switch-console) ·
@@ -211,7 +211,8 @@ ssh root@<esxi> 'vim-cmd vmsvc/power.on <vmid>'
 ping -c2 169.254.1.0
 
 # MANAGEMENT - step 6: remove the PCI device from the VM, power it back on,
-#               then inside it (and see step 9 for what to do after a reboot):
+#               then inside it. (Steps 5+6 together, and at every host boot:
+#               sh /vmfs/volumes/datastore1/encs-esxi/encs-esxi-bootstrap install-hook)
 nmcli con add type ethernet ifname ens224 con-name encs-mgmt \
       ipv4.method manual ipv4.addresses 169.254.1.1/16 \
       ipv4.never-default yes ipv6.method ignore
@@ -232,7 +233,8 @@ Revert the host side with
    until AC is pulled.
 3. Bootstrap must re-run after **every host power-on or reboot** - a warm
    reboot drops the switch, though it leaves the ASIC re-bootstrappable rather
-   than wedged.
+   than wedged. `encs-esxi-bootstrap install-hook` makes that automatic
+   ([step 8](#8-boot-ordering--and-coming-back-from-a-power-cut-on-your-own)).
 
 ---
 
@@ -416,25 +418,22 @@ vSwitch maximum. The ASIC side is unaffected; frames just cap lower.
 
 ## 4. Create the bootstrap VM
 
-Two vCPU, **384 MB**, EFI, Secure Boot **off**, two vNICs, one passthrough
+Two vCPU, **256 MB**, EFI, Secure Boot **off**, two vNICs, one passthrough
 device.
 
-> **Why 384 MB and not 2 GB.** Measured here on 2026-09-03: the image idles at
-> 150 MB and bootstrapped the ASIC at **320 MB** exactly as it does at 2048. It
-> does **not** boot at 288 or 256 — GRUB fails with `can't allocate initrd`,
-> because `dracut-config-generic` builds a 62 MB initramfs full of NIC firmware
-> no VM needs, and the guest reboot-loops on
-> `VFS: Unable to mount root fs`. 384 is the tested floor plus one step of
-> margin. It matters more than it looks: with a passthrough device ESXi pins
-> the entire allocation (`sched.mem.pin`), and Proxmox/VFIO does the same, so
-> every MB here is a MB the host never sees again. Dropping the firmware from
-> the initramfs was measured too (`dracut --fwdir /nonexistent`): 62 → 47 MB,
-> which is not enough on its own to reach 256 — that would need a leaner
-> module set as well, and is not done. The management role runs the TUI at
-> 320 as well, though with ~100 MB to spare rather than comfortably.
-The image ships a generic (non-hostonly) initramfs — `dracut-config-generic` is
-in the kickstart — so `vmw_pvscsi` and `vmxnet3` are present and it boots on
-VMware hardware without modification.
+> **Why 256 MB and not 2 GB.** Measured here on 2026-09-03: the image idles
+> at 150 MB, and it bootstrapped the ASIC at 256 MB — unattended, after a host
+> reboot — exactly as it does at 2048. What sets the floor is not usage but
+> the initramfs: `dracut-config-generic` builds a 62 MB one full of NIC
+> firmware no VM needs, GRUB cannot place it below ~300 MB (`can't allocate
+> initrd`), and the guest reboot-loops on `VFS: Unable to mount root fs`.
+> Images built from this tree ship a 21 MB initramfs instead
+> (`payload/etc/dracut.conf.d/90-encs-slim.conf`) and boot at 256. **An image
+> built before that needs 384** — 320 is its measured floor. It matters more
+> than it looks: with a passthrough device ESXi pins the entire allocation
+> (`sched.mem.pin`) and Proxmox/VFIO does the same, so every MB here is a MB
+> the host never sees again. The management role runs the TUI at 256 as
+> well, with ~60 MB to spare and 1.6 GB of swap behind it.
 
 `build.sh --esxi` writes `out/esxi/encs-switch.vmx` with all of this already
 set (`VM_HWVERSION=17 build.sh --esxi ...` for an older ESXi), so registering
@@ -449,7 +448,7 @@ virtualHW.version = "19"        # 7.0 U2+. Use 17 on 7.0 GA/U1, or the VM
 firmware = "efi"
 uefi.secureBoot.enabled = "FALSE"
 numvcpus = "2"
-memSize = "384"
+memSize = "256"
 
 scsi0.present = "TRUE"
 scsi0.virtualDev = "pvscsi"
@@ -488,8 +487,8 @@ pciBridge7.functions = "8"
 SMBIOS.reflectHost = "TRUE"
 
 # passthrough requires the full memory reservation
-sched.mem.min = "384"
-sched.mem.minSize = "384"
+sched.mem.min = "256"
+sched.mem.minSize = "256"
 sched.mem.pin = "TRUE"
 ```
 
@@ -681,7 +680,7 @@ the hypervisor: the VM is by definition up before the switch is.
 
 Do **not** enable `encs-switch-startup.service` here. It is Proxmox-only — it
 orders guests via `qm` and `/etc/pve/qemu-server`. The ESXi equivalent is
-[step 8](#8-boot-ordering).
+[step 8](#8-boot-ordering--and-coming-back-from-a-power-cut-on-your-own).
 
 On this branch `encs-switch-vnet` refuses `init`, `teardown` and `startup` when
 the files they edit are not there — `/etc/network/interfaces` for the first
@@ -841,26 +840,62 @@ for the bootstrap VM and nothing else.
 
 ---
 
-## 8. Boot ordering
+## 8. Boot ordering — and coming back from a power cut on your own
 
-A guest on `encs-lan` that starts before the ASIC is up gets a working vNIC and
-a network that forwards nothing for 60–90 s. DHCP fails and the cause is two
-layers from where it shows. Proxmox gets `order=1,up=90` on the bootstrap VM;
-ESXi's equivalent is autostart with a start delay:
+Everything in steps 5 and 6 — attach the Marvell, power on, wait for the VM
+to die and the links to come up, detach, power on again — is one script on
+the host, and it can run itself at every ESXi boot:
 
 ```sh
-vim-cmd hostsvc/autostartmanager/enable_autostart 1
-vim-cmd vmsvc/getallvms                       # note the Vmid of each VM
-
-# bootstrap VM: first, then wait 90s before starting anything else
-vim-cmd hostsvc/autostartmanager/update_autostartentry <vmid> "PowerOn" "90" "1" "guestShutdown" "0" "systemDefault"
-
-# each guest that depends on the switch
-vim-cmd hostsvc/autostartmanager/update_autostartentry <vmid> "PowerOn" "0" "2" "guestShutdown" "0" "systemDefault"
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/encs-esxi-bootstrap'               # now
+ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/encs-esxi-bootstrap install-hook'  # every boot
 ```
 
-As on Proxmox, **the delay goes on the bootstrap VM, not on the guest waiting**
-— the delay applies before the *next* entry starts.
+`install-hook` adds one line to `/etc/rc.local.d/local.sh` (which ESXi does
+persist across reboots) and `remove-hook` takes it out; `uninstall.sh` calls
+`remove-hook` for you. What a run does, from its own log:
+
+```
+18:58:19 == encs-switch (vmid 2) /vmfs/volumes/datastore1/encs-switch/encs-switch.vmx
+18:58:24 bootstrap role: 0000:0d:00.0 attached as pciPassthru0.id=00000:013:00.0
+18:58:29 powered on; waiting up to 240s for the backplane links (the VM dying meanwhile is expected)
+18:59:54 ASIC up after 75s
+18:59:56 removed the Marvell from encs-switch (management role)
+18:59:58 powered on encs-switch (management role)
+18:59:58 done: switch up, encs-switch in management role
+```
+
+That is a real host reboot on 2026-09-03, with nobody logged in: the switch
+was up and the management VM running 2 min 40 s after the host came back.
+
+Three things it does that matter:
+
+- **It refuses to run if the X710 links are already up.** That is the ASIC
+  running, and the loader against a running ASIC is the wedge. `FORCE=1`
+  overrides it for the case where you know better (links can read Up briefly
+  after an AC pull).
+- **It always leaves the VMX without the device.** On success, on timeout, on
+  a power-on failure — so a later manual power-on of the VM is never the
+  wedge by accident.
+- **It waits for hostd.** `local.sh` runs a minute before `vim-cmd` works;
+  the script polls rather than failing.
+
+**Guests that depend on the switch** go in `START_AFTER`, which the hook bakes
+in:
+
+```sh
+START_AFTER="web01 db01" sh /vmfs/volumes/datastore1/encs-esxi/encs-esxi-bootstrap install-hook
+```
+
+They are powered on only after the ASIC is up, which is the ordering the
+Proxmox side gets from `order=1,up=90`. Do **not** put the switch VM itself in
+ESXi's autostart list: autostart cannot flip the role, so it would either
+start a VM that cannot bootstrap (device detached) or, worse, one that can
+(device attached) against a live ASIC.
+
+`sh …/encs-esxi-bootstrap status` prints one line — ASIC state, VM state and
+which role the VMX currently holds — and is the first thing to run when
+something looks wrong.
 
 ---
 
@@ -888,13 +923,15 @@ Only the wedge case needs someone physically at the box, and the way to avoid
 it is the rule from [step 6](#6-switch-the-vm-to-the-management-role): never
 leave the Marvell attached to a VM you might boot while the switch is up.
 
-So the operating loop is:
+So the operating loop is — and with the [hook from step 8](#8-boot-ordering--and-coming-back-from-a-power-cut-on-your-own)
+installed, it runs itself:
 
 ```
 host power-on / reboot
-    -> power on the bootstrap VM        (it dies; that is fine)
-    -> confirm: ping 169.254.1.0
-    -> power on the management VM       (no PCI device) and everything else
+    -> sh /vmfs/volumes/datastore1/encs-esxi/encs-esxi-bootstrap
+       (attaches the device, powers on, waits for the links, detaches,
+        powers on again as the management VM, then START_AFTER)
+    -> confirm from the management VM: ping 169.254.1.0
 ```
 
 `encs-switch-replay.service` in the management VM reapplies your saved
