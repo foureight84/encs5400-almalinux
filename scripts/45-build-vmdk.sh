@@ -172,9 +172,12 @@ Deploying $NAME.vmdk on ESXi          (experimental - see docs/ESXI.md)
 
 5. Switch to the MANAGEMENT role - this is not optional:
      # Remove the PCI device from the VM (Host Client -> Edit settings), then
-     # power it back on. Now it can run the tools:
-     #   ip addr add 169.254.1.1/16 dev <the encs-mgmt-2363 vNIC>
-     #   /opt/encs-host/encs-switch-tui
+     # power it back on. Now it can run the tools. Address the mgmt vNIC
+     # persistently - NetworkManager drops a bare 'ip addr add':
+     #   nmcli con add type ethernet ifname <encs-mgmt-2363 vNIC> \
+     #       con-name encs-mgmt ipv4.method manual \
+     #       ipv4.addresses 169.254.1.1/16 ipv4.never-default yes ipv6.method ignore
+     #   encs-switch-tui
      #
      # NEVER boot a VM that still has the Marvell attached while the switch is
      # up. marvell-switch-boot runs at every boot, and a loader run against an

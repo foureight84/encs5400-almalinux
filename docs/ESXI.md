@@ -215,7 +215,7 @@ ping -c2 169.254.1.0
 nmcli con add type ethernet ifname ens224 con-name encs-mgmt \
       ipv4.method manual ipv4.addresses 169.254.1.1/16 \
       ipv4.never-default yes ipv6.method ignore
-/opt/encs-host/encs-switch-tui
+encs-switch-tui
 ```
 
 Revert the host side with
@@ -622,7 +622,7 @@ Then:
 
 ```sh
 ping -c2 169.254.1.0        # the ASIC
-/opt/encs-host/encs-switch-tui
+encs-switch-tui
 ```
 
 Everything the README says about the TUI applies unchanged — same program,
@@ -634,15 +634,24 @@ VM; the line that matters is the last one, `switch reachable at 169.254.1.0`.
 
 ### Install the tools properly
 
+The image already puts `encs-switch-tui`, `-api` and `-vnet` on `PATH` as
+symlinks into `/opt/encs-host/`, so the commands above work as written. On an
+image built before that change (the tools are only under `/opt/encs-host/`),
+add the links by hand:
+
 ```sh
-bash /opt/encs-host/install.sh
+for t in tui api vnet; do
+    chmod 0755 /opt/encs-host/encs-switch-$t
+    ln -sfn /opt/encs-host/encs-switch-$t /usr/local/sbin/encs-switch-$t
+done
 ```
 
-On this platform `install.sh` will not find two `i40e` ports (they belong to
-ESXi, not the VM) and will stop. Do the two useful parts by hand instead:
+What is still worth setting up is the replay unit, which restores the switch
+configuration after a cold boot. `bash /opt/encs-host/install.sh` would do it,
+but on this platform it stops early — it wants two `i40e` ports, and they
+belong to ESXi, not the VM. Do the useful part by hand:
 
 ```sh
-install -m 0755 /opt/encs-host/encs-switch-{api,tui,vnet} /usr/local/sbin/
 install -m 0644 /opt/encs-host/encs-switch-replay.service /etc/systemd/system/
 mkdir -p /etc/encs-switch
 systemctl daemon-reload
@@ -689,7 +698,7 @@ SSH into it (or open its VMware console) and run the tool:
 
 ```sh
 ssh root@<management-vm>
-encs-switch-tui           # or /opt/encs-host/encs-switch-tui if not installed
+encs-switch-tui
 ```
 
 It is an ordinary interactive curses program: arrow keys move, `p`/`v`/`e`/`m`
