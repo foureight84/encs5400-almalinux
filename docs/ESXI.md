@@ -1176,11 +1176,12 @@ The mechanism: the service CPU reads its own BAR2 back from the device side of
 the PCIe core. That value is the host-physical one — ESXi does not virtualise
 what a device sees of itself — and something in the firmware keeps only 32
 bits of it. On bare metal and under Proxmox the BAR sits below 4 GB, so
-truncation is lossless and the write goes back to the chip's own window. On
-this host the BIOS has **Above 4G Decoding** enabled, every 64-bit prefetchable
-BAR (the Marvell's three, both X710s) lands at `0x383f_xxxx_xxxx`, the top 16
-bits are lost, and `0xe0041000` happens to be the guest's ECAM range — which
-the IOMMU domain will never map for writes.
+truncation is lossless and the write goes back to the chip's own window. Here
+it does not matter whether it is lossless: with Above 4G Decoding on, host BAR2
+is `0x383fe0000000`; with it off (tested), it is `0xe0000000`. **The low 32
+bits are `0xe0000000` either way**, so the write always targets guest-physical
+`0xe0041000` — and in every ESXi VM that is the ECAM range, which the IOMMU
+domain will never map for writes.
 
 **That is why no guest-side knob ever moved the address.** `pciHole`,
 `pci=nommconf`, guest RAM size, `use64bitMMIO` — all shuffle the *guest's*
@@ -1205,53 +1206,54 @@ ESXi:
 | Route | Why it works | On ESXi |
 |---|---|---|
 | Guest BAR2 at exactly `0xe0000000`, plus P2P mapping | truncated address == guest BAR | **shut** — ECAM lives there, and every lever that moves it is closed |
-| Host BAR2 below 4 GB | truncation becomes lossless | **open** — a BIOS setting, see below |
+| Host BAR2 below 4 GB, at an address the guest can also host | truncation lossless *and* `useActualBases` can mirror it | **tested, shut** — the BIOS puts it at `0xe0000000`, which is ECAM again; see below |
 
 (A third, hacky option: `setpci` the guest BAR2 to `0xe0000000` after `FW
 upload done` and before u-boot writes. A 1–6 s race, ESXi may refuse a BAR
 over its ECAM, and it is unknown which BAR the DDR upload uses. Ranked below
 the BIOS route, not above.)
 
-### What was tried, and what is left
+### What was tried — all of it, with results
 
 | Lever | Result |
 |---|---|
 | `pciHole.dynStart` | closed — ESXi rewrites it to `2560` at power-on |
 | `pci=nommconf` in the guest | closed — range stays reserved as `pnp 00:05` |
-| `pciPassthru.allowP2P = "TRUE"` | **tested 2026-09-03, no effect.** Accepted into the DICT, VM still killed at the same address. Expected in hindsight: it maps the device's *guest* BARs into the domain, and `0xe0000000` is not one of them. |
+| `pciPassthru.allowP2P = "TRUE"`, Above 4G on | **no effect** — accepted into the DICT, same fault at `0xe0041000` |
+| **BIOS: Above 4G Decoding off** | BAR2 moved from `0x383fe0000000` to `0xe0000000`. Same low 32 bits, so the target address did not change. Harmless, and pointless for this. |
+| `useActualBases` + `allowP2P`, Above 4G off | **crashes the VMX process.** `Failed to map MMIO: Failure` then `PANIC: VERIFY bora/devices/pcipassthru/pciPassthru.c:871`, core dumped. The "actual base" is `0xe0000000`, ESXi cannot place a passthrough BAR over its own ECAM, and it asserts rather than failing cleanly. The ASIC stayed in WFI through it. |
+| `allowP2P` alone, Above 4G off | **same fault**, `0xe0041000`, VM killed at ~35 s, switch up at ~70 s as always |
+| A VMX knob for MMCONFIG placement | none exists — `grep -a` over `/bin/vmx` finds no `mmconfig`/`mcfg` option at all; only `pciHole.*`, which governs the hole, not ECAM |
 
-**The one lever left is on the host: put BAR2 below 4 GB.** Then the 32-bit
-truncation is lossless and the service CPU writes to its own real BAR.
+All tested on 2026-09-03 on the real 5412, each with an AC pull where the ASIC
+needed to be in WFI.
 
-1. **BIOS (F2): disable Above 4G Decoding** (the ENCS BIOS may call it *MMIO
-   High* or *Memory Mapped I/O above 4GB*). This needs 577 MB of prefetchable
-   space below 4 GB for the Marvell alone plus the X710s; a Broadwell-DE has
-   roughly 2 GB there, so it fits. Reboot ESXi, confirm with
-   `vsish -e get /hardware/pci/seg/0/bus/13/slot/0/func/0/BARInfo/2` that the
-   address is now 32-bit.
-2. **Then the guest-physical address the ASIC writes must reach the device.**
-   The write will now target *host* BAR2 + `0x41000`, interpreted as a
-   guest-physical address. Two accepted VMX options cover it, and both are
-   needed:
-   `pciPassthru.useActualBases = "TRUE"` makes the guest BAR equal the host
-   BAR, and `pciPassthru.allowP2P = "TRUE"` puts that MMIO into the IOMMU
-   domain. (There is a chance `useActualBases` is unnecessary — the guest
-   already puts BAR2 at `0xc0000000`, and if the BIOS happens to pick the same
-   address the two agree by accident. Do not rely on it.)
-3. Bootstrap after an AC pull and watch `vmkwarning.log`.
+### Where that leaves it
 
-**How to read it.** If the fault is gone, done — the bootstrap VM survives,
-and the [two-VM split](#two-jobs-two-vms-how-this-actually-works-on-esxi)
-becomes a convenience rather than a requirement. If the fault *moves* to
-`<new BAR2> + 0x41000`, the truncation story is confirmed and step 2 is what
-is missing. If it stays at exactly `0xe0041000` with the BAR moved, the value
-is hardcoded in the firmware rather than read back, and only a guest BAR at
-`0xe0000000` would satisfy it — which ECAM forbids, and that would be the end
-of the road.
+The write must land on guest-physical `0xe0000000 + 0x41000`. In an ESXi VM
+that range is ECAM, ESXi provides no way to move ECAM, and it cannot map a
+passthrough BAR there even when asked to (the VERIFY crash *is* that
+attempt). Proxmox is not affected only because q35 happened to put the
+guest's BAR2 at that exact address.
 
-**Status: root cause established, fix untested.** It needs a BIOS change and
-an AC pull, so it is not something to try remotely. Until then this remains
-documented rather than fixed — and it costs the bootstrap VM, not the switch.
+**One idea remains untested, and it is a long shot:** the value the firmware
+writes comes from the *host* BAR2, so if the host BAR2 could be placed at a
+below-4 GB address *outside* `0xe0000000–0xe7ffffff`, then
+`useActualBases` (mirror it into the guest — it only crashed because the
+mirror landed on ECAM) plus `allowP2P` (map it) should let the write land.
+Nothing tried so far moves the host BAR anywhere but `0xe0000000`: the BIOS
+allocator picks it deterministically and exposes no per-device control. The
+ESXi kernel options `pciBarAllocPolicy` and `pciHonorAcpiRootBridgeRes`
+*might* make the VMkernel reassign BARs itself rather than honour the BIOS —
+that is not established, each attempt is a host reboot plus an AC pull, and
+moving every BAR on the box is not free of risk to `vmk0`. It is recorded here
+so the next person does not start from zero, not because it is expected to
+work.
+
+**Status: root cause established, no fix available on ESXi 8.0 U3.** It costs
+the bootstrap VM and not the switch, so the
+[two-VM model](#two-jobs-two-vms-how-this-actually-works-on-esxi) stands as
+the way this platform works, not as a workaround for something pending.
 
 ### The COMMAND register bug
 
@@ -1305,10 +1307,11 @@ Things a first attempt should watch for, so a report back is useful:
 
 All four are answered. What remains was not on the original list:
 
-**Can the [IOMMU fault](#the-iommu-fault) be fixed after all?** The cause
-is now known: u-boot on the ASIC's service CPU writes to its own BAR2 using
-only the low 32 bits of the *host-physical* address, and this BIOS places that
-BAR above 4 GB. `allowP2P` alone was tested and does nothing. The remaining
-lever is disabling Above 4G Decoding in the BIOS, then `useActualBases` +
-`allowP2P` in the VMX — untested, needs a site visit. It costs the bootstrap
-VM, not the switch, so nothing is blocked on it.
+**Can the [IOMMU fault](#the-iommu-fault) be fixed after all?** No, not
+on this ESXi. The cause is known — u-boot on the ASIC's service CPU writes to
+the low 32 bits of the host BAR2 plus `0x41000`, which is `0xe0041000` with
+Above 4G Decoding on *or* off, and that is ECAM in every ESXi VM. Every lever
+was tested on 2026-09-03: `allowP2P` does nothing, `useActualBases` crashes
+the VMX process, and there is no knob for MMCONFIG placement. It costs the
+bootstrap VM, not the switch; the two-VM model is simply how this platform
+works.
