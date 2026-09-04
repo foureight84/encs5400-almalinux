@@ -74,7 +74,7 @@ CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
 
 # Single source of truth for the version. scripts/release.sh reads this line
 # to name the tag and the tarball, so keep the literal on one line.
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 # Where --update looks. Override for a fork or a test repo.
 GITHUB_REPO = os.environ.get("ENCS_REPO", "foureight84/encs5400-almalinux")
@@ -1358,6 +1358,50 @@ def _try(fn, default=None):
 
 
 # ============================================================ config files
+# Every replay file save_config can produce. Used to drop the ones it did
+# NOT produce this time: an area that was configured last save and is not
+# now would otherwise keep replaying its old settings after every cold boot.
+# Only these names are ever removed - a hand-written file is not touched.
+SAVED_FILES = (
+    "11-port-settings.xml",
+    "35-stp-global.xml",
+    "36-stp-bridge.xml",
+    "37-stp-ports.xml",
+    "40-storm.xml",
+    "41-span-dest.xml",
+    "42-span-src.xml",
+    "45-lldp-global.xml",
+    "46-lldp-ports.xml",
+    "47-cdp-ports.xml",
+    "50-lacp-global.xml",
+    "51-lacp-ports.xml",
+    "55-mac-aging.xml",
+    "56-static-mac.xml",
+    "60-acls.xml",
+    "61-aces.xml",
+    "62-acl-bindings.xml",
+    "65-qos-global.xml",
+    "66-qos-cos.xml",
+    "67-cos-queue.xml",
+    "68-policers.xml",
+    "70-radius.xml",
+    "71-dot1x-global.xml",
+    "72-dot1x-ports.xml",
+    "75-multicast.xml",
+    "76-igmp-vlans.xml",
+    "77-igmp-routers.xml",
+    "80-pvlan.xml",
+    "81-pvlan-assoc.xml",
+    "82-pvlan-hosts.xml",
+    "83-pvlan-promisc.xml",
+    "84-ip-routing.xml",
+    "85-gateway.xml",
+    "86-routes.xml",
+    "87-arp.xml",
+    "88-arp-timeout.xml",
+)
+
+
 def save_config(sw, path=CFG_DIR):
     os.makedirs(path, exist_ok=True)
     # A saved RADIUS server carries its shared secret in the clear, because
@@ -1477,6 +1521,11 @@ def save_config(sw, path=CFG_DIR):
         written.append(f)
 
     written += save_extended(sw, path, allports)
+    for stale in SAVED_FILES:
+        f = os.path.join(path, stale)
+        if f not in written and os.path.exists(f):
+            os.unlink(f)
+            written.append(f"{f} (removed - no longer configured)")
     return written
 
 
@@ -1579,14 +1628,21 @@ def save_extended(sw, path, allports=None):
     # This matters more than a one-off: encs-switch-replay.service applies
     # these files unattended after every cold power cycle, so a te entry
     # here would break management on every single boot.
-    settings = _pick(_no_backplane(allports or []),
+    # No LAGs either: Standard802_3List lists LAG1-4 alongside the ports,
+    # with speedAdmin 0, and the firmware answers a replay of that with
+    # statusCode 3 "Invalid speedAdmin value" - which failed the whole file,
+    # and with it encs-switch-replay.service, on every boot (seen on
+    # hardware 2026-09-03; every gi entry in the same file was accepted).
+    settings = _pick([r for r in _no_backplane(allports or [])
+                      if not (r.get("interfaceName") or "").startswith("LAG")],
                      ["interfaceDescription", "speedAdmin",
                       "autoNegotiationAdminEnabled", "flowControlAdminType"])
     # Only ports that have actually been given a setting - autoneg on with
-    # no description is the default and not worth a file.
+    # no description is the default and not worth a file. speedAdmin is
+    # always populated (it echoes the negotiated speed), so on its own it
+    # says nothing; it only means something when autoneg is off.
     settings = [s for s in settings
                 if s.get("interfaceDescription")
-                or s.get("speedAdmin")
                 or s.get("autoNegotiationAdminEnabled") == "2"
                 or s.get("flowControlAdminType") == "1"]
     if settings:
@@ -1869,12 +1925,20 @@ def save_extended(sw, path, allports=None):
     return written
 
 
+def status_string(body):
+    """The switch's own verdict: 'OK', or e.g. 'Invalid speedAdmin value'."""
+    m = re.search(r"<statusString>([^<]*)</statusString>", body or "")
+    return m.group(1).strip() if m else "no statusString in reply"
+
+
 def apply_config(sw, path=CFG_DIR):
+    """-> [(file, ok, reason)], reason being the switch's statusString."""
     if not os.path.isdir(path):
         return []
     out = []
     for fn in sorted(f for f in os.listdir(path) if f.endswith(".xml")):
-        out.append((fn, ok(sw.post(open(os.path.join(path, fn)).read()))))
+        body = sw.post(open(os.path.join(path, fn)).read())
+        out.append((fn, ok(body), status_string(body)))
     return out
 
 
@@ -4669,9 +4733,9 @@ class UI:
                 if self.prompt("apply saved config to the switch? type yes:") == "yes":
                     try:
                         res = apply_config(self.sw)
-                        self.set_msg("  ".join(f"{f}:{'OK' if g else 'FAIL'}"
-                                               for f, g in res) or "nothing to apply",
-                                     bad=any(not g for _, g in res))
+                        self.set_msg("  ".join(f"{f}:{'OK' if g else 'FAIL (' + why + ')'}"
+                                               for f, g, why in res) or "nothing to apply",
+                                     bad=any(not g for _, g, _w in res))
                     except Exception as e:
                         self.set_msg(str(e), bad=True)
 
@@ -5302,12 +5366,12 @@ def main():
             sys.exit(f"ERROR: {e}")
         if arg == "--save":
             for f in save_config(sw):
-                print("wrote", f)
+                print(f if "(removed" in f else f"wrote {f}")
             sw.logout()
             return
         bad = False
-        for f, good in apply_config(sw):
-            print(f"{f}: {'OK' if good else 'FAILED'}")
+        for f, good, why in apply_config(sw):
+            print(f"{f}: {'OK' if good else 'FAILED - ' + why}")
             bad |= not good
         sw.logout()
         sys.exit(1 if bad else 0)
