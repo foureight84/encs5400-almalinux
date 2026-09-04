@@ -989,8 +989,8 @@ def test_config_roundtrip():
         sw.posts.clear()
         res = t.apply_config(sw, d)
         check(len(res) == len(written), "apply posts every saved file")
-        check(all(good for _, good in res), "every replayed file reports OK")
-        check([f for f, _ in res] == sorted(f for f, _ in res),
+        check(all(good for _, good, _ in res), "every replayed file reports OK")
+        check([f for f, _, _ in res] == sorted(f for f, _, _ in res),
               "files are replayed in filename order")
 
 
@@ -1055,7 +1055,7 @@ def test_config_extended_roundtrip():
 
         sw.posts.clear()
         res = t.apply_config(sw, d)
-        check(all(good for _, good in res),
+        check(all(good for _, good, _ in res),
               "every extended file replays without error")
 
         # Operational fields must not be echoed back as settings.

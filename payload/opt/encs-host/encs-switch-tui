@@ -74,7 +74,7 @@ CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
 
 # Single source of truth for the version. scripts/release.sh reads this line
 # to name the tag and the tarball, so keep the literal on one line.
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 # Where --update looks. Override for a fork or a test repo.
 GITHUB_REPO = os.environ.get("ENCS_REPO", "foureight84/encs5400-almalinux")
@@ -2126,7 +2126,41 @@ def do_update(force=False, say_=print):
             say_("  systemctl daemon-reload")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    _post_update(say_)
     return tag
+
+
+def _post_update(say_=print):
+    """Apply what the new tools would do at the next boot, now.
+
+    encs-switch-startup.service runs `encs-switch-vnet startup --fix` before
+    pve-guests, which since 0.2.3 also re-points the bootstrap VM's hostpciN
+    line when a BIOS/CIMC update has moved the Marvell on the PCI bus. Someone
+    running --update is quite likely doing so *because* of that - their VM
+    will not start - so do not make them wait for a reboot, or learn a second
+    command. Proxmox only: the ESXi bootstrap handles its own passthrough.
+    Nothing here starts a VM: booting the loader against an ASIC that is
+    already up wedges it, and only the operator knows which case this is.
+    """
+    vnet = "/usr/local/sbin/encs-switch-vnet"
+    if not (os.path.isdir("/etc/pve/qemu-server") and os.path.exists(vnet)):
+        return
+    subprocess.run(["systemctl", "enable", "encs-switch-startup.service"],
+                   capture_output=True, check=False)
+    say_("post-update: checking the bootstrap VM's passthrough and boot order")
+    r = subprocess.run([vnet, "hostpci", "--fix"], capture_output=True,
+                       text=True, check=False)
+    out = (r.stdout + r.stderr).strip()
+    if out:
+        for line in out.splitlines():
+            say_("  " + line)
+    if r.returncode == 0 and "->" in out:
+        say_("  the VM now points at the Marvell's current address - "
+             "start it with: qm start <vmid>")
+    r = subprocess.run([vnet, "startup", "--fix", "--quiet"],
+                       capture_output=True, text=True, check=False)
+    for line in (r.stdout + r.stderr).strip().splitlines():
+        say_("  " + line)
 
 
 def _is_python(path):
@@ -2447,6 +2481,12 @@ each file in atomically. It only ever writes to /usr/local/sbin,
 
 It does NOT touch your switch config, the VLAN interface, or /etc/encs-switch.
 Roll back by copying the files out of the backup directory.
+
+On Proxmox it finishes by running 'encs-switch-vnet hostpci --fix' and
+'encs-switch-vnet startup --fix': if a BIOS or CIMC update moved the Marvell
+on the PCI bus, the bootstrap VM's hostpci line is re-pointed right away
+instead of at the next boot. It never starts a VM - do that yourself once it
+says the address was fixed.
 
 This updates the HOST tools only. The bootstrap VM's kernel, the Marvell
 module and the firmware loader are baked into the image and are not

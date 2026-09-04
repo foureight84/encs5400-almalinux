@@ -730,12 +730,22 @@ qm start 900
 ```
 
 If the switch was up before the reboot, the usual AC pull applies first.
-**Since the host tools dated 2026-09-04 this is automatic**:
-`encs-switch-startup.service` runs `encs-switch-vnet startup --fix` before
-`pve-guests` on every boot, and that now re-points `hostpciN` when the live
-address matches no VM — recognising the bootstrap VM by its `smbios1`
-platform gate. `encs-switch-vnet hostpci` shows the check on demand. Older
-installs use the commands above, then [update the host tools](#updating-the-host-tools).
+
+**Since host tools 0.2.3 this is automatic.** `encs-switch-startup.service`
+runs `encs-switch-vnet startup --fix` before `pve-guests` on every boot, and
+that re-points `hostpciN` when the live address matches no VM — recognising
+the bootstrap VM by its `smbios1` platform gate. `encs-switch-vnet hostpci`
+shows the check on demand. **Already installed and hit by this?** One
+command, then start the VM:
+
+```sh
+encs-switch-tui --update      # installs 0.2.3 and applies the hostpci fix right away
+qm start 900
+```
+
+`--update` runs the fix itself after installing, so there is no waiting for
+a reboot and no second command to learn. It never starts the VM for you,
+because booting the loader against an ASIC that is already up is the wedge.
 The same thing on ESXi is a per-address passthrough flag; see
 [docs/ESXI.md](docs/ESXI.md#after-a-bios-or-cimc-update-the-marvell-moves-on-the-pci-bus).
 
