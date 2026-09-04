@@ -145,7 +145,7 @@ On Proxmox 8 (kernel 6.8) it is usually on already.
 
 ```sh
 qm create 900 --name encs-switch --machine q35 --bios ovmf \
-    --memory 2048 --cores 2 --net0 virtio,bridge=vmbr0 \
+    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \
     --serial0 socket --vga serial0
 qm importdisk 900 AlmaLinux-8.9-ENCS5400-switch.qcow2 local-lvm
 qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
@@ -239,7 +239,7 @@ use `AlmaLinux-8.9-ENCS5400-switch.iso`.
 
 ```sh
 qm create 900 --name encs-switch --machine q35 --bios ovmf \
-    --memory 2048 --cores 2 --net0 virtio,bridge=vmbr0 \
+    --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \
     --serial0 socket --vga serial0
 qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:16
 qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
@@ -978,8 +978,12 @@ Three separate paths, which is the key to understanding everything else:
 | **Boot** | bootstrap VM | pushes firmware over PCIe; a permanent watchdog daemon |
 | **Management** | Proxmox host | HTTPS XML API on `169.254.1.0` over VLAN 2363 |
 
-The VM is *infrastructure*, not a data-plane element — 2 vCPU / 2 GB is enough
-regardless of switch throughput. Management deliberately lives on the host,
+The VM is *infrastructure*, not a data-plane element — 2 vCPU / 384 MB is enough
+(it idles at 150 MB and has been seen to bootstrap the ASIC at 320; below ~300 MB
+GRUB cannot load the 62 MB generic initramfs at all). With passthrough the whole
+allocation is pinned, so do not hand it 2 GB out of habit — that is 2 GB the host
+never gets back. The same figure applies on ESXi; see `docs/ESXI.md`.
+Sizing is independent of switch throughput. Management deliberately lives on the host,
 because the backplane NIC does.
 
 ---

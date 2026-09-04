@@ -416,7 +416,22 @@ vSwitch maximum. The ASIC side is unaffected; frames just cap lower.
 
 ## 4. Create the bootstrap VM
 
-Two vCPU, 2 GB, EFI, Secure Boot **off**, two vNICs, one passthrough device.
+Two vCPU, **384 MB**, EFI, Secure Boot **off**, two vNICs, one passthrough
+device.
+
+> **Why 384 MB and not 2 GB.** Measured here on 2026-09-03: the image idles at
+> 150 MB and bootstrapped the ASIC at **320 MB** exactly as it does at 2048. It
+> does **not** boot at 288 or 256 — GRUB fails with `can't allocate initrd`,
+> because `dracut-config-generic` builds a 62 MB initramfs full of NIC firmware
+> no VM needs, and the guest reboot-loops on
+> `VFS: Unable to mount root fs`. 384 is the tested floor plus one step of
+> margin. It matters more than it looks: with a passthrough device ESXi pins
+> the entire allocation (`sched.mem.pin`), and Proxmox/VFIO does the same, so
+> every MB here is a MB the host never sees again. Dropping the firmware from
+> the initramfs was measured too (`dracut --fwdir /nonexistent`): 62 → 47 MB,
+> which is not enough on its own to reach 256 — that would need a leaner
+> module set as well, and is not done. The management role runs the TUI at
+> 320 as well, though with ~100 MB to spare rather than comfortably.
 The image ships a generic (non-hostonly) initramfs — `dracut-config-generic` is
 in the kickstart — so `vmw_pvscsi` and `vmxnet3` are present and it boots on
 VMware hardware without modification.
@@ -434,7 +449,7 @@ virtualHW.version = "19"        # 7.0 U2+. Use 17 on 7.0 GA/U1, or the VM
 firmware = "efi"
 uefi.secureBoot.enabled = "FALSE"
 numvcpus = "2"
-memSize = "2048"
+memSize = "384"
 
 scsi0.present = "TRUE"
 scsi0.virtualDev = "pvscsi"
@@ -473,8 +488,8 @@ pciBridge7.functions = "8"
 SMBIOS.reflectHost = "TRUE"
 
 # passthrough requires the full memory reservation
-sched.mem.min = "2048"
-sched.mem.minSize = "2048"
+sched.mem.min = "384"
+sched.mem.minSize = "384"
 sched.mem.pin = "TRUE"
 ```
 
