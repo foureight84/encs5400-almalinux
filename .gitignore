@@ -12,3 +12,7 @@ __pycache__/
 
 # macOS
 .DS_Store
+# Cisco firmware staged for the CIMC TFTP server - proprietary, never commit.
+bios/
+# local search index
+.zvec-grep/

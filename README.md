@@ -627,7 +627,9 @@ systemctl disable encs-switch-startup   # opt out entirely
 It finds the bootstrap VM by which guest has the Marvell device passed through,
 never by a hardcoded VMID, and covers every bridge the tool owns — `swbr0` plus
 any `--named-bridge`. `status` and the TUI's vnet view warn when it becomes
-relevant.
+relevant. Before any of that it checks that the `hostpciN` line still names
+the address the Marvell has *now*, and re-points it if a firmware update moved
+the device — see [Operational warnings](#operational-warnings).
 
 **The delay goes on the bootstrap VM, not on the guest waiting.** `qm`'s `up=`
 delays *the next* guest in the sequence, so `--startup order=2,up=90` on the
@@ -919,6 +921,31 @@ and excludes `kernel*`; if you defeat that, the switch dies silently.
 **`nfvis-fwupdate` is deliberately excluded.** It flashes BIOS/CIMC firmware,
 and newer NFVIS images reportedly lock the BIOS so F2 setup becomes
 unreachable — which would make PCI passthrough impossible to configure.
+
+**A BIOS or CIMC update can move the switch on the PCI bus.** Seen on the
+chassis on 2026-09-04: after updating CIMC to 3.2(14.27) the Marvell went from
+`0000:0d:00.0` to `0000:0e:00.0`. The bootstrap VM's `hostpci0` line names the
+old address, so `qm start 900` fails with *no PCI device found* — or, worse, if
+another device now sits at the old address the VM gets that one instead. The
+VM, the tools and the saved config are untouched; only the hypervisor's binding
+of the ASIC to the VM is stale. Fix it the way the VM was created, so the
+address is never typed by hand:
+
+```sh
+lspci -d 11ab:be00                                              # where it is now
+qm set 900 --hostpci0 0000:$(lspci -d 11ab:be00 | cut -d' ' -f1) # keep any ,pcie=1 etc.
+qm start 900
+```
+
+If the switch was up before the reboot, the usual AC pull applies first.
+**Since the host tools dated 2026-09-04 this is automatic**:
+`encs-switch-startup.service` runs `encs-switch-vnet startup --fix` before
+`pve-guests` on every boot, and that now re-points `hostpciN` when the live
+address matches no VM — recognising the bootstrap VM by its `smbios1`
+platform gate. `encs-switch-vnet hostpci` shows the check on demand. Older
+installs use the commands above, then [update the host tools](#updating-the-host-tools).
+The same thing on ESXi is a per-address passthrough flag; see
+[docs/ESXI.md](docs/ESXI.md#after-a-bios-or-cimc-update-the-marvell-moves-on-the-pci-bus).
 
 **Front ports come up disabled (`admin DOWN`) with PoE off** after a bootstrap —
 that is the firmware default, and NFVIS's own init is what used to enable them.

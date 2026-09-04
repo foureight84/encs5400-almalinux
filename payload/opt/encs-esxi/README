@@ -61,7 +61,11 @@ encs-esxi-bootstrap the two-role dance, unattended: attach the Marvell, power
                     management VM. "install-hook" runs it from
                     /etc/rc.local.d/local.sh at every host boot, so a power
                     cut no longer needs a person. Refuses to run against a
-                    switch that is already up (that is the wedge).
+                    switch that is already up (that is the wedge). Finds the
+                    Marvell by 11ab:be00, not by address, and re-enables
+                    passthrough on whatever address it has now — a BIOS or
+                    CIMC update can renumber the bus (0d:00.0 became 0e:00.0
+                    after the 3.2(14.27) update).
 
 WHAT IT NEVER TOUCHES
 ---------------------

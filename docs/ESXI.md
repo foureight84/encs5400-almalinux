@@ -914,6 +914,7 @@ bootstrap. What that costs you depends on what happened:
 | ESXi host **warm reboot** | **down** | power on the bootstrap VM again |
 | Host powered off, or AC removed | **down** | power on the bootstrap VM again |
 | Loader run against an already-booted ASIC | **wedged** | **pull AC**, then bootstrap |
+| BIOS or CIMC firmware updated | **down** | re-enable passthrough on the Marvell's **new** PCI address, then bootstrap - [below](#after-a-bios-or-cimc-update-the-marvell-moves-on-the-pci-bus) |
 
 Measured on the chassis: after a warm host reboot both X710 links read
 `Link Down` and the switch is gone — the vSwitch, portgroups and passthrough
@@ -941,6 +942,45 @@ host power-on / reboot
 `/etc/encs-switch/*.xml` once the ASIC answers, which is what puts VLANs, port
 state and PoE back after any of the "down" rows above. Without it a cold boot
 leaves you with firmware defaults and every front port shut.
+
+### After a BIOS or CIMC update: the Marvell moves on the PCI bus
+
+Seen on the chassis on 2026-09-04, after updating CIMC to 3.2(14.27): the
+Marvell went from `0000:0d:00.0` to `0000:0e:00.0`. Nothing else changed,
+but ESXi enables DirectPath I/O **per PCI address**, so the new address was
+not enabled and the boot hook stopped at
+
+```
+ERROR: 0000:0e:00.0 is not enabled for passthrough - run install.sh --yes first
+```
+
+with both X710 links `Link Down` and the switch VM off. The message names the
+cause correctly and the remedy wrongly - `install.sh` would try to redo the
+networking too. This is the fix, on the host:
+
+```sh
+DEV=$(lspci | awk '/11ab|Marvell/{print $1; exit}')          # the new address
+esxcli hardware pci pcipassthru set --device-id=$DEV --enable=true --apply-now
+esxcli hardware pci pcipassthru list | grep $DEV              # must say true
+echo "passthru $DEV" >> /vmfs/volumes/datastore1/encs-esxi/created
+/sbin/auto-backup.sh
+VM=encs-switch sh /vmfs/volumes/datastore1/encs-esxi/encs-esxi-bootstrap run
+```
+
+If the list says `pending` rather than `true`, the VMkernel still owns the
+device: reboot the host and the hook does the rest. The `created` line is so
+`uninstall.sh` knows to undo it; `auto-backup.sh` is what makes the setting
+survive a reboot. Nothing inside the VM is affected - the VMX is rewritten
+from the live address on every bootstrap, and the tools, the replay unit and
+the saved switch config never knew the address at all.
+
+**Since the bootstrap dated 2026-09-04 this is automatic**: `encs-esxi-bootstrap`
+finds the device by `11ab:be00`, and when its current address is not enabled
+for passthrough it runs exactly the commands above before attaching it. Only
+the `pending` case still needs a reboot, and the hook retries then anyway.
+If your copy on the datastore predates that, update it from
+`payload/opt/encs-esxi/` ([Install the tools properly](#install-the-tools-properly))
+or use the commands by hand.
 
 ---
 

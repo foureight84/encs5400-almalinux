@@ -137,6 +137,9 @@ host NIC, built in the first seconds of boot whether the ASIC is up or not.
 The GUESTS on it do: for the ~60-90s the switch takes to boot, that bridge
 forwards nothing.
 
+    encs-switch-vnet hostpci         is the bootstrap VM still pointed at the
+                                     Marvell? A BIOS/CIMC update can renumber
+                                     the PCI bus; --fix re-points hostpciN
     encs-switch-vnet startup         what needs changing, and why
     encs-switch-vnet startup --fix   apply it now
 
@@ -158,7 +161,8 @@ CONTENTS
   encs-switch-api              low-level XML API client for scripting
   encs-switch-vnet             VM <-> front-port networks (bridge + VLAN)
   encs-switch-replay.service   reapplies switch config after a cold boot
-  encs-switch-startup.service  fixes guest boot order before the guests start
+  encs-switch-startup.service  fixes the Marvell's hostpci address and guest
+                               boot order before the guests start
 
 THE TWO THINGS TO REMEMBER
 --------------------------

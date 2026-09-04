@@ -98,6 +98,32 @@ marvell() {
     ' | head -1
 }
 
+# Passthrough is enabled per PCI address, and a BIOS/CIMC update can renumber
+# the bus (2026-09-04: the Marvell moved 0d:00.0 -> 0e:00.0 and the boot hook
+# died here). The device is found by 11ab:be00, so make the flag follow it:
+# enable on the current address with --apply-now and record it next to the
+# bundle so uninstall.sh knows. "pending" means the VMkernel still owns the
+# device; only a host reboot fixes that, and the hook runs again then.
+passthru_state() {
+    esxcli hardware pci pcipassthru list 2>/dev/null \
+        | awk -v d="$1" '$1 == d { print $2; exit }'
+}
+ensure_passthru() {
+    dev=$1
+    case "$(passthru_state "$dev")" in
+        true) return 0 ;;
+    esac
+    log "$dev is not enabled for passthrough (PCI address changed?) - enabling"
+    esxcli hardware pci pcipassthru set --device-id="$dev" --enable=true --apply-now \
+        || die "could not enable passthrough on $dev"
+    echo "passthru $dev" >> "$HERE/created" 2>/dev/null
+    /sbin/auto-backup.sh >/dev/null 2>&1 || log "warning: auto-backup.sh failed - passthrough may not survive a reboot"
+    case "$(passthru_state "$dev")" in
+        true) log "passthrough enabled on $dev" ;;
+        *)    die "$dev passthrough is $(passthru_state "$dev"), not true - reboot the host; the hook will retry" ;;
+    esac
+}
+
 # VMX spelling of a BDF: "%05d:%03d:%02d.%d", all decimal (0000:0d:00.0 ->
 # 00000:013:00.0). $((0x..)) not awk strtonum(), which busybox awk lacks.
 pt_id() {
@@ -174,9 +200,7 @@ do_run() {
     fi
 
     DEV=$(marvell); [ -n "$DEV" ] || die "no 11ab:be00 device on this host"
-    esxcli hardware pci pcipassthru list 2>/dev/null \
-        | awk -v d="$DEV" '$1 == d && $2 == "true" { f=1 } END { exit !f }' \
-        || die "$DEV is not enabled for passthrough - run install.sh --yes first"
+    ensure_passthru "$DEV"
 
     case "$(vm_state "$ID")" in
         on) log "$VM is running; powering it off to change roles"; power_off "$ID"; sleep 3 ;;

@@ -664,6 +664,54 @@ def bootstrap_vmid():
     return None
 
 
+ENCS_PRODUCT_B64 = "RU5DUzU0MTIvSzk="          # 'ENCS5412/K9'
+HOSTPCI_RE = re.compile(r"^(hostpci\d+):\s*(?:0000:)?([0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])(.*)$",
+                        re.M | re.I)
+
+
+def marvell_bdf():
+    """Where the switch ASIC is on the bus right now, e.g. '0e:00.0'."""
+    rc, out = run(["lspci", "-d", "11ab:be00"])
+    if rc != 0 or not out.strip():
+        return None
+    bdf = out.split()[0]
+    return bdf.split(":", 1)[1] if bdf.count(":") > 1 else bdf
+
+
+def hostpci_plan():
+    """The hostpci line that has to move, if any. (vmid, key, old, new, opts) or None.
+
+    hostpciN names a PCI address, and the address is not a property of the
+    device: a BIOS or CIMC update can renumber the bus (2026-09-04: 0d:00.0
+    became 0e:00.0 on ESXi after the 3.2(14.27) update). Then qm start fails
+    with "no PCI device", or worse, the old address now belongs to some other
+    device and the VM gets that instead. bootstrap_vmid() matches the live
+    address and so finds nothing. The bootstrap VM is then recognised by the
+    other thing it must have: the ENCS platform gate in smbios1, which the
+    README makes every setup add. Exactly one such VM, or nothing is touched.
+    """
+    new = marvell_bdf()
+    if not new or bootstrap_vmid():
+        return None
+    found = []
+    for conf in sorted(glob.glob(os.path.join(VMCONF, "*.conf"))):
+        text = read(conf).split("\n[", 1)[0]
+        if not re.search(rf"^smbios1:.*product={ENCS_PRODUCT_B64}", text, re.M):
+            continue
+        m = HOSTPCI_RE.search(text)
+        if m:
+            found.append((os.path.basename(conf)[:-5], m.group(1),
+                          m.group(2).lower(), new.lower(), m.group(3)))
+    if len(found) != 1:
+        return None
+    return found[0]
+
+
+def fix_hostpci(plan):
+    vmid, key, old, new, opts = plan
+    return run(["qm", "set", vmid, f"--{key}", f"0000:{new}{opts}"])
+
+
 def parse_startup(s):
     """'order=2,up=90' -> {'order': '2', 'up': '90'}. Order may be bare."""
     out = {}
@@ -1300,10 +1348,25 @@ def cmd_startup(args):
     cause is two layers away from where it shows.
     """
     require_host_paths("startup", IFACES, VMCONF)
+    quiet = getattr(args, "quiet", False)
+    # First: does the bootstrap VM still point at the ASIC? Boot ordering is
+    # moot if qm start is going to fail on a stale PCI address.
+    hp = hostpci_plan()
+    if hp:
+        vmid, key, old, new, _ = hp
+        if quiet or args.fix:
+            rc, out = fix_hostpci(hp)
+            print(f"VM {vmid}: {key} {old} -> {new} (the Marvell moved on the "
+                  f"PCI bus)" if rc == 0
+                  else f"VM {vmid}: {key} FAILED {out.strip()}")
+        else:
+            say("Passthrough")
+            warn(f"VM {vmid}: {key} names {old} but the Marvell is at {new} "
+                 f"- the VM will not start. Re-run with --fix, or:")
+            print(f"      qm set {vmid} --{key} 0000:{new}")
     boot = bootstrap_vmid()
     ours = our_bridges()
     vms = vm_inventory()
-    quiet = getattr(args, "quiet", False)
     if quiet:
         # Runs on every boot from encs-switch-startup.service. A journal
         # entry per boot saying "nothing to do" is noise that trains people
@@ -1347,6 +1410,37 @@ def cmd_startup(args):
         print(f"  VM {vmid}: " + (f"{GREEN}set to {want}{OFF}" if rc == 0
                                   else f"{RED}failed{OFF} {out.strip()}"))
     return 0
+
+
+def cmd_hostpci(args):
+    """Is the bootstrap VM's hostpci line still where the Marvell is?"""
+    require_host_paths("hostpci", VMCONF)
+    say("Passthrough")
+    new = marvell_bdf()
+    if not new:
+        warn("no 11ab:be00 device on this host - is this the ENCS?")
+        return 1
+    boot = bootstrap_vmid()
+    if boot:
+        print(f"  VM {boot} has the Marvell at 0000:{new} - {GREEN}ok{OFF}")
+        return 0
+    hp = hostpci_plan()
+    if not hp:
+        warn(f"the Marvell is at 0000:{new} but no VM passes it through, and "
+             f"no single VM with the ENCS smbios1 gate has a hostpci line to "
+             f"move. Set it by hand:")
+        print(f"      qm set <vmid> --hostpci0 0000:{new}")
+        return 1
+    vmid, key, old, new, _ = hp
+    print(f"  VM {vmid}: {key} names {old}, the Marvell is at {new}")
+    if not args.fix:
+        print(f"\n  Nothing changed. Re-run with --fix, or by hand:")
+        print(f"      qm set {vmid} --{key} 0000:{new}")
+        return 0
+    rc, out = fix_hostpci(hp)
+    print(f"  VM {vmid}: " + (f"{GREEN}{key} -> 0000:{new}{OFF}" if rc == 0
+                              else f"{RED}failed{OFF} {out.strip()}"))
+    return 0 if rc == 0 else 1
 
 
 def cmd_add(args):
@@ -1570,6 +1664,12 @@ def main():
                    help="say nothing unless something changed (used by "
                         "encs-switch-startup.service at boot)")
     s.set_defaults(fn=cmd_startup)
+
+    s = sub.add_parser("hostpci",
+                       help="re-point the bootstrap VM at the Marvell if the "
+                            "PCI address changed")
+    s.add_argument("--fix", action="store_true", help="apply it with qm set")
+    s.set_defaults(fn=cmd_hostpci)
 
     s = sub.add_parser("add", help="put front ports in a VLAN for VMs")
     s.add_argument("vlan")

@@ -15,6 +15,11 @@
 # It changes nothing until a guest actually depends on one of these bridges:
 # the delay postpones every later guest, so an unused bridge costs no one 90s.
 #
+# It also checks that the bootstrap VM's hostpci line still names the address
+# the Marvell has now. A BIOS or CIMC update can renumber the PCI bus, and a
+# stale address means qm start fails - or passes through whatever device
+# landed there instead. encs-switch-vnet re-points it (see "hostpci").
+#
 # To opt out:  systemctl disable encs-switch-startup
 # To see what it would do:  encs-switch-vnet startup
 Description=Fix guest boot order for the ENCS switch bridges
