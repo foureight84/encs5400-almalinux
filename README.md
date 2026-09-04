@@ -20,37 +20,20 @@ firmware on your machine to produce a bootable image.
 MAC learning, 10 G backplane, and **802.3bt PoE** (a class-5 AP powered up and
 linked over a port enabled purely through the API).
 
-**New here:** [Requirements](#requirements) then
-[Build the image](#build-the-image). If you want to know why the LAN ports need
-any of this in the first place, that is [How it works](#how-it-works).
+**New here:** [Requirements](#requirements) → [Build the image](#build-the-image)
+→ [Deploy on Proxmox](#deploying-on-proxmox) or [ESXi](#deploying-on-esxi).
+Why the LAN ports need any of this is [How it works](#how-it-works).
 
 ---
 
 ## Contents
 
-**Getting it running**
-[Requirements](#requirements) ·
-[Build the image](#build-the-image) ·
-[Deploy on Proxmox](#deploying-on-proxmox) ·
-[Deploy on ESXi](#deploying-on-esxi)
-
-**Using it**
-[Managing the switch](#managing-the-switch) ·
-[VMs on the front ports](#putting-vms-on-the-front-lan-ports-the-nfvis-lan-net-model) ·
-[Link aggregation](#link-aggregation-lag--port-channel) ·
-[Updating the tools](#updating-the-host-tools) ·
-[The front panel](#the-front-panel) ·
-[Credentials](#credentials)
-
-**Before you trust it**
-[Operational warnings](#operational-warnings) ·
-[What has not been tested](#what-has-not-been-tested)
-
-**Why any of this is necessary**
-[How it works](#how-it-works) ·
-[Repository layout](#repository-layout) ·
-[Legal](#legal) ·
-[Credits](#credits)
+| | |
+|---|---|
+| **Get it running** | [Requirements](#requirements) · [Build the image](#build-the-image) · [Deploy on Proxmox](#deploying-on-proxmox) · [Deploy on ESXi](#deploying-on-esxi) |
+| **Use it** | [Managing the switch](#managing-the-switch) · [Link aggregation](#link-aggregation-lag--port-channel) · [VMs on the front ports](#vms-on-the-front-lan-ports) · [Boot ordering](#boot-ordering) · [Updating the tools](#updating-the-host-tools) |
+| **Before you trust it** | [Operational warnings](#operational-warnings) · [What has not been tested](#what-has-not-been-tested) |
+| **Reference** | [The front panel](#the-front-panel) · [Credentials](#credentials) · [How it works](#how-it-works) · [Repository layout](#repository-layout) · [Legal](#legal) · [Credits](#credits) |
 
 ---
 
@@ -66,8 +49,9 @@ never appear. ENCS 5400 support ended at 4.15.x.
 
 Known-good: `Cisco_NFVIS-4.15.5-FC4.iso` (sha256 `36c7d642…`).
 
-**A Linux build host** with ~15 GB free and KVM (a VM install runs during the
-build). Dependencies:
+**An x86_64 Linux build host** with ~15 GB free and KVM — the qcow2 step
+installs AlmaLinux under QEMU, and `createrepo_c` has no Homebrew formula, so
+an arm64 Mac cannot build this at all. Dependencies:
 
 ```sh
 # Debian / Ubuntu
@@ -80,6 +64,9 @@ sudo dnf install -y libarchive xorriso createrepo_c qemu-kvm edk2-ovmf
 ```
 
 `build.sh` checks all of these up front and tells you exactly what is missing.
+On AlmaLinux 9 the check passes but two symlinks are still needed:
+`qemu-system-x86_64` → `/usr/libexec/qemu-kvm`, and
+`/usr/share/OVMF/OVMF_CODE.fd` → `../edk2/ovmf/OVMF_CODE.fd`.
 
 ---
 
@@ -223,7 +210,7 @@ before you answer. Saying no costs nothing: `encs-switch-vnet init` does the
 same thing whenever you want it, and you can equally build the bridge by hand.
 The prompt is skipped entirely when stdin is not a terminal, or with
 `ENCS_NO_VNET=1`, so an unattended install never rearranges the network on its
-own. See [below](#putting-vms-on-the-front-lan-ports-the-nfvis-lan-net-model).
+own. See [below](#vms-on-the-front-lan-ports).
 
 It is idempotent — safe to re-run, and it skips anything already in place. Once
 `swbr0` exists, re-running it leaves the network config alone entirely.
@@ -282,37 +269,34 @@ an interactive install if you want to choose the disk yourself, and rescue.
 
 ## Deploying on ESXi
 
-**[docs/ESXI.md](docs/ESXI.md) is the walkthrough.** It is **tested on
-hardware**: a real ENCS 5412 (`ENCS5412/K9`, FGL232931K9) running ESXi 8.0 U3,
-verified 2026-09-02 and in daily use since. The switch boots, survives VM
-death and host reboots, comes back on its own after a power cut via the boot
-hook, and its VLAN tables read back correctly. The mechanism is the same as on
-Proxmox — a passthrough VM pushing firmware into the ASIC over PCIe — but
-getting it to work on ESXi turned up eight bugs the Proxmox path never hit,
-all fixed and written up in the guide.
+**[docs/ESXI.md](docs/ESXI.md) is the walkthrough**, and it is **tested on
+hardware**: a real ENCS 5412 (`ENCS5412/K9`) under ESXi 8.0 U3, verified
+2026-09-02 and in daily use since. The switch boots, survives VM death and
+host reboots, comes back on its own after a power cut, and its VLAN tables
+read back correctly.
 
-The short version of what changes:
+The mechanism is the same as on Proxmox — a passthrough VM pushing firmware
+into the ASIC over PCIe — but ESXi changes where things live:
 
 | | Proxmox | ESXi |
 |---|---|---|
 | Passthrough | `hostpci0` | DirectPath I/O, possibly a `/etc/vmware/passthru.map` reset override |
 | Platform gate | `--smbios1 product=...` | `SMBIOS.reflectHost = "TRUE"` |
-| **The switch tools** | on the hypervisor | **inside the bootstrap VM** — ESXi has no bash, systemd or curses to run them |
+| **The switch tools** | on the hypervisor | **inside the VM** — ESXi has no bash, systemd or curses to run them |
 | `swbr0` (= NFVIS `lan-br`) | VLAN-aware bridge on the te2 NIC | a standard vSwitch whose only uplink is that vmnic |
 | `bridge=swbr0,tag=100` | | a portgroup with VLAN ID 100 |
-| Guest boot ordering | `--startup order=1,up=90` | autostart entry with a 90 s delay |
+| Coming back after a power cut | `onboot` + `encs-switch-startup.service` | `encs-esxi-bootstrap install-hook` |
 
-Everything switch-side — VLANs, PoE, LAG, mirroring, cold-boot replay — is
-unchanged, because it is the same client speaking the same XML API over the
-same VLAN. Only the machine it runs on moves.
+Two things are ESXi-only, and the guide covers both. The work splits across
+**two VM roles** — one with the Marvell passed through that bootstraps the
+ASIC, and one *without* it that runs the tools over the management VLAN. And
+the bootstrap VM is killed part-way by an IOMMU fault, which turns out not to
+matter: the firmware is already delivered and the ASIC finishes on its own.
+Bootstrap must run again after every host power-on **or reboot**; the boot
+hook does that unattended. Never boot a VM that still has the Marvell attached
+while the switch is up — that wedges the ASIC until AC is pulled.
 
-The guide grades every step by how much it can be trusted, and ends with a
-[revert procedure](docs/ESXI.md#reverting-everything) that puts the host back
-exactly as it was — it never touches `vSwitch0` or `vmk0`. Read that before
-starting rather than after.
-
-The automation ships in the tree alongside the guide (it was developed on the
-`experimental/esxi` branch, now merged):
+The automation ships in the tree:
 
 ```sh
 ./build.sh --esxi <nfvis.iso>      # also writes out/esxi/{vmdk,vmx,README}
@@ -321,46 +305,12 @@ ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh'        # plan
 ssh root@<esxi> 'sh /vmfs/volumes/datastore1/encs-esxi/install.sh --yes'  # apply
 ```
 
-`install.sh` does passthrough and networking and records everything it creates;
-`uninstall.sh` takes exactly that back out. `--esxi` is a last, separate build
-step — if the conversion fails you still have a working qcow2 and an untouched
-Proxmox path.
-
-`python3 scripts/66-test-esxi.py` runs both against a **fake `esxcli`** — the
-same trick `60-test-tui.py` uses on the TUI. It asserts that the dry run writes
-nothing, that install → uninstall is a bit-identical round trip, and that no
-write command ever names `vSwitch0`. The fake's output shapes and option names
-were checked against ESXi 8.0 U3 on a real 5412, and it runs with `PATH` cut
-down to what ESXi's `/bin` actually holds — the first real run found four bugs
-the earlier, more forgiving fake could not, and those are what that hardening
-is for.
-
-**This works on hardware.** Verified end to end on a real ENCS 5412 under
-ESXi 8.0 U3: the switch boots, stays up, and is fully manageable — VLAN tables
-and all. DirectPath I/O takes the Marvell with no `passthru.map` entry and
-`SMBIOS.reflectHost` gives the guest `ENCS5412/K9`.
-
-Two things differ from the Proxmox path. The work splits across **two VM
-roles** — one with the Marvell passed through that bootstraps the ASIC, and one
-*without* it that runs `encs-switch-tui` and friends over the management VLAN.
-And the bootstrap VM is killed part-way by an IOMMU fault, which turns out not
-to matter: the firmware is already delivered and the ASIC finishes on its own.
-
-Bootstrap has to run again after every host power-on **or reboot** — a warm
-reboot drops the switch, though it leaves the ASIC re-bootstrappable rather
-than wedged, so recovery is one VM run and not a site visit. Never boot a VM
-that still has the Marvell attached while the switch is up: that is the wedge
-case, and it does need AC pulled.
-
-It stays off `main` while that fault is unexplained.
-[docs/ESXI.md](docs/ESXI.md) grades every step, documents the fault, and
-carries the eight bugs the offline tests could not catch.
-
-Note the build host must be **x86_64 Linux with KVM**: the qcow2 step installs
-AlmaLinux under QEMU, and `createrepo_c` has no Homebrew formula, so an arm64
-Mac cannot build this at all. On AlmaLinux 9, `check_deps` passes but two
-symlinks are still needed — `qemu-system-x86_64` → `/usr/libexec/qemu-kvm`,
-and `/usr/share/OVMF/OVMF_CODE.fd` → `../edk2/ovmf/OVMF_CODE.fd`.
+`install.sh` does passthrough and networking and records everything it
+creates; `uninstall.sh` takes exactly that back out and never touches
+`vSwitch0` or `vmk0`. `--esxi` is a last, separate build step — if the
+conversion fails you still have a working qcow2. `python3 scripts/66-test-esxi.py`
+exercises both scripts against a fake `esxcli` whose output shapes were
+checked against the real host.
 
 ---
 
@@ -494,7 +444,12 @@ Cisco's `switch-confd` sent for `channel-group`. See
 [docs/CONFIG.md](docs/CONFIG.md) for the file format and
 [docs/FINDINGS.md](docs/FINDINGS.md) for how it was derived.
 
-### Putting VMs on the front LAN ports (the NFVIS `lan-net` model)
+---
+
+## VMs on the front LAN ports
+
+This is the NFVIS `lan-net` model: guest traffic leaves over the 10 G
+backplane into a VLAN that a front jack is also in.
 
 Out of the box a Proxmox VM lands on `vmbr0`, which is the **MGMT CPU** jack —
 so guest traffic shares the one interface you manage the hypervisor over. That
@@ -645,7 +600,9 @@ these bridges, the delay is taken back off, so an unused bridge stops costing
 every other guest 90 s. A delay you set yourself, to a different value, is
 never touched.
 
-### Updating the host tools
+---
+
+## Updating the host tools
 
 The switch tools on the hypervisor are **completely independent of the disk
 image**. The ISO and qcow2 only carry the bootstrap VM — kernel, Marvell
@@ -672,7 +629,7 @@ swaps each file in atomically. It only writes to `/usr/local/sbin`,
 config, the VLAN interface, or `/etc/encs-switch`. Roll back by copying the
 files back out of the backup directory.
 
-#### Updating by hand
+### Updating by hand
 
 If the host has no internet access, or you would rather see exactly what lands
 where, do it manually. **You do not need to rebuild the ISO or the qcow2 for
@@ -719,7 +676,84 @@ Nothing here restarts the bootstrap VM or touches the ASIC, so updating the
 tools is safe on a live switch. A running TUI keeps its old code until you
 quit and relaunch it.
 
-### What has not been tested
+---
+
+## Operational warnings
+
+**Never restart the bootstrap service, and avoid stopping the VM.**
+
+The loader can only bootstrap an ASIC in WFI (freshly reset). Cisco's state
+machine has no reset path — it waits for "an external task" that only exists on
+real NFVIS (the BMC). Re-running it against a live switch wedges it in
+`Service CPU not ready (requires reset?)`, and recovery requires **physical AC
+removal for ~30 s**. A CIMC power-off is *not* enough — the ASIC sits on
+standby power. The shipped unit therefore has `Restart=no`.
+
+**A wedged loader does not mean a dead switch.** The ASIC keeps forwarding.
+Judge switch health with `ping 169.254.1.0` or `encs-switch-tui --status`,
+never from that log line.
+
+**Config is volatile.** The ASIC has no flash.
+
+| Event | Config |
+|---|---|
+| VM restart / service restart | survives (no power cycle of the ASIC) |
+| cold power cycle / AC loss | **lost** — back to VLAN 1 + 2363, all ports shut, PoE off, LAGs empty |
+
+Save it (`encs-switch-tui`, `c`, `w`) into `/etc/encs-switch/*.xml` — those
+files are the switch's real source of truth, and `encs-switch-replay.service`
+reapplies them after a power loss. **[docs/CONFIG.md](docs/CONFIG.md)** covers
+the file format, the apply ordering, and every enum value, for when you want to
+hand-write one or keep them in version control.
+
+**Never update the kernel.** The Marvell module is built for exactly
+`4.18.0-513.18.2.el8_9` with `modversions` CRCs. The image pins `releasever`
+and excludes `kernel*`; if you defeat that, the switch dies silently.
+
+**`nfvis-fwupdate` is deliberately excluded.** It flashes BIOS/CIMC firmware,
+and newer NFVIS images reportedly lock the BIOS so F2 setup becomes
+unreachable — which would make PCI passthrough impossible to configure.
+
+**A BIOS or CIMC update can move the switch on the PCI bus.** Seen on the
+chassis on 2026-09-04: after updating CIMC to 3.2(14.27) and BIOS to 4.03 the Marvell went from
+`0000:0d:00.0` to `0000:0e:00.0`. The bootstrap VM's `hostpci0` line names the
+old address, so `qm start 900` fails with *no PCI device found* — or, worse, if
+another device now sits at the old address the VM gets that one instead. The
+VM, the tools and the saved config are untouched; only the hypervisor's binding
+of the ASIC to the VM is stale. Fix it the way the VM was created, so the
+address is never typed by hand:
+
+```sh
+lspci -d 11ab:be00                                              # where it is now
+qm set 900 --hostpci0 0000:$(lspci -d 11ab:be00 | cut -d' ' -f1) # keep any ,pcie=1 etc.
+qm start 900
+```
+
+If the switch was up before the reboot, the usual AC pull applies first.
+**Since the host tools dated 2026-09-04 this is automatic**:
+`encs-switch-startup.service` runs `encs-switch-vnet startup --fix` before
+`pve-guests` on every boot, and that now re-points `hostpciN` when the live
+address matches no VM — recognising the bootstrap VM by its `smbios1`
+platform gate. `encs-switch-vnet hostpci` shows the check on demand. Older
+installs use the commands above, then [update the host tools](#updating-the-host-tools).
+The same thing on ESXi is a per-address passthrough flag; see
+[docs/ESXI.md](docs/ESXI.md#after-a-bios-or-cimc-update-the-marvell-moves-on-the-pci-bus).
+
+**Front ports come up disabled (`admin DOWN`) with PoE off** after a bootstrap —
+that is the firmware default, and NFVIS's own init is what used to enable them.
+Open the Ports view and press `space`, or apply a saved config.
+
+**The TUI refuses to disable `te1`–`te4`.** Those are internal backplane ports
+with no front-panel jack, and the switch owns its end of each link — it will
+accept the shut. `te2` carries the management VLAN, so shutting it ends your
+session, and with no flash on the ASIC only a cold power cycle undoes it.
+Worse, the serdes stays trained regardless, so a shut backplane port still
+reports `link UP` and nothing on screen looks wrong. Enabling is always
+allowed; only shutting is blocked. Override with `ENCS_ALLOW_TE_SHUT=1`.
+
+---
+
+## What has not been tested
 
 Nothing here is known broken — it is unmeasured, and the missing piece is
 hardware rather than code. Grouped by what you would need:
@@ -737,8 +771,17 @@ hardware rather than code. Grouped by what you would need:
 > it, recoverable only by physical AC removal. Set `STPEnabled=2` on `te1`–`te4`
 > first, and do it with hands on the chassis.
 
-**Still not implemented.** Three of these are blocked on missing information
-rather than effort:
+What *has* been verified on hardware (2026-08-12): all 49 wcd tables read
+back as expected; VLAN isolation, port mirroring, PoE on two ports, speed
+forcing and live VLAN changes were confirmed on a real 5412 with two PoE
+devices attached; the duplex enums were resolved (`duplexAdminMode` and
+`duplexOperMode` are inverted relative to each other); and two ways to hang
+the ASIC were found and blocked. Full detail in
+[docs/FINDINGS.md §8n](docs/FINDINGS.md).
+
+### Not implemented
+
+Three of these are blocked on missing information rather than effort:
 
 | Area | Why |
 |---|---|
@@ -748,6 +791,15 @@ rather than effort:
 | MSTP instances | The client can write region, revision, instance priorities and instance→VLAN maps; there is no view. MSTP on an 8-port edge switch with one region is not worth the screen — use `encs-switch-api`. |
 | DSCP mutation/remark, per-port shaping, class/policy maps | The client can write all of them; there is no view. Reach them with `encs-switch-api`, or see [docs/CONFIG.md](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot). |
 | Port security | `InterfaceSecurityTable` templates exist, but the mode and violation enums were never pinned down. |
+
+`encs-switch-api` can drive anything the TUI does not. Whatever you configure
+that way is as volatile as the rest, so it needs its own file in
+`/etc/encs-switch/` to survive a power cycle — the replay service applies
+every `*.xml` there in filename order, and one file must hold exactly one
+table. Full detail with the ConfD paths is in
+[docs/CONFIG.md](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot).
+
+### The NIM slot
 
 **The NIM slot cannot be driven from the host — by any OS.** Extracting the
 CIMC firmware settles why: the FPGA that powers the slot (`dash_fpga`) is
@@ -761,21 +813,9 @@ device, no PCI change, no SMBIOS change, no kernel event. Not a driver
 problem, and not fixable from Proxmox or NFVIS. See
 [docs/FINDINGS.md §8m](docs/FINDINGS.md).
 
-`encs-switch-api` can drive anything the TUI does not. Whatever you configure
-that way is as volatile as the rest, so it needs its own file in
-`/etc/encs-switch/` to survive a power cycle — the replay service applies
-every `*.xml` there in filename order, and one file must hold exactly one
-table. Full detail with the ConfD paths is in
-[docs/CONFIG.md](docs/CONFIG.md#what-nfvis-could-do-that-this-cannot).
+### Testing without the hardware
 
-**Verified on hardware (2026-08-12).** All 49 wcd tables read back as expected; VLAN isolation,
-port mirroring, PoE on two ports, speed forcing and live VLAN changes all confirmed on a real
-5412 with two PoE devices attached. The duplex enums were resolved (`duplexAdminMode` and
-`duplexOperMode` are inverted relative to each other), and two ways to hang the ASIC were found
-and blocked. Full detail in [docs/FINDINGS.md §8n](docs/FINDINGS.md).
-
-**Testing without the hardware.** `scripts/60-test-tui.py` runs the TUI
-against a fake switch — no network, no chassis. It checks that every view
+`scripts/60-test-tui.py` runs the TUI against a fake switch — no network, no chassis. It checks that every view
 fetches and renders (including at 40 columns and with tables missing), that
 every write produces the element names `switch-confd` used, that config
 save/replay round-trips in dependency order, and that cancelling a prompt
@@ -889,81 +929,6 @@ wider network.
 
 ---
 
-## Operational warnings
-
-**Never restart the bootstrap service, and avoid stopping the VM.**
-
-The loader can only bootstrap an ASIC in WFI (freshly reset). Cisco's state
-machine has no reset path — it waits for "an external task" that only exists on
-real NFVIS (the BMC). Re-running it against a live switch wedges it in
-`Service CPU not ready (requires reset?)`, and recovery requires **physical AC
-removal for ~30 s**. A CIMC power-off is *not* enough — the ASIC sits on
-standby power. The shipped unit therefore has `Restart=no`.
-
-**A wedged loader does not mean a dead switch.** The ASIC keeps forwarding.
-Judge switch health with `ping 169.254.1.0` or `encs-switch-tui --status`,
-never from that log line.
-
-**Config is volatile.** The ASIC has no flash.
-
-| Event | Config |
-|---|---|
-| VM restart / service restart | survives (no power cycle of the ASIC) |
-| cold power cycle / AC loss | **lost** — back to VLAN 1 + 2363, all ports shut, PoE off, LAGs empty |
-
-Save it (`encs-switch-tui`, `c`, `w`) into `/etc/encs-switch/*.xml` — those
-files are the switch's real source of truth, and `encs-switch-replay.service`
-reapplies them after a power loss. **[docs/CONFIG.md](docs/CONFIG.md)** covers
-the file format, the apply ordering, and every enum value, for when you want to
-hand-write one or keep them in version control.
-
-**Never update the kernel.** The Marvell module is built for exactly
-`4.18.0-513.18.2.el8_9` with `modversions` CRCs. The image pins `releasever`
-and excludes `kernel*`; if you defeat that, the switch dies silently.
-
-**`nfvis-fwupdate` is deliberately excluded.** It flashes BIOS/CIMC firmware,
-and newer NFVIS images reportedly lock the BIOS so F2 setup becomes
-unreachable — which would make PCI passthrough impossible to configure.
-
-**A BIOS or CIMC update can move the switch on the PCI bus.** Seen on the
-chassis on 2026-09-04: after updating CIMC to 3.2(14.27) and BIOS to 4.03 the Marvell went from
-`0000:0d:00.0` to `0000:0e:00.0`. The bootstrap VM's `hostpci0` line names the
-old address, so `qm start 900` fails with *no PCI device found* — or, worse, if
-another device now sits at the old address the VM gets that one instead. The
-VM, the tools and the saved config are untouched; only the hypervisor's binding
-of the ASIC to the VM is stale. Fix it the way the VM was created, so the
-address is never typed by hand:
-
-```sh
-lspci -d 11ab:be00                                              # where it is now
-qm set 900 --hostpci0 0000:$(lspci -d 11ab:be00 | cut -d' ' -f1) # keep any ,pcie=1 etc.
-qm start 900
-```
-
-If the switch was up before the reboot, the usual AC pull applies first.
-**Since the host tools dated 2026-09-04 this is automatic**:
-`encs-switch-startup.service` runs `encs-switch-vnet startup --fix` before
-`pve-guests` on every boot, and that now re-points `hostpciN` when the live
-address matches no VM — recognising the bootstrap VM by its `smbios1`
-platform gate. `encs-switch-vnet hostpci` shows the check on demand. Older
-installs use the commands above, then [update the host tools](#updating-the-host-tools).
-The same thing on ESXi is a per-address passthrough flag; see
-[docs/ESXI.md](docs/ESXI.md#after-a-bios-or-cimc-update-the-marvell-moves-on-the-pci-bus).
-
-**Front ports come up disabled (`admin DOWN`) with PoE off** after a bootstrap —
-that is the firmware default, and NFVIS's own init is what used to enable them.
-Open the Ports view and press `space`, or apply a saved config.
-
-**The TUI refuses to disable `te1`–`te4`.** Those are internal backplane ports
-with no front-panel jack, and the switch owns its end of each link — it will
-accept the shut. `te2` carries the management VLAN, so shutting it ends your
-session, and with no flash on the ASIC only a cold power cycle undoes it.
-Worse, the serdes stays trained regardless, so a shut backplane port still
-reports `link UP` and nothing on screen looks wrong. Enabling is always
-allowed; only shutting is blocked. Override with `ENCS_ALLOW_TE_SHUT=1`.
-
----
-
 ## How it works
 
 ### The problem this solves
@@ -1009,16 +974,13 @@ Three separate paths, which is the key to understanding everything else:
 | **Management** | Proxmox host | HTTPS XML API on `169.254.1.0` over VLAN 2363 |
 
 The VM is *infrastructure*, not a data-plane element — 2 vCPU / **384 MB** is
-enough. It idles at 150 MB; what sets the floor is the firmware. Under OVMF
-(Proxmox, and the build's own verify boot) the kernel's EFI stub cannot find
-room below 320 MB — `Failed to allocate usable memory for kernel` at 288 and
-256, measured 2026-09-03 — so 384 is the floor plus one step. (ESXi's firmware
-manages 256; see `docs/ESXI.md`.) Do not hand it 2 GB out of habit: with
-passthrough the whole allocation is pinned. With passthrough the whole
-allocation is pinned, so do not hand it 2 GB out of habit — that is 2 GB the host
-never gets back. The same figure applies on ESXi; see `docs/ESXI.md`.
-Sizing is independent of switch throughput. Management deliberately lives on the host,
-because the backplane NIC does.
+enough, and sizing is independent of switch throughput. It idles at 150 MB;
+the floor is set by the firmware: under OVMF (Proxmox, and the build's own
+verify boot) the kernel's EFI stub cannot find room below 320 MB, so 384 is
+the floor plus one step. ESXi's firmware manages 256 — see `docs/ESXI.md`.
+Do not hand it 2 GB out of habit: with passthrough the whole allocation is
+pinned, and that is 2 GB the host never gets back. Management deliberately
+lives on the host, because the backplane NIC does.
 
 ---
 
