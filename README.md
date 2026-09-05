@@ -79,14 +79,14 @@ ROOT_PASSWORD='pick-something' ./build.sh ~/Cisco_NFVIS-4.15.5-FC4.iso
 ```
 
 No git? Every [release](https://github.com/foureight84/encs5400-almalinux/releases)
-also carries `encs-builder-<ver>.tar.gz`, the same tree without the history:
+also carries `encs-image-builder-<ver>.tar.gz`, the same tree without the history:
 
 ```sh
 V=0.2.4
-curl -fsSLO https://github.com/foureight84/encs5400-almalinux/releases/download/v$V/encs-builder-$V.tar.gz
+curl -fsSLO https://github.com/foureight84/encs5400-almalinux/releases/download/v$V/encs-image-builder-$V.tar.gz
 curl -fsSLO https://github.com/foureight84/encs5400-almalinux/releases/download/v$V/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing     # must print OK
-tar xzf encs-builder-$V.tar.gz && cd encs-builder-$V
+tar xzf encs-image-builder-$V.tar.gz && cd encs-image-builder-$V
 ROOT_PASSWORD='pick-something' ./build.sh ~/Cisco_NFVIS-4.15.5-FC4.iso
 ```
 
@@ -1121,7 +1121,7 @@ A release carries two tarballs and one `SHA256SUMS`:
 | Asset | What | Who fetches it |
 |---|---|---|
 | `encs-host-<ver>.tar.gz` | the hypervisor-side tools, with a `MANIFEST` | `encs-switch-tui --update`, or by hand |
-| `encs-builder-<ver>.tar.gz` | this tree: `build.sh`, `scripts/`, `kickstart/`, `payload/`, `docs/` | anyone building the ISO/qcow2 without git |
+| `encs-image-builder-<ver>.tar.gz` | this tree: `build.sh`, `scripts/`, `kickstart/`, `payload/`, `docs/` | anyone building the ISO/qcow2 without git |
 
 Neither contains anything from a Cisco ISO; the builder extracts that from
 the ISO you supply, on your machine. One version number covers both — bump

@@ -2065,7 +2065,7 @@ def do_update(force=False, say_=print):
         return None
     say_(f"updating {VERSION} -> {tag}")
 
-    # Releases also carry encs-builder-<ver>.tar.gz (the image build tree),
+    # Releases also carry encs-image-builder-<ver>.tar.gz (the image build tree),
     # which is not for the host: pick the host bundle by name.
     tarname = next((n for n in assets
                     if n.startswith("encs-host-") and n.endswith(".tar.gz")), None)

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Cut a GitHub release: the HYPERVISOR-side tools (encs-host-<ver>.tar.gz,
 # what encs-switch-tui --update installs) and the image build tree
-# (encs-builder-<ver>.tar.gz: build.sh, scripts/, kickstart/, payload/, docs -
+# (encs-image-builder-<ver>.tar.gz: build.sh, scripts/, kickstart/, payload/, docs -
 # everything needed to build the ISO/qcow2 without a git checkout).
 #
 #   ./scripts/release.sh            # build the tarballs into out/, do not publish
@@ -99,7 +99,7 @@ COPYFILE_DISABLE=1 tar -C "$OUT" --numeric-owner --owner=0 --group=0 \
 rm -rf "$STAGE"
 
 # --- the builder: the tree minus build outputs, Cisco material and git ----
-BNAME="encs-builder-$VER"
+BNAME="encs-image-builder-$VER"
 BSTAGE="$OUT/$BNAME"
 BTARBALL="$OUT/$BNAME.tar.gz"
 rm -rf "$BSTAGE"; mkdir -p "$BSTAGE"
@@ -180,8 +180,9 @@ git -C "$ROOT" tag -a "$TAG" -m "encs-host $VER"
 git -C "$ROOT" push origin "$TAG"
 
 say "Creating the GitHub release"
-# Host tarball FIRST: a pre-0.2.4 --update takes the first .tar.gz asset it
-# sees, and GitHub lists assets in upload order.
+# A pre-0.2.4 --update takes the first .tar.gz asset it sees, and GitHub
+# lists assets by name - which is why the builder is "encs-image-builder"
+# (sorts after "encs-host"), not "encs-builder".
 gh release create "$TAG" "$TARBALL" "$BTARBALL" "$SUMS" \
     --repo "$(git -C "$ROOT" remote get-url origin \
               | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$##')" \
@@ -194,7 +195,7 @@ Install or upgrade an existing host:
 
 First install: see README.md.
 
-encs-builder-$VER.tar.gz is the image build tree (build.sh, kickstart,
+encs-image-builder-$VER.tar.gz is the image build tree (build.sh, kickstart,
 scripts, payload, docs) for building the installer ISO and qcow2 from your
 own Cisco NFVIS ISO - no git checkout needed. No Cisco software is included
 in this release."
