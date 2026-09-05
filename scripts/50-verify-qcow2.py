@@ -31,6 +31,11 @@ CHECKS = [
     # EFI the same image boots at 256.
     ("memory: this VM's size, and what is left",
      "free -m | sed -n '1,2p'"),
+    ("firmware this boot came up under, and both boot paths present",
+     "[ -d /sys/firmware/efi ] && echo EFI || echo BIOS; "
+     "ls /boot/efi/EFI/almalinux/grubx64.efi /boot/grub2/i386-pc/core.img 2>&1 | sed 's/^/  /'; "
+     "grep -oE 'crashkernel=[^ ]*|resume=[^ ]*' /boot/loader/entries/*.conf || echo '  no crashkernel/resume args'; "
+     "systemctl is-enabled polkit tuned 2>&1 | tr '\\n' ' '; echo"),
     ("initramfs: must be the slim one (well under 32 MB) with LVM and both "
      "hypervisors' drivers in it",
      "ls -la /boot/initramfs-$(uname -r).img | awk '{printf \"%d MB\\n\", $5/1048576}'; "
@@ -81,20 +86,28 @@ def main():
         copy = os.path.join(tmp, "disk.qcow2")
         varsf = os.path.join(tmp, "OVMF_VARS.fd")
         shutil.copy2(img, copy)
-        shutil.copy2(ovmf("OVMF_VARS"), varsf)
+        if os.environ.get("VERIFY_BIOS", "seabios") == "ovmf":
+            shutil.copy2(ovmf("OVMF_VARS"), varsf)
 
         accel = "kvm" if os.access("/dev/kvm", os.R_OK | os.W_OK) else "tcg"
         # -cpu host is KVM-only; TCG rejects it outright, so fall back to 'max'.
         cpumodel = "host" if accel == "kvm" else "max"
+        # VERIFY_BIOS=seabios (default) boots the BIOS GRUB in the biosboot
+        # partition at 256 MB - the Proxmox shipping configuration, and the
+        # regression test for the memory floor as much as for the image.
+        # VERIFY_BIOS=ovmf boots the EFI path instead, at 384: OVMF's EFI
+        # stub cannot place the kernel below that (Proxmox's edk2 fails at
+        # 320, "Failed to allocate usable memory for kernel"), whatever the
+        # initramfs size; VMware's EFI manages 256. VERIFY_MEM overrides.
+        bios = os.environ.get("VERIFY_BIOS", "seabios")
+        if bios == "ovmf":
+            fw = ["-drive", f"if=pflash,format=raw,readonly=on,file={ovmf('OVMF_CODE')}",
+                  "-drive", f"if=pflash,format=raw,file={varsf}"]
+            mem = os.environ.get("VERIFY_MEM", "384")
+        else:
+            fw, mem = [], os.environ.get("VERIFY_MEM", "256")
         cmd = ["qemu-system-x86_64", "-machine", f"q35,accel={accel}",
-               # 384 MB, the Proxmox shipping size: this boot runs under OVMF,
-               # and is the regression test for the memory floor as much as
-               # for the image. OVMF's EFI stub cannot place the kernel below
-               # 320 ("Failed to allocate usable memory for kernel" at 288),
-               # whatever the initramfs size. VERIFY_MEM overrides.
-               "-cpu", cpumodel, "-smp", "4", "-m", os.environ.get("VERIFY_MEM", "384"),
-               "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf('OVMF_CODE')}",
-               "-drive", f"if=pflash,format=raw,file={varsf}",
+               "-cpu", cpumodel, "-smp", "4", "-m", mem, *fw,
                "-drive", f"file={copy},format=qcow2,if=virtio",
                "-smbios", "type=1,manufacturer=Cisco,product=ENCS5412/K9",
                "-display", "none", "-serial", "stdio", "-no-reboot"]
@@ -128,7 +141,7 @@ def main():
             p.stdin.write((s + "\n").encode())
             p.stdin.flush()
 
-        print(f"== booting {os.path.basename(img)} (accel={accel}, cpu={cpumodel}) ==", flush=True)
+        print(f"== booting {os.path.basename(img)} ({bios}, {mem} MB, accel={accel}, cpu={cpumodel}) ==", flush=True)
         if wait_for(r"login:", 300) is None:
             with lock:
                 sys.stdout.write(buf[-3000:].decode("utf8", "replace"))

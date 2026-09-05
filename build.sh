@@ -19,6 +19,10 @@ usage: $0 [options] <nfvis.iso>
   --esxi            also emit an ESXi VMDK + .vmx from the qcow2 (experimental)
   --full            keep every package (2.7GB ISO instead of ~1.6GB)
   --no-verify       skip the post-build boot verification
+  --firmware X      which VM firmware to verify and print setup for:
+                    seabios (256 MB), ovmf (384 MB) or both (default).
+                    One qcow2 boots either way - this only picks the
+                    verify boots and the qm commands shown at the end.
   --out DIR         output directory (default: ./out)
   --work DIR        scratch directory (default: ./work)
 
@@ -34,7 +38,7 @@ EOF
 }
 
 OUT_DIR="$HERE/out"; WORK_DIR="$HERE/work"
-DO_ISO=1; DO_QCOW=1; DO_VERIFY=1; DO_ESXI=0; MODE=""
+DO_ISO=1; DO_QCOW=1; DO_VERIFY=1; DO_ESXI=0; MODE=""; FIRMWARE="both"
 ISO=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -43,6 +47,10 @@ while [ $# -gt 0 ]; do
         --full)       MODE="--full" ;;
         --no-verify)  DO_VERIFY=0 ;;
         --esxi)       DO_ESXI=1 ;;
+        --firmware)   [ $# -ge 2 ] || die "--firmware needs seabios, ovmf or both"
+                      case "$2" in seabios|ovmf|both) FIRMWARE="$2" ;;
+                          *) die "--firmware: seabios, ovmf or both (not '$2')" ;; esac
+                      shift ;;
         --out)        [ $# -ge 2 ] || die "--out needs a directory"
                       OUT_DIR="$2"; shift ;;
         --work)       [ $# -ge 2 ] || die "--work needs a directory"
@@ -82,8 +90,17 @@ if [ "$DO_QCOW" -eq 1 ]; then
         # "Marvell not visible / mv_pciboot not loaded" lines are EXPECTED (no
         # switch is attached to the test VM) and do not affect its exit code.
         # Shipping an unbootable image with exit 0 would be worse than noisy.
-        python3 "$HERE/scripts/50-verify-qcow2.py" "$BUILT_QCOW" "${ROOT_PASSWORD:-encs}" \
-            || die "the built image failed boot verification - see output above"
+        # The image is hybrid (BIOS GRUB + EFI GRUB on one disk). By default
+        # both paths are booted: SeaBIOS at 256 MB (the Proxmox shipping
+        # size) and OVMF at 384 (its floor; ESXi's own EFI does 256).
+        case "$FIRMWARE" in seabios|both)
+            VERIFY_BIOS=seabios python3 "$HERE/scripts/50-verify-qcow2.py" "$BUILT_QCOW" "${ROOT_PASSWORD:-encs}" \
+                || die "the built image failed boot verification under SeaBIOS - see output above" ;;
+        esac
+        case "$FIRMWARE" in ovmf|both)
+            VERIFY_BIOS=ovmf python3 "$HERE/scripts/50-verify-qcow2.py" "$BUILT_QCOW" "${ROOT_PASSWORD:-encs}" \
+                || die "the built image failed boot verification under OVMF - see output above" ;;
+        esac
     fi
 fi
 
@@ -100,6 +117,33 @@ fi
 say "Artifacts in $OUT_DIR"
 ls -la "$OUT_DIR"
 
+# The same qcow2 boots under either firmware; only the VM definition differs.
+qm_snippet() {
+    case "$1" in
+        seabios) cat <<EOF
+   SeaBIOS, 256 MB (recommended - the smallest the VM can be on Proxmox):
+
+     qm create 900 --name encs-switch --machine q35 --bios seabios \\
+         --memory 256 --cores 2 --net0 virtio,bridge=vmbr0 \\
+         --serial0 socket --vga serial0
+     qm importdisk 900 $(basename "$BUILT_QCOW") local-lvm
+     qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
+EOF
+        ;;
+        ovmf) cat <<EOF
+   OVMF (UEFI), 384 MB (Proxmox's OVMF cannot place the kernel below that):
+
+     qm create 900 --name encs-switch --machine q35 --bios ovmf \\
+         --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \\
+         --serial0 socket --vga serial0
+     qm importdisk 900 $(basename "$BUILT_QCOW") local-lvm
+     qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
+     qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
+EOF
+        ;;
+    esac
+}
+
 cat <<EOF
 
 Next steps
@@ -108,12 +152,12 @@ Next steps
 
      scp $OUT_DIR/$(basename "$BUILT_QCOW") root@<proxmox>:/root/
 
-     qm create 900 --name encs-switch --machine q35 --bios ovmf \\
-         --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \\
-         --serial0 socket --vga serial0
-     qm importdisk 900 $(basename "$BUILT_QCOW") local-lvm
-     qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
-     qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
+EOF
+case "$FIRMWARE" in seabios|both) qm_snippet seabios; echo ;; esac
+case "$FIRMWARE" in ovmf|both)    qm_snippet ovmf;    echo ;; esac
+cat <<EOF
+   then, either way:
+
      qm set 900 --boot order=virtio0
      qm set 900 --smbios1 product=\$(echo -n 'ENCS5412/K9' | base64),base64=1
      qm set 900 --hostpci0 0000:\$(lspci -d 11ab:be00 | cut -d' ' -f1)

@@ -78,6 +78,18 @@ cd encs5400-almalinux
 ROOT_PASSWORD='pick-something' ./build.sh ~/Cisco_NFVIS-4.15.5-FC4.iso
 ```
 
+No git? Every [release](https://github.com/foureight84/encs5400-almalinux/releases)
+also carries `encs-builder-<ver>.tar.gz`, the same tree without the history:
+
+```sh
+V=0.2.4
+curl -fsSLO https://github.com/foureight84/encs5400-almalinux/releases/download/v$V/encs-builder-$V.tar.gz
+curl -fsSLO https://github.com/foureight84/encs5400-almalinux/releases/download/v$V/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing     # must print OK
+tar xzf encs-builder-$V.tar.gz && cd encs-builder-$V
+ROOT_PASSWORD='pick-something' ./build.sh ~/Cisco_NFVIS-4.15.5-FC4.iso
+```
+
 Roughly 15 minutes. You get:
 
 | Artifact | Size | Use |
@@ -89,11 +101,18 @@ Both are covered below: [importing the qcow2](#deploying-on-proxmox) and
 [installing from the ISO](#alternative-install-from-the-iso-instead).
 
 Options: `--iso-only`, `--qcow2-only`, `--full` (skip package trimming),
-`--no-verify`, `--out DIR`, `--work DIR`.
+`--no-verify`, `--firmware seabios|ovmf|both`, `--out DIR`, `--work DIR`.
 
 The build ends by **booting the image it just made** and asserting the
 post-install state. That is deliberate — earlier revisions produced images
 that installed perfectly and silently never started the switch.
+
+**One image, two firmwares.** The qcow2 carries both a BIOS GRUB and an EFI
+GRUB, so the same file runs as a SeaBIOS VM at **256 MB** or an OVMF (UEFI)
+VM at **384 MB** — there is nothing separate to build. By default the
+verification boots it both ways; `--firmware seabios` or `--firmware ovmf`
+verifies only that one and prints only that one's `qm` commands at the end.
+Which to pick is [below](#seabios-or-ovmf).
 
 ---
 
@@ -130,6 +149,32 @@ On Proxmox 8 (kernel 6.8) it is usually on already.
 
 **2. Import the VM**
 
+<a id="seabios-or-ovmf"></a>
+The same qcow2 boots under either firmware. Pick one:
+
+| | SeaBIOS (recommended) | OVMF / UEFI |
+|---|---|---|
+| Memory | **256 MB** | **384 MB** |
+| Extra disk | none | a 4 MB `efidisk0` |
+| Why | smallest footprint; nothing else differs | if you need UEFI for your own reasons |
+
+With a passthrough device Proxmox pins the VM's whole allocation, so the
+128 MB between them is host memory you never get back. The floor is set by
+the firmware, not the guest: Proxmox's OVMF cannot place the kernel below 384
+([How it works](#how-it-works)); SeaBIOS boots the very same image at 256.
+
+*SeaBIOS, 256 MB:*
+
+```sh
+qm create 900 --name encs-switch --machine q35 --bios seabios \
+    --memory 256 --cores 2 --net0 virtio,bridge=vmbr0 \
+    --serial0 socket --vga serial0
+qm importdisk 900 AlmaLinux-8.9-ENCS5400-switch.qcow2 local-lvm
+qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
+```
+
+*OVMF, 384 MB:*
+
 ```sh
 qm create 900 --name encs-switch --machine q35 --bios ovmf \
     --memory 384 --cores 2 --net0 virtio,bridge=vmbr0 \
@@ -137,6 +182,11 @@ qm create 900 --name encs-switch --machine q35 --bios ovmf \
 qm importdisk 900 AlmaLinux-8.9-ENCS5400-switch.qcow2 local-lvm
 qm set 900 --scsihw virtio-scsi-pci --virtio0 local-lvm:vm-900-disk-0
 qm set 900 --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0
+```
+
+*Then, either way:*
+
+```sh
 qm set 900 --boot order=virtio0
 qm set 900 --smbios1 product=RU5DUzU0MTIvSzk=,base64=1   # 'ENCS5412/K9'
 qm set 900 --hostpci0 0000:$(lspci -d 11ab:be00 | cut -d' ' -f1)
@@ -144,14 +194,16 @@ qm set 900 --onboot 1 --startup order=1
 qm start 900
 ```
 
-384 MB is verified; `--memory 512` if you want a margin above the firmware
-floor — see [How it works](#how-it-works). Two things that will otherwise
-waste your afternoon:
+Switching an existing VM between the two is one line each way — the disk
+does not change: `qm set 900 --bios seabios --delete efidisk0 --memory 256`,
+or `qm set 900 --bios ovmf --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0 --memory 384`.
+
+Two things that will otherwise waste your afternoon:
 
 - **SMBIOS must be base64.** `switch-confd` gates on
   `dmidecode -s system-product-name` matching `ENCS5412/K9`, and the `/` breaks
   Proxmox's SMBIOS parser. `RU5DUzU0MTIvSzk=` is that string base64-encoded.
-- **`pre-enrolled-keys=0`.** The image expects Secure Boot off.
+- **Secure Boot off** on the OVMF route: `pre-enrolled-keys=0`.
 
 **3. Watch it boot** (`qm terminal 900`, login `root`)
 
@@ -244,10 +296,16 @@ fix the boot order:
 
 ```sh
 qm set 900 --ide2 none --boot order=virtio0
+qm set 900 --bios seabios --delete efidisk0 --memory 256   # see below
 qm set 900 --hostpci0 0000:$(lspci -d 11ab:be00 | cut -d' ' -f1)   # the Marvell switch
 qm set 900 --onboot 1 --startup order=1
 qm start 900
 ```
+
+The install runs under OVMF so that anaconda lays down the EFI loader (the
+same disk has to boot on ESXi), and the kickstart adds a BIOS GRUB next to
+it. Switching the VM to SeaBIOS afterwards is what allows 256 MB; leave it on
+OVMF and it needs 384.
 
 Passthrough is added *after* installation deliberately — the installer has no
 use for the switch, and leaving it out keeps the install from touching it.
@@ -989,23 +1047,24 @@ Three separate paths, which is the key to understanding everything else:
 | **Boot** | bootstrap VM | pushes firmware over PCIe; a permanent watchdog daemon |
 | **Management** | Proxmox host | HTTPS XML API on `169.254.1.0` over VLAN 2363 |
 
-The VM is *infrastructure*, not a data-plane element — 2 vCPU / **384 MB** is
-what the `qm create` above uses, and sizing is independent of switch
-throughput. **Verified on Proxmox 9.2 (2026-09-04):** at 384 MB the VM
-reaches a login prompt in 16 s, the ASIC is `ROS ready` about 60 s later,
-the guest has ~240 MB in use once the switch is up, and it comes back on its
-own after a host reboot. The floor is set by the firmware, not the workload:
-under OVMF (Proxmox, and the build's own verify boot) the kernel's EFI stub
-cannot find room below 320 MB, so 384 is the floor plus one step. ESXi's
-firmware manages 256 — see `docs/ESXI.md`.
+The VM is *infrastructure*, not a data-plane element — 2 vCPU / **256 MB**
+with SeaBIOS is what the `qm create` above uses, and sizing is independent of
+switch throughput. The floor is set by the firmware, not the workload: the
+image idles around 100 MB with a 21 MB initramfs, but under OVMF the kernel's
+EFI stub has to find a contiguous window for itself in whatever the firmware
+leaves, and **Proxmox's OVMF (edk2 4.2026.08) fails at 320 and even refuses
+the kernel in GRUB at 256** (`can't allocate kernel`); it needs 384. Measured
+on Proxmox 9.2 on 2026-09-04. SeaBIOS reserves next to nothing, so the same
+image boots at 256 there — which is why the disk carries both a BIOS GRUB (in
+a 1 MB `biosboot` partition) and the EFI one, and why the build verifies both
+paths. VMware's EFI manages 256 with the EFI loader — see `docs/ESXI.md`.
 
-**If you would rather not sit one step above the floor, use 512 MB.** On the
-first-ever start of the VM on that host, one boot at 384 stalled before
-userspace — kernel and initramfs read from disk, then nothing — and a
-stop/start fixed it; it has not recurred across several boots since, and the
-cause was not captured. The EFI stub's placement depends on the firmware's
-memory map, so a margin of one 64 MB step is thinner than it looks. 512 MB
-costs 128 MB more pinned RAM and buys that margin: `qm set 900 --memory 512`.
+**If you would rather have margin, use 320 or 384.** With passthrough the
+whole allocation is pinned, so each step is 64 MB the host never gets back;
+`qm set 900 --memory 384`. Under OVMF, 384 was verified on 2026-09-04
+(login in 16 s, `ROS ready` about 60 s later, back on its own after a host
+reboot) with one unexplained first-boot stall that a stop/start fixed, so if
+you must stay on OVMF, 512 is the comfortable number there.
 
 Do not hand it 2 GB out of habit: with passthrough the whole allocation is
 pinned, and that is 2 GB the host never gets back. Management deliberately
@@ -1028,7 +1087,7 @@ scripts/
   60-test-tui.py              offline tests for the TUI and the config files
   64-test-vnet.py             offline tests for encs-switch-vnet
   66-test-esxi.py             offline tests for the ESXi bundle (fake esxcli)
-  release.sh                  package + publish the host tools to GitHub
+  release.sh                  package + publish the host tools and this build tree to GitHub
 kickstart/ks-encs.cfg         the kickstart, heavily commented
 payload/                      our code, installed into the image
   usr/local/sbin/encs-switch-status        (VM) bootstrap health check
@@ -1057,18 +1116,28 @@ enum values, and how to hand-write one the replay service will accept.
 
 ### Cutting a release
 
-The host tools version independently of the image. Bump `VERSION` in
-`payload/opt/encs-host/encs-switch-tui`, then:
+A release carries two tarballs and one `SHA256SUMS`:
+
+| Asset | What | Who fetches it |
+|---|---|---|
+| `encs-host-<ver>.tar.gz` | the hypervisor-side tools, with a `MANIFEST` | `encs-switch-tui --update`, or by hand |
+| `encs-builder-<ver>.tar.gz` | this tree: `build.sh`, `scripts/`, `kickstart/`, `payload/`, `docs/` | anyone building the ISO/qcow2 without git |
+
+Neither contains anything from a Cisco ISO; the builder extracts that from
+the ISO you supply, on your machine. One version number covers both — bump
+`VERSION` in `payload/opt/encs-host/encs-switch-tui`, then:
 
 ```sh
 ./scripts/release.sh              # build + self-verify into out/, publish nothing
 ./scripts/release.sh --publish    # tag and create the GitHub release
 ```
 
-The build step compiles every script, packages the bundle with a `MANIFEST`,
-generates `SHA256SUMS`, then unpacks its own tarball and checks that the
-manifest paths and the reported version are right — all before anything is
-published. Existing hosts then pick it up with `encs-switch-tui --update`.
+The build step compiles every script (host tools and build tree), packages
+the host bundle with a `MANIFEST`, packages the builder, generates
+`SHA256SUMS`, then unpacks both tarballs and checks that the manifest paths,
+the reported version and `build.sh` are right — all before anything is
+published. It refuses outright if a binary or Cisco file has crept into the
+tree. Existing hosts then pick it up with `encs-switch-tui --update`.
 
 ---
 

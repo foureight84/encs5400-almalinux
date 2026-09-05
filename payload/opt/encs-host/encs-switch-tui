@@ -74,7 +74,7 @@ CFG_DIR = os.environ.get("SW_CFG_DIR", "/etc/encs-switch")
 
 # Single source of truth for the version. scripts/release.sh reads this line
 # to name the tag and the tarball, so keep the literal on one line.
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 
 # Where --update looks. Override for a fork or a test repo.
 GITHUB_REPO = os.environ.get("ENCS_REPO", "foureight84/encs5400-almalinux")
@@ -2065,9 +2065,12 @@ def do_update(force=False, say_=print):
         return None
     say_(f"updating {VERSION} -> {tag}")
 
-    tarname = next((n for n in assets if n.endswith(".tar.gz")), None)
+    # Releases also carry encs-builder-<ver>.tar.gz (the image build tree),
+    # which is not for the host: pick the host bundle by name.
+    tarname = next((n for n in assets
+                    if n.startswith("encs-host-") and n.endswith(".tar.gz")), None)
     if not tarname:
-        raise UpdateError(f"release {tag} has no .tar.gz asset")
+        raise UpdateError(f"release {tag} has no encs-host-*.tar.gz asset")
     if "SHA256SUMS" not in assets:
         raise UpdateError(f"release {tag} has no SHA256SUMS asset")
 
